@@ -82,8 +82,10 @@ func Open(dbPath string) (*DB, error) {
 func (d *DB) Close() error { return d.db.Close() }
 
 func (d *DB) migrate() error {
-	_, err := d.db.Exec(schema)
-	return err
+	if _, err := d.db.Exec(schema); err != nil {
+		return err
+	}
+	return d.BackfillFTS()
 }
 
 func (d *DB) Begin() (*sql.Tx, error) { return d.db.Begin() }
@@ -91,7 +93,7 @@ func (d *DB) Begin() (*sql.Tx, error) { return d.db.Begin() }
 // Workspace
 
 func (d *DB) UpsertWorkspace(name, rootPath string) (int64, error) {
-	res, err := d.db.Exec(
+	_, err := d.db.Exec(
 		`INSERT INTO workspaces(name, root_path) VALUES(?, ?)
 		 ON CONFLICT(name) DO UPDATE SET root_path=excluded.root_path`,
 		name, rootPath,
@@ -99,13 +101,9 @@ func (d *DB) UpsertWorkspace(name, rootPath string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
-	if id == 0 {
-		var ws Workspace
-		if err := d.db.QueryRow(`SELECT id FROM workspaces WHERE name=?`, name).Scan(&ws.ID); err != nil {
-			return 0, err
-		}
-		return ws.ID, nil
+	var id int64
+	if err := d.db.QueryRow(`SELECT id FROM workspaces WHERE name=?`, name).Scan(&id); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -145,7 +143,7 @@ func (d *DB) DeleteWorkspace(id int64) error {
 // Document
 
 func (d *DB) UpsertDocument(doc *Document) (int64, error) {
-	res, err := d.db.Exec(
+	_, err := d.db.Exec(
 		`INSERT INTO documents(workspace_id, path, type, hash, size_bytes, indexed_at)
 		 VALUES(?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
@@ -159,9 +157,9 @@ func (d *DB) UpsertDocument(doc *Document) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
-	if id == 0 {
-		d.db.QueryRow(`SELECT id FROM documents WHERE path=?`, doc.Path).Scan(&id)
+	var id int64
+	if err := d.db.QueryRow(`SELECT id FROM documents WHERE path=?`, doc.Path).Scan(&id); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -200,6 +198,45 @@ func (d *DB) GetDocumentsByWorkspace(workspaceID int64) ([]*Document, error) {
 func (d *DB) DeleteDocument(id int64) error {
 	_, err := d.db.Exec(`DELETE FROM documents WHERE id=?`, id)
 	return err
+}
+
+// DeleteDocumentWithCleanup removes a document, its FTS rows, and cascading chunks.
+// Returns deleted chunk IDs for vector store cleanup.
+func (d *DB) DeleteDocumentWithCleanup(docID int64) ([]int64, error) {
+	chunkIDs, err := d.GetChunkIDsByDocument(docID)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.deleteChunkFTSDirect(chunkIDs); err != nil {
+		return nil, err
+	}
+	if _, err := d.db.Exec(`DELETE FROM documents WHERE id=?`, docID); err != nil {
+		return nil, err
+	}
+	return chunkIDs, nil
+}
+
+func (d *DB) UpdateDocumentPath(docID int64, newPath string) error {
+	_, err := d.db.Exec(
+		`UPDATE documents SET path=?, indexed_at=CURRENT_TIMESTAMP WHERE id=?`,
+		newPath, docID,
+	)
+	return err
+}
+
+func (d *DB) GetDocumentByHashInWorkspace(workspaceID int64, hash string) (*Document, error) {
+	doc := &Document{}
+	err := d.db.QueryRow(
+		`SELECT id, workspace_id, path, type, hash, size_bytes, indexed_at FROM documents WHERE workspace_id=? AND hash=? LIMIT 1`,
+		workspaceID, hash,
+	).Scan(&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Type, &doc.Hash, &doc.SizeBytes, &doc.IndexedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return doc, nil
 }
 
 // Chunk
@@ -252,9 +289,33 @@ func (d *DB) GetChunksByIDs(ids []int64) ([]*Chunk, error) {
 	return out, rows.Err()
 }
 
-func (d *DB) DeleteChunksByDocument(tx *sql.Tx, docID int64) error {
-	_, err := tx.Exec(`DELETE FROM chunks WHERE document_id=?`, docID)
-	return err
+func (d *DB) DeleteChunksByDocument(tx *sql.Tx, docID int64) ([]int64, error) {
+	oldIDs, err := d.GetChunkIDsByDocumentInTx(tx, docID)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.DeleteChunkFTS(tx, oldIDs); err != nil {
+		return nil, err
+	}
+	_, err = tx.Exec(`DELETE FROM chunks WHERE document_id=?`, docID)
+	return oldIDs, err
+}
+
+func (d *DB) GetChunkIDsByDocumentInTx(tx *sql.Tx, docID int64) ([]int64, error) {
+	rows, err := tx.Query(`SELECT id FROM chunks WHERE document_id=?`, docID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 type DocWithWorkspace struct {
@@ -390,6 +451,9 @@ func (d *DB) GetAllChunkIDs() ([]int64, error) {
 }
 
 func (d *DB) DeleteAllData() error {
+	if err := d.ClearFTS(); err != nil {
+		return err
+	}
 	_, err := d.db.Exec(`DELETE FROM workspaces`)
 	if err != nil {
 		return err

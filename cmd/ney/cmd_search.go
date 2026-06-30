@@ -34,13 +34,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		topK = cfg.Retrieval.TopK
 	}
 
-	retriever := &search.Retriever{
-		DB:       app.DB,
-		Vectors:  app.Vectors,
-		Embedder: app.Embedder,
-	}
-
-	results, err := retriever.Search(cmd.Context(), query, topK, flagWorkspace, flagPath)
+	results, err := newRetriever(app).Search(cmd.Context(), query, retrieveOpts(cfg, topK))
 	if err != nil {
 		return err
 	}

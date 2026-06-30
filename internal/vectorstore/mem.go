@@ -3,9 +3,7 @@ package vectorstore
 import (
 	"context"
 	"container/heap"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"sync"
@@ -26,57 +24,16 @@ func NewBruteForceStore(path string) (*BruteForceStore, error) {
 }
 
 func (s *BruteForceStore) load() error {
-	f, err := os.Open(s.path)
+	items, err := loadFlatVectors(s.path)
 	if err != nil {
 		return err
-	}
-	defer f.Close()
-
-	var items []VectorItem
-	for {
-		var idLen uint32
-		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("read id len: %w", err)
-		}
-		idBytes := make([]byte, idLen)
-		if _, err := io.ReadFull(f, idBytes); err != nil {
-			return fmt.Errorf("read id: %w", err)
-		}
-		var dimCount uint32
-		if err := binary.Read(f, binary.LittleEndian, &dimCount); err != nil {
-			return fmt.Errorf("read dim count: %w", err)
-		}
-		vec := make([]float32, dimCount)
-		if err := binary.Read(f, binary.LittleEndian, vec); err != nil {
-			return fmt.Errorf("read vector: %w", err)
-		}
-		items = append(items, VectorItem{ID: string(idBytes), Vector: vec})
 	}
 	s.items = items
 	return nil
 }
 
 func (s *BruteForceStore) save() error {
-	tmp := s.path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	for _, item := range s.items {
-		idBytes := []byte(item.ID)
-		binary.Write(f, binary.LittleEndian, uint32(len(idBytes)))
-		f.Write(idBytes)
-		binary.Write(f, binary.LittleEndian, uint32(len(item.Vector)))
-		binary.Write(f, binary.LittleEndian, item.Vector)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return saveFlatVectors(s.path, s.items)
 }
 
 func (s *BruteForceStore) Add(_ context.Context, items []VectorItem) error {

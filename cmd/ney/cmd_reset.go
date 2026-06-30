@@ -8,7 +8,6 @@ import (
 
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 	"github.com/spf13/cobra"
 )
 
@@ -46,13 +45,18 @@ func runReset(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
 	db, err := store.Open(config.DBPath())
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	vs, err := vectorstore.NewBruteForceStore(config.VectorsPath())
+	vs, err := config.NewVectorStore(cfg, db, false)
 	if err != nil {
 		return err
 	}
@@ -87,6 +91,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	os.Remove(config.VectorsPath())
+	os.Remove(config.HNSWPath())
 
 	if flagJSON {
 		PrintJSON(resetResult{OK: true, Scope: "full"})

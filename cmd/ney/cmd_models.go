@@ -33,6 +33,14 @@ func runModels(cmd *cobra.Command, args []string) error {
 		{Provider: cfg.Embedder.Provider, Role: "embedder", Model: cfg.Embedder.Model, Active: true},
 		{Provider: cfg.Chat.Provider, Role: "chat", Model: cfg.Chat.Model, Active: true},
 	}
+	if cfg.Retrieval.Rerank {
+		entries = append(entries, modelEntry{
+			Provider: cfg.Reranker.Provider,
+			Role:     "reranker",
+			Model:    cfg.Reranker.Model,
+			Active:   true,
+		})
+	}
 
 	// if Ollama configured, list installed models
 	var ollamaModels []string
@@ -51,10 +59,13 @@ func runModels(cmd *cobra.Command, args []string) error {
 
 	PrintTable(
 		[]string{"Provider", "Role", "Model"},
-		[][]string{
-			{entries[0].Provider, "embedder", entries[0].Model},
-			{entries[1].Provider, "chat", entries[1].Model},
-		},
+		func() [][]string {
+			rows := make([][]string, len(entries))
+			for i, e := range entries {
+				rows[i] = []string{e.Provider, e.Role, e.Model}
+			}
+			return rows
+		}(),
 	)
 
 	if len(ollamaModels) > 0 {

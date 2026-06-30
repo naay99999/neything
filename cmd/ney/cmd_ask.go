@@ -24,9 +24,6 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.Retrieval.Rerank {
-		return fmt.Errorf("rerank is enabled but no reranker is implemented yet (set retrieval.rerank: false)")
-	}
 	applyProviderOverride(cfg, false)
 	app, err := initAppFromConfig(cfg)
 	if err != nil {
@@ -39,13 +36,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		topK = cfg.Retrieval.TopK
 	}
 
-	retriever := &search.Retriever{
-		DB:       app.DB,
-		Vectors:  app.Vectors,
-		Embedder: app.Embedder,
-	}
-
-	results, err := retriever.Search(cmd.Context(), question, topK, flagWorkspace, flagPath)
+	results, err := newRetriever(app).Search(cmd.Context(), question, retrieveOpts(cfg, topK))
 	if err != nil {
 		return err
 	}

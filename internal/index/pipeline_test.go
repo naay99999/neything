@@ -66,17 +66,17 @@ func setupIndexer(t *testing.T) (*Indexer, *store.DB, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunker, err := chunk.NewChunker("character", 200, 20)
+	chunkResolver, err := chunk.NewResolver("character", 200, 20, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ix := &Indexer{
-		DB:        db,
-		Vectors:   vs,
-		Embedder:  &mockEmbedder{},
-		Loaders:   loader.NewRegistry(&loader.MarkdownLoader{}),
-		Chunker:   chunker,
-		BatchSize: 8,
+		DB:            db,
+		Vectors:       vs,
+		Embedder:      &mockEmbedder{},
+		Loaders:       loader.NewRegistry(&loader.MarkdownLoader{}),
+		ChunkResolver: chunkResolver,
+		BatchSize:     8,
 	}
 	return ix, db, dir
 }
@@ -113,7 +113,11 @@ func TestIndexerIndexAndSearch(t *testing.T) {
 		Vectors:  ix.Vectors,
 		Embedder: &mockEmbedder{},
 	}
-	results, err := retriever.Search(context.Background(), unique, 3, "test", "")
+	results, err := retriever.Search(context.Background(), unique, search.RetrieveOptions{
+		TopK:      3,
+		FetchK:    10,
+		Workspace: "test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,7 +4,7 @@ import "context"
 
 type Document struct {
 	Path        string
-	Type        string // "pdf" | "docx" | "md"
+	Type        string // md | pdf | docx | html | json | obsidian | notion | confluence | git
 	Content     string
 	Hash        string
 	Metadata    map[string]string

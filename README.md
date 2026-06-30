@@ -94,7 +94,8 @@ ney ask "how do I roll back a failed deploy?"
 
 | Command | Description |
 |---|---|
-| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`) |
+| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`); prunes missing files and orphan vectors |
+| `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
 | `ney search "<query>"` | Semantic search — returns chunks grouped by file with snippets |
 | `ney ask "<question>"` | RAG: retrieve → LLM → answer with source citations |
 | `ney status` | Index stats: files, chunks, DB size, last indexed |
@@ -162,33 +163,56 @@ chat:
 retrieval:
   top_k: 8                  # chunks retrieved per query
   max_context_chars: 12000  # context window budget for LLM
-  rerank: false             # reranker not implemented yet — must stay false
+  rerank: false             # set true to rerank before LLM (ask only)
+  rerank_top_k: 24          # candidates fetched before rerank
+  hybrid: false             # combine semantic + BM25 keyword search
+
+reranker:                   # used when retrieval.rerank is true
+  provider: cohere          # cohere | jina | ollama
+  model: rerank-v3.5
+  # endpoint: http://localhost:11434   # ollama/local only
 
 chunking:
-  strategy: markdown        # character | sentence | paragraph | markdown
+  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer | page
   target_chars: 1200
   overlap_chars: 150
+  target_tokens: 300        # tokenizer strategy (~4 chars/token)
+  overlap_tokens: 50
+  # by_format:              # used when strategy: auto
+  #   md: markdown
+  #   pdf: page
+  #   docx: paragraph
+
+loaders:
+  git:
+    recent_commits: 0       # index recent git commits (0 = disabled)
+  ocr:
+    enabled: false          # requires: brew install tesseract poppler
+    lang: eng
+    min_chars: 32
 
 telemetry: false            # always off
 ```
 
-API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). They can also be set directly in the config file, but env vars are recommended.
+API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`). They can also be set directly in the config file, but env vars are recommended.
 
 ---
 
 ## How it works
 
 ```
-Index:  Files → Loader → Chunker → Embedder → VectorStore + SQLite
-Search: Query → Embed → VectorStore.Search → ranked chunks
-Ask:    Query → Search → trim to context budget → LLM → answer + Sources
+Index:  Files → Loader → Chunker → Embedder → VectorStore + SQLite + FTS
+Search: Query → Embed → VectorStore + optional FTS → RRF → ranked chunks
+Ask:    Query → Search → optional Rerank → trim to context budget → LLM → answer + Sources
 ```
 
-- **Loaders** extract text from `.md`, `.pdf`, `.docx`
-- **Chunkers** split text into ~1200-char pieces with position tracking (line/page/paragraph)
-- **Embedder** converts chunks to float32 vectors; stored in `~/.ney/vectors.bin`
+- **Loaders** extract text from `.md`, `.pdf`, `.docx`, `.html`, `.json`, `.xml`, plus Obsidian/Notion markdown and Confluence XML; optional git commit history and OCR for scanned PDFs
+- **Chunkers** split text with format-aware defaults (`chunking.strategy: auto`) — markdown by heading, PDF by page, docx/html by paragraph
+- **Embedder** converts chunks to float32 vectors; stored in `~/.ney/vectors.bin` (brute) or `~/.ney/vectors.hnsw` (HNSW backend)
 - **SQLite** (`~/.ney/index.db`) stores metadata, chunk content, and workspace info
 - **Hash-based skip** — unchanged files are not re-embedded on re-index
+- **Incremental sync** — deleted files and stale vectors are removed on re-index; renames detected by content hash
+- **Vector store** — `brute` (default) or `hnsw` via `vector_store.backend` in config; migrate with `ney index --migrate-vectors`
 - **Offline capable** — use Ollama for both embedder and chat to run fully air-gapped
 
 ---
@@ -203,9 +227,11 @@ Ask:    Query → Search → trim to context budget → LLM → answer + Sources
 
 ## Roadmap
 
-- Reranker support (Jina, Cohere, BGE)
-- Hybrid search (BM25 + semantic)
-- File watcher for automatic re-indexing
-- Web UI + REST API + MCP server
-- Additional loaders: Git, Notion, Obsidian, HTML
+Phase 3 (v0.4) is complete — see [docs/roadmap.md](docs/roadmap.md) for details.
+
+Next up (Phase 4):
+
+- REST API (`ney serve`)
+- MCP server (`ney mcp`)
+- Web UI dashboard
 - VS Code extension

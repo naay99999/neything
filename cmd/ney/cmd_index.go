@@ -5,17 +5,20 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/naay99999/neything/internal/chunk"
-	"github.com/naay99999/neything/internal/index"
-	"github.com/naay99999/neything/internal/loader"
 	"github.com/spf13/cobra"
 )
+
+var flagMigrateVectors bool
 
 var indexCmd = &cobra.Command{
 	Use:   "index <path>",
 	Short: "Index files in a directory",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runIndex,
+}
+
+func init() {
+	indexCmd.Flags().BoolVar(&flagMigrateVectors, "migrate-vectors", false, "import vectors.bin into hnsw backend without re-embedding")
 }
 
 func runIndex(cmd *cobra.Command, args []string) error {
@@ -37,33 +40,15 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
-	app, err := initAppFromConfig(cfg)
+	app, err := initAppWithOptions(cfg, flagMigrateVectors)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
 
-	chunker, err := chunk.NewChunker(cfg.Chunking.Strategy, cfg.Chunking.TargetChars, cfg.Chunking.OverlapChars)
+	ix, err := newIndexer(app, cfg)
 	if err != nil {
 		return err
-	}
-
-	reg := loader.NewRegistry(
-		&loader.MarkdownLoader{},
-		&loader.PDFLoader{},
-		&loader.DOCXLoader{},
-	)
-
-	ix := &index.Indexer{
-		DB:        app.DB,
-		Vectors:   app.Vectors,
-		Embedder:  app.Embedder,
-		Loaders:   reg,
-		Chunker:   chunker,
-		BatchSize: 32,
-		OnProgress: func(file string, chunks int) {
-			fmt.Fprintf(os.Stderr, "  indexed %s (%d chunks)\n", file, chunks)
-		},
 	}
 
 	fmt.Fprintf(os.Stderr, "Indexing %s (workspace: %s)...\n", rootPath, workspaceName)
@@ -77,14 +62,18 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		Workspace     string `json:"workspace"`
 		FilesScanned  int    `json:"files_scanned"`
 		FilesSkipped  int    `json:"files_skipped"`
+		FilesRemoved  int    `json:"files_removed"`
 		ChunksCreated int    `json:"chunks_created"`
+		VectorsPruned int    `json:"vectors_pruned"`
 		DurationMs    int64  `json:"duration_ms"`
 	}
 	r := result{
 		Workspace:     workspaceName,
 		FilesScanned:  stats.FilesScanned,
 		FilesSkipped:  stats.FilesSkipped,
+		FilesRemoved:  stats.FilesRemoved,
 		ChunksCreated: stats.ChunksCreated,
+		VectorsPruned: stats.VectorsPruned,
 		DurationMs:    stats.Duration.Milliseconds(),
 	}
 
@@ -95,7 +84,13 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("✓ %d files scanned (workspace: %s)\n", stats.FilesScanned, workspaceName)
 	fmt.Printf("✓ %d files skipped (unchanged)\n", stats.FilesSkipped)
+	if stats.FilesRemoved > 0 {
+		fmt.Printf("✓ %d files removed from index\n", stats.FilesRemoved)
+	}
 	fmt.Printf("✓ %d chunks embedded\n", stats.ChunksCreated)
+	if stats.VectorsPruned > 0 {
+		fmt.Printf("✓ %d vectors pruned\n", stats.VectorsPruned)
+	}
 	fmt.Printf("✓ Index ready (%s) in %s\n", "~/.ney/index.db", stats.Duration.Round(1000000000))
 	return nil
 }

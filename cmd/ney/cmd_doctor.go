@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -48,17 +49,102 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	})
 
 	if cfg.Retrieval.Rerank {
-		results = append(results, checkResult{
-			Check:   "rerank_enabled",
-			OK:      false,
-			Message: "Rerank is enabled but no reranker is implemented yet",
-			Hint:    "Set retrieval.rerank: false in ~/.ney/config.yaml",
-		})
+		if _, err := config.NewReranker(cfg); err != nil {
+			results = append(results, checkResult{
+				Check:   "rerank_enabled",
+				OK:      false,
+				Message: fmt.Sprintf("Rerank enabled but misconfigured: %v", err),
+				Hint:    "Check reranker settings and API keys in ~/.ney/config.yaml",
+			})
+		} else {
+			results = append(results, checkResult{
+				Check:   "rerank_enabled",
+				OK:      true,
+				Message: fmt.Sprintf("Reranker ready (%s / %s)", cfg.Reranker.Provider, cfg.Reranker.Model),
+			})
+		}
 	} else {
 		results = append(results, checkResult{
 			Check:   "rerank_enabled",
 			OK:      true,
 			Message: "Rerank disabled (default)",
+		})
+	}
+
+	if cfg.Retrieval.Hybrid {
+		results = append(results, checkResult{
+			Check:   "hybrid_search",
+			OK:      true,
+			Message: "Hybrid search enabled (semantic + BM25 FTS)",
+		})
+	} else {
+		results = append(results, checkResult{
+			Check:   "hybrid_search",
+			OK:      true,
+			Message: "Semantic search only (default)",
+		})
+	}
+
+	backend := cfg.VectorStore.Backend
+	if backend == "" {
+		backend = "brute"
+	}
+	results = append(results, checkResult{
+		Check:   "vector_store",
+		OK:      true,
+		Message: fmt.Sprintf("Vector store backend: %s", backend),
+	})
+
+	results = append(results, checkResult{
+		Check:   "loaders",
+		OK:      true,
+		Message: "Supported formats: .md, .pdf, .docx, .html, .json, .xml (+ Obsidian/Notion .md, Confluence .xml)",
+	})
+
+	if cfg.Loaders.Git.RecentCommits > 0 {
+		if loader.GitAvailable(nil) {
+			results = append(results, checkResult{
+				Check:   "git_loader",
+				OK:      true,
+				Message: fmt.Sprintf("Git history indexing enabled (recent_commits: %d)", cfg.Loaders.Git.RecentCommits),
+			})
+		} else {
+			results = append(results, checkResult{
+				Check:   "git_loader",
+				OK:      false,
+				Message: "Git history indexing enabled but git not found on PATH",
+				Hint:    "Install git or set loaders.git.recent_commits: 0",
+			})
+		}
+	}
+
+	if cfg.Loaders.OCR.Enabled {
+		ocrCfg := loader.OCRConfig{
+			Enabled:      cfg.Loaders.OCR.Enabled,
+			Lang:         cfg.Loaders.OCR.Lang,
+			TesseractCmd: cfg.Loaders.OCR.TesseractCmd,
+			PdftoppmCmd:  cfg.Loaders.OCR.PdftoppmCmd,
+			MinChars:     cfg.Loaders.OCR.MinChars,
+		}
+		if ok, msg := loader.OCRToolsAvailable(ocrCfg); ok {
+			results = append(results, checkResult{
+				Check:   "ocr_tools",
+				OK:      true,
+				Message: "OCR enabled — pdftoppm and tesseract available",
+			})
+		} else {
+			results = append(results, checkResult{
+				Check:   "ocr_tools",
+				OK:      false,
+				Message: "OCR enabled but tools missing: " + msg,
+				Hint:    "Install: brew install tesseract poppler (or set loaders.ocr.enabled: false)",
+			})
+		}
+	} else {
+		results = append(results, checkResult{
+			Check:   "ocr_tools",
+			OK:      true,
+			Message: "OCR disabled (default)",
 		})
 	}
 
@@ -201,6 +287,32 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					OK:      true,
 					Message: fmt.Sprintf("Index contains %d chunks across %d files", stats.ChunkCount, stats.DocumentCount),
 				})
+
+				vs, vsErr := config.NewVectorStore(cfg, db2, false)
+				if vsErr != nil {
+					results = append(results, checkResult{
+						Check:   "vector_store_open",
+						OK:      false,
+						Message: fmt.Sprintf("Vector store error: %v", vsErr),
+						Hint:    "Check vector_store settings or run: ney reset && ney index <path>",
+					})
+				} else {
+					vecCount := vs.Count()
+					if vecCount > stats.ChunkCount {
+						results = append(results, checkResult{
+							Check:   "vector_parity",
+							OK:      false,
+							Message: fmt.Sprintf("Orphan vectors detected: %d vectors vs %d chunks", vecCount, stats.ChunkCount),
+							Hint:    "Run: ney index <path> to prune orphans",
+						})
+					} else {
+						results = append(results, checkResult{
+							Check:   "vector_parity",
+							OK:      true,
+							Message: fmt.Sprintf("Vector count matches chunks (%d)", vecCount),
+						})
+					}
+				}
 
 				// 8. Embedder consistency
 				active, err := db2.GetActiveEmbedder()

@@ -31,6 +31,7 @@ func init() {
 
 	rootCmd.AddCommand(
 		indexCmd,
+		watchCmd,
 		searchCmd,
 		askCmd,
 		statusCmd,
