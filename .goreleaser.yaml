@@ -1,0 +1,57 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ney
+    main: ./cmd/ney
+    binary: ney
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: ney
+    name_template: "ney_{{.Version}}_{{.Os}}_{{.Arch}}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+
+checksum:
+  name_template: "ney_{{.Version}}_checksums.txt"
+
+brews:
+  - name: ney
+    repository:
+      owner: naay
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/naay/ney"
+    description: "Local-first CLI knowledge engine — index files, search by meaning, ask questions with source citations"
+    license: "MIT"
+    install: |
+      bin.install "ney"
+    test: |
+      system "#{bin}/ney", "version"
+
+release:
+  github:
+    owner: naay
+    name: ney
+  draft: false
+  prerelease: auto
