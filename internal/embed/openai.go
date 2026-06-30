@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/naay99999/neything/internal/apiretry"
 )
 
 type OpenAIEmbedder struct {
@@ -70,54 +72,41 @@ func (e *OpenAIEmbedder) embedBatch(ctx context.Context, texts []string) ([][]fl
 		"input": texts,
 	})
 
-	var result [][]float32
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		baseURL := e.BaseURL
-		if baseURL == "" {
-			baseURL = "https://api.openai.com"
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/embeddings", bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		if e.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+e.APIKey)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := e.client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
-			lastErr = fmt.Errorf("openai rate limited")
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("openai embeddings: status %d", resp.StatusCode)
-		}
-
-		var out struct {
-			Data []struct {
-				Embedding []float32 `json:"embedding"`
-			} `json:"data"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		resp.Body.Close()
-
-		for _, d := range out.Data {
-			result = append(result, d.Embedding)
-		}
-		return result, nil
+	baseURL := e.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.openai.com"
 	}
-	return nil, lastErr
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if e.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.APIKey)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := apiretry.Do(ctx, e.client, req, 3)
+	if err != nil {
+		return nil, fmt.Errorf("openai embeddings: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai embeddings: status %d", resp.StatusCode)
+	}
+
+	var out struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+
+	result := make([][]float32, 0, len(out.Data))
+	for _, d := range out.Data {
+		result = append(result, d.Embedding)
+	}
+	return result, nil
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/naay99999/neything/internal/chunk"
+	"github.com/naay99999/neything/internal/citation"
 	"github.com/naay99999/neything/internal/search"
 	"github.com/spf13/cobra"
 )
@@ -23,10 +24,11 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if flagProvider != "" {
-		cfg.Chat.Provider = flagProvider
+	if cfg.Retrieval.Rerank {
+		return fmt.Errorf("rerank is enabled but no reranker is implemented yet (set retrieval.rerank: false)")
 	}
-	app, err := initApp(cfg)
+	applyProviderOverride(cfg, false)
+	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}
@@ -51,7 +53,6 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no relevant context found — try indexing more files")
 	}
 
-	// convert to chunks, trimming to max_context_chars
 	var ctxChunks []chunk.Chunk
 	totalChars := 0
 	for _, r := range results {
@@ -60,6 +61,8 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		}
 		ctxChunks = append(ctxChunks, chunk.Chunk{
 			ID:       fmt.Sprintf("%d", r.ChunkID),
+			DocPath:  r.DocPath,
+			DocType:  r.DocType,
 			Content:  r.Content,
 			StartPos: r.StartPos,
 			EndPos:   r.EndPos,
@@ -74,7 +77,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 
 	if flagJSON {
 		type jsonAnswer struct {
-			Answer  string           `json:"answer"`
+			Answer  string                  `json:"answer"`
 			Sources []search.EnrichedResult `json:"sources"`
 		}
 		PrintJSON(jsonAnswer{Answer: answer, Sources: results})
@@ -83,16 +86,25 @@ func runAsk(cmd *cobra.Command, args []string) error {
 
 	fmt.Println(answer)
 
-	// if the LLM didn't include a Sources section, append our own
 	if !strings.Contains(strings.ToLower(answer), "sources") {
 		fmt.Println("\nSources:")
-		for _, r := range results {
-			if r.StartPos > 0 {
-				fmt.Printf("  %s (lines %d-%d)\n", r.DocPath, r.StartPos, r.EndPos)
-			} else {
-				fmt.Printf("  %s\n", r.DocPath)
-			}
+		for _, src := range dedupeSources(results) {
+			fmt.Printf("  %s\n", src)
 		}
 	}
 	return nil
+}
+
+func dedupeSources(results []search.EnrichedResult) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, r := range results {
+		src := citation.FormatSource(r.DocPath, r.DocType, r.StartPos, r.EndPos)
+		if seen[src] {
+			continue
+		}
+		seen[src] = true
+		out = append(out, src)
+	}
+	return out
 }

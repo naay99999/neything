@@ -95,11 +95,10 @@ ney ask "how do I roll back a failed deploy?"
 | Command | Description |
 |---|---|
 | `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`) |
-| `ney search "<query>"` | Semantic search — returns ranked chunks with snippets |
+| `ney search "<query>"` | Semantic search — returns chunks grouped by file with snippets |
 | `ney ask "<question>"` | RAG: retrieve → LLM → answer with source citations |
 | `ney status` | Index stats: files, chunks, DB size, last indexed |
-| `ney config show` | Print current config |
-| `ney config edit` | Open config in `$EDITOR` |
+| `ney config` | Print current config (`config show` / `config edit` also work) |
 | `ney doctor` | Check config, API keys, Ollama, SQLite, index health |
 | `ney models` | List configured providers and Ollama installed models |
 | `ney reset` | Clear the index (add `--workspace <name>` for partial reset) |
@@ -111,7 +110,7 @@ ney ask "how do I roll back a failed deploy?"
 |---|---|
 | `--workspace <name>` | Target a specific workspace |
 | `--top-k <n>` | Number of chunks to retrieve (default: 8) |
-| `--provider <name>` | Override chat provider for this run (e.g. `--provider openai`) |
+| `--provider <name>` | Override embedder on `index`/`search`; override chat on `ask` |
 | `--path <dir>` | Limit results to files under this directory |
 | `--json` | Machine-readable JSON output |
 
@@ -163,7 +162,7 @@ chat:
 retrieval:
   top_k: 8                  # chunks retrieved per query
   max_context_chars: 12000  # context window budget for LLM
-  rerank: false             # reranker (future)
+  rerank: false             # reranker not implemented yet — must stay false
 
 chunking:
   strategy: markdown        # character | sentence | paragraph | markdown

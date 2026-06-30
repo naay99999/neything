@@ -12,27 +12,13 @@ import (
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Show or edit configuration",
+	RunE:  runConfigShow,
 }
 
 var configShowCmd = &cobra.Command{
 	Use:   "show",
 	Short: "Print current config",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		data, err := os.ReadFile(config.ConfigPath())
-		if err != nil {
-			return fmt.Errorf("cannot read config: %w", err)
-		}
-		if flagJSON {
-			cfg, err := config.Load()
-			if err != nil {
-				return err
-			}
-			PrintJSON(cfg)
-			return nil
-		}
-		fmt.Print(string(data))
-		return nil
-	},
+	RunE:  runConfigShow,
 }
 
 var configEditCmd = &cobra.Command{
@@ -49,6 +35,23 @@ var configEditCmd = &cobra.Command{
 		c.Stderr = os.Stderr
 		return c.Run()
 	},
+}
+
+func runConfigShow(cmd *cobra.Command, args []string) error {
+	data, err := os.ReadFile(config.ConfigPath())
+	if err != nil {
+		return fmt.Errorf("cannot read config: %w", err)
+	}
+	if flagJSON {
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		PrintJSON(cfg)
+		return nil
+	}
+	fmt.Print(string(data))
+	return nil
 }
 
 func init() {

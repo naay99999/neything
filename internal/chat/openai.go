@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/naay99999/neything/internal/apiretry"
 	"github.com/naay99999/neything/internal/chunk"
 )
 
@@ -60,7 +61,7 @@ func (m *OpenAIChatModel) Complete(ctx context.Context, prompt string, ctxChunks
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := m.client.Do(req)
+	resp, err := apiretry.Do(ctx, m.client, req, 3)
 	if err != nil {
 		return "", err
 	}

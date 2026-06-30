@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/naay99999/neything/internal/apiretry"
 	"github.com/naay99999/neything/internal/chunk"
 )
 
@@ -46,7 +47,7 @@ func (m *ClaudeChatModel) Complete(ctx context.Context, prompt string, ctxChunks
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("content-type", "application/json")
 
-	resp, err := m.client.Do(req)
+	resp, err := apiretry.Do(ctx, m.client, req, 3)
 	if err != nil {
 		return "", err
 	}

@@ -24,12 +24,23 @@ func init() {
 	resetCmd.Flags().BoolVar(&resetForce, "force", false, "skip confirmation prompt")
 }
 
+type resetResult struct {
+	OK        bool   `json:"ok"`
+	Aborted   bool   `json:"aborted,omitempty"`
+	Scope     string `json:"scope,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+}
+
 func runReset(cmd *cobra.Command, args []string) error {
 	if !resetForce {
 		fmt.Print("This will delete all indexed data. Continue? [y/N] ")
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Scan()
 		if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+			if flagJSON {
+				PrintJSON(resetResult{OK: false, Aborted: true})
+				return nil
+			}
 			fmt.Println("Aborted.")
 			return nil
 		}
@@ -54,7 +65,6 @@ func runReset(cmd *cobra.Command, args []string) error {
 		if ws == nil {
 			return fmt.Errorf("workspace %q not found", flagWorkspace)
 		}
-		// get chunk IDs to delete from vector store
 		chunkIDs, err := db.GetChunkIDsByWorkspace(ws.ID)
 		if err != nil {
 			return err
@@ -65,17 +75,23 @@ func runReset(cmd *cobra.Command, args []string) error {
 		if err := db.DeleteWorkspace(ws.ID); err != nil {
 			return err
 		}
+		if flagJSON {
+			PrintJSON(resetResult{OK: true, Scope: "workspace", Workspace: flagWorkspace})
+			return nil
+		}
 		fmt.Printf("✓ Reset workspace %q\n", flagWorkspace)
 		return nil
 	}
 
-	// full reset
 	if err := db.DeleteAllData(); err != nil {
 		return err
 	}
-	// delete vectors file
 	os.Remove(config.VectorsPath())
 
+	if flagJSON {
+		PrintJSON(resetResult{OK: true, Scope: "full"})
+		return nil
+	}
 	fmt.Println("✓ Index cleared")
 	return nil
 }

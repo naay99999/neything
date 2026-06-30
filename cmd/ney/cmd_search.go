@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/naay99999/neything/internal/citation"
 	"github.com/naay99999/neything/internal/search"
 	"github.com/spf13/cobra"
 )
@@ -21,7 +22,8 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	app, err := initApp(cfg)
+	applyProviderOverride(cfg, true)
+	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}
@@ -43,23 +45,29 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	groups := search.GroupByFile(results)
+
 	if flagJSON {
-		PrintJSON(results)
+		PrintJSON(search.GroupedResults{Files: groups})
 		return nil
 	}
 
-	if len(results) == 0 {
+	if len(groups) == 0 {
 		fmt.Println("No results found.")
 		return nil
 	}
 
-	for i, r := range results {
-		fmt.Printf("[%d] %s", i+1, r.DocPath)
-		if r.StartPos > 0 || r.EndPos > 0 {
-			fmt.Printf(" (lines %d-%d)", r.StartPos, r.EndPos)
+	for _, g := range groups {
+		fmt.Printf("%s (best: %.4f)\n", g.DocPath, g.BestScore)
+		for i, r := range g.Chunks {
+			loc := citation.FormatLocation(r.DocType, r.StartPos, r.EndPos)
+			if loc != "" {
+				fmt.Printf("  [%d] %s  score: %.4f\n", i+1, loc, r.Score)
+			} else {
+				fmt.Printf("  [%d] score: %.4f\n", i+1, r.Score)
+			}
+			fmt.Printf("    %s\n\n", truncate(r.Content, 200))
 		}
-		fmt.Printf("  score: %.4f\n", r.Score)
-		fmt.Printf("    %s\n\n", truncate(r.Content, 200))
 	}
 	return nil
 }

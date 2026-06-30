@@ -36,7 +36,8 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	app, err := initApp(cfg)
+	applyProviderOverride(cfg, true)
+	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}

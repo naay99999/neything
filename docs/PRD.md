@@ -10,7 +10,7 @@
 | Version | 0.1 (MVP) |
 | Core language | Go |
 | Interface | CLI เท่านั้น (Web UI / API เป็น future) |
-| Status | Draft |
+| Status | Implemented (v0.1) |
 
 > ชื่อสั้น จำง่าย เน้นที่ตัว CLI เป็นหลัก — model เดียวกับ `git`, `uv`, `bun`, `mise` ที่คนจำคำสั่งมากกว่าชื่อเต็ม
 
@@ -253,7 +253,7 @@ index_meta
   value         TEXT
 ```
 
-- **Vector** เก็บใน VectorStore (turbovec), key = `chunks.id`
+- **Vector** เก็บใน VectorStore (`~/.ney/vectors.bin`), key = `chunks.id`
 - **SQLite** ใช้ driver `modernc.org/sqlite` (pure Go, ไม่ต้อง cgo → cross-compile ง่าย)
 - ตาราง `workspaces` รองรับ `ney search --workspace code` ในอนาคต
 - ตาราง `providers` บันทึกว่า index สร้างด้วย embedder/dimension อะไร เพื่อเตือนเมื่อต้อง re-index
@@ -294,8 +294,8 @@ type ChunkStrategy interface {
 - target ~1000–1500 ตัวอักษร, overlap ~150
 - Future: `TokenizerChunker`
 
-### VectorStore (สำคัญที่สุด — อย่า hardcode turbovec)
-core ไม่รู้จัก turbovec ตรง ๆ รู้จักแค่ interface — ถ้า turbovec หยุดพัฒนา โปรเจกต์ไม่ตาย
+### VectorStore (สำคัญที่สุด — อย่า hardcode implementation ตรง ๆ)
+core ไม่รู้จัก vector library ตรง ๆ รู้จักแค่ interface — สลับ implementation ได้โดยไม่แตะ pipeline
 
 ```go
 type VectorStore interface {
@@ -305,8 +305,8 @@ type VectorStore interface {
 }
 ```
 
-- MVP implementation เดียว: **TurbovecStore**
-- Future: เปลี่ยนเป็น store อื่นได้โดยไม่แตะ pipeline
+- MVP implementation: **BruteForceStore** — pure Go, in-memory cosine similarity, persist เป็น flat binary (`vectors.bin`)
+- Future: Turbovec / HNSW / store อื่นได้โดยไม่แตะ pipeline
 
 ### Retriever / Reranker (เตรียม interface ไว้)
 ยังไม่มี implementation reranker ใน MVP แต่วาง slot ไว้ให้ Jina / Cohere / BGE เสียบได้
@@ -351,7 +351,9 @@ ney/
     chunk/            # character.go, paragraph.go, markdown.go (ChunkStrategy)
     embed/            # provider implementations (Embedder)
     chat/             # provider implementations (ChatModel)
-    vectorstore/      # turbovec.go (VectorStore)
+    vectorstore/      # mem.go (BruteForceStore)
+    citation/         # source location formatting (lines/pages/paragraphs)
+    apiretry/         # HTTP retry for cloud providers
     rerank/           # interface + (future) implementations
     store/            # sqlite layer
     search/           # retriever logic
@@ -391,7 +393,7 @@ ney/
 
 ## 13. Open Questions
 
-- **turbovec** — เป็น Go library, binary แยก, หรือ service? มี Go client / API แบบไหน? (กระทบ `vectorstore/turbovec.go` โดยตรง — interface พร้อมแล้ว เหลือ implementation)
 - รองรับ scan PDF ในอนาคตด้วย OCR engine ตัวไหน (Tesseract ผ่าน cgo จะกระทบ single-binary)
 - กลยุทธ์เก็บ API key — env var อย่างเดียว หรือมี keyring integration
 - default chunk strategy ต่อ format — markdown ใช้ heading, pdf/docx ใช้อะไรดีที่สุด
+- Vector store ขยาย scale — เมื่อ corpus ใหญ่ขึ้น อาจพิจารณา Turbovec (Rust) หรือ ANN index อื่นผ่าน `VectorStore` interface

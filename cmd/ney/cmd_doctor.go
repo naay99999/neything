@@ -47,6 +47,21 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		Message: fmt.Sprintf("Config file valid (%s)", config.ConfigPath()),
 	})
 
+	if cfg.Retrieval.Rerank {
+		results = append(results, checkResult{
+			Check:   "rerank_enabled",
+			OK:      false,
+			Message: "Rerank is enabled but no reranker is implemented yet",
+			Hint:    "Set retrieval.rerank: false in ~/.ney/config.yaml",
+		})
+	} else {
+		results = append(results, checkResult{
+			Check:   "rerank_enabled",
+			OK:      true,
+			Message: "Rerank disabled (default)",
+		})
+	}
+
 	// 2. Embedder is not Claude
 	if cfg.Embedder.Provider == "claude" {
 		results = append(results, checkResult{
