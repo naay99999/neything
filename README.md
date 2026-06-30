@@ -12,13 +12,26 @@ ney ask "what are the retry policies for failed payments?"
 
 ## Install
 
+**macOS / Linux — curl:**
 ```bash
-# Build from source (requires Go 1.22+)
-go install github.com/naay/ney/cmd/ney@latest
+curl -sSL https://raw.githubusercontent.com/naay/ney/main/scripts/install.sh | sh
+```
 
-# Or clone and build
-git clone https://github.com/naay99999/neything
-cd neything
+**macOS — Homebrew:**
+```bash
+brew tap naay/tap
+brew install ney
+```
+
+**Go users:**
+```bash
+go install github.com/naay/ney/cmd/ney@latest
+```
+
+**Build from source:**
+```bash
+git clone https://github.com/naay/ney
+cd ney
 go build -o ney ./cmd/ney
 ```
 
@@ -96,6 +109,8 @@ ney ask "how do I roll back a failed deploy?"
 |---|---|
 | `--workspace <name>` | Target a specific workspace |
 | `--top-k <n>` | Number of chunks to retrieve (default: 8) |
+| `--provider <name>` | Override chat provider for this run (e.g. `--provider openai`) |
+| `--path <dir>` | Limit results to files under this directory |
 | `--json` | Machine-readable JSON output |
 
 ### Workspaces
