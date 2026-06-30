@@ -34,7 +34,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		topK = cfg.Retrieval.TopK
 	}
 
+	sp := startSpinner("searching")
 	results, err := newRetriever(app).Search(cmd.Context(), query, retrieveOpts(cfg, topK))
+	sp.Stop()
 	if err != nil {
 		return err
 	}
@@ -52,13 +54,13 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, g := range groups {
-		fmt.Printf("%s (best: %.4f)\n", g.DocPath, g.BestScore)
+		fmt.Printf("%s %s\n", Bold(g.DocPath), Dim(fmt.Sprintf("(best: %.4f)", g.BestScore)))
 		for i, r := range g.Chunks {
 			loc := citation.FormatLocation(r.DocType, r.StartPos, r.EndPos)
 			if loc != "" {
-				fmt.Printf("  [%d] %s  score: %.4f\n", i+1, loc, r.Score)
+				fmt.Printf("  [%d] %s  %s\n", i+1, loc, Dim(fmt.Sprintf("score: %.4f", r.Score)))
 			} else {
-				fmt.Printf("  [%d] score: %.4f\n", i+1, r.Score)
+				fmt.Printf("  [%d] %s\n", i+1, Dim(fmt.Sprintf("score: %.4f", r.Score)))
 			}
 			fmt.Printf("    %s\n\n", truncate(r.Content, 200))
 		}

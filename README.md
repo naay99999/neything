@@ -128,11 +128,13 @@ ney> search auth flow
 ney> what are the retry policies for failed payments?
 ```
 
-- A line starting with a known command word (`ask`, `search`, `index`, `watch`, `status`, `config`, `doctor`, `models`, `reset`, `version`, `help`) dispatches that command — no quoting needed around `ask`/`search` queries.
+- A line starting with a known command word (`ask`, `search`, `index`, `watch`, `status`, `config`, `doctor`, `models`, `reset`, `version`, `help`) dispatches that command — no quoting needed around `ask`/`search` queries. Commands can optionally be prefixed with `/` (e.g. `/config`).
 - Anything else is treated as a question and sent straight to `ask`.
+- Type a bare `config`, `reset`, or `index` with no arguments and ney asks what you want instead of erroring — e.g. `config` prompts "Show or edit config? [s/e]", `reset` prompts for full vs. one workspace, `index` prompts for a path. Giving the full command (`config edit`, `reset --workspace foo`, `index ~/docs`) skips the prompt as before.
 - Meta-commands: `:help`, `:clear`, `:quit` / `:exit`.
 - Line history persists across sessions in `~/.ney/history` (arrow keys to recall).
 - Each line runs statelessly, same as a one-shot CLI call — no conversation memory between lines yet.
+- `ask`/`search` show a spinner while waiting on the embedder/LLM, and `ask` answers type out instead of appearing all at once. Output is colored on an interactive terminal; set `NO_COLOR=1` to disable, or pipe/redirect output to fall back to plain text automatically.
 
 ### Workspaces
 

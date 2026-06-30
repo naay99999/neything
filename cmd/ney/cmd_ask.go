@@ -36,7 +36,9 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		topK = cfg.Retrieval.TopK
 	}
 
+	sp := startSpinner("searching")
 	results, err := newRetriever(app).Search(cmd.Context(), question, retrieveOpts(cfg, topK))
+	sp.Stop()
 	if err != nil {
 		return err
 	}
@@ -61,7 +63,9 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		totalChars += len(r.Content)
 	}
 
+	sp = startSpinner("thinking")
 	answer, err := app.Chat.Complete(cmd.Context(), question, ctxChunks)
+	sp.Stop()
 	if err != nil {
 		return fmt.Errorf("LLM error: %w", err)
 	}
@@ -75,12 +79,12 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Println(answer)
+	typewrite(answer)
 
 	if !strings.Contains(strings.ToLower(answer), "sources") {
-		fmt.Println("\nSources:")
+		fmt.Println(Dim("\nSources:"))
 		for _, src := range dedupeSources(results) {
-			fmt.Printf("  %s\n", src)
+			fmt.Printf("  %s\n", Bold(src))
 		}
 	}
 	return nil

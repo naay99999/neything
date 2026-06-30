@@ -33,9 +33,9 @@ func PrintTable(headers []string, rows [][]string) {
 
 func CheckMark(ok bool) string {
 	if ok {
-		return "✓"
+		return Green("✓")
 	}
-	return "✗"
+	return Red("✗")
 }
 
 func GlobalJSON() bool {

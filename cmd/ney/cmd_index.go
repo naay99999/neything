@@ -82,15 +82,15 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("✓ %d files scanned (workspace: %s)\n", stats.FilesScanned, workspaceName)
-	fmt.Printf("✓ %d files skipped (unchanged)\n", stats.FilesSkipped)
+	fmt.Println(Green(fmt.Sprintf("✓ %d files scanned (workspace: %s)", stats.FilesScanned, workspaceName)))
+	fmt.Println(Green(fmt.Sprintf("✓ %d files skipped (unchanged)", stats.FilesSkipped)))
 	if stats.FilesRemoved > 0 {
-		fmt.Printf("✓ %d files removed from index\n", stats.FilesRemoved)
+		fmt.Println(Green(fmt.Sprintf("✓ %d files removed from index", stats.FilesRemoved)))
 	}
-	fmt.Printf("✓ %d chunks embedded\n", stats.ChunksCreated)
+	fmt.Println(Green(fmt.Sprintf("✓ %d chunks embedded", stats.ChunksCreated)))
 	if stats.VectorsPruned > 0 {
-		fmt.Printf("✓ %d vectors pruned\n", stats.VectorsPruned)
+		fmt.Println(Green(fmt.Sprintf("✓ %d vectors pruned", stats.VectorsPruned)))
 	}
-	fmt.Printf("✓ Index ready (%s) in %s\n", "~/.ney/index.db", stats.Duration.Round(1000000000))
+	fmt.Println(Green(fmt.Sprintf("✓ Index ready (%s) in %s", "~/.ney/index.db", stats.Duration.Round(1000000000))))
 	return nil
 }

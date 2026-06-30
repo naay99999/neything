@@ -40,7 +40,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 				PrintJSON(resetResult{OK: false, Aborted: true})
 				return nil
 			}
-			fmt.Println("Aborted.")
+			fmt.Println(Yellow("Aborted."))
 			return nil
 		}
 	}
@@ -83,7 +83,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 			PrintJSON(resetResult{OK: true, Scope: "workspace", Workspace: flagWorkspace})
 			return nil
 		}
-		fmt.Printf("✓ Reset workspace %q\n", flagWorkspace)
+		fmt.Println(Green(fmt.Sprintf("✓ Reset workspace %q", flagWorkspace)))
 		return nil
 	}
 
@@ -97,6 +97,6 @@ func runReset(cmd *cobra.Command, args []string) error {
 		PrintJSON(resetResult{OK: true, Scope: "full"})
 		return nil
 	}
-	fmt.Println("✓ Index cleared")
+	fmt.Println(Green("✓ Index cleared"))
 	return nil
 }
