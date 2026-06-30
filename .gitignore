@@ -1,4 +1,4 @@
-ney
-ney-*
+/ney
+/ney-*
 *.exe
 dist/

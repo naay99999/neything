@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/naay/ney/internal/embed"
 	"github.com/naay/ney/internal/store"
@@ -27,7 +28,7 @@ type Retriever struct {
 	Embedder embed.Embedder
 }
 
-func (r *Retriever) Search(ctx context.Context, query string, topK int, workspaceName string) ([]EnrichedResult, error) {
+func (r *Retriever) Search(ctx context.Context, query string, topK int, workspaceName, pathPrefix string) ([]EnrichedResult, error) {
 	vecs, err := r.Embedder.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -80,6 +81,9 @@ func (r *Retriever) Search(ctx context.Context, query string, topK int, workspac
 			continue
 		}
 		if workspaceName != "" && dw.WorkspaceName != workspaceName {
+			continue
+		}
+		if pathPrefix != "" && !strings.HasPrefix(dw.Path, pathPrefix) {
 			continue
 		}
 		results = append(results, EnrichedResult{
