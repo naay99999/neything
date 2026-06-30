@@ -3,17 +3,19 @@ module github.com/naay99999/neything
 go 1.26.4
 
 require (
+	github.com/coder/hnsw v0.6.1
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
+	golang.org/x/net v0.56.0
 	modernc.org/sqlite v1.53.0
 )
 
 require (
 	github.com/chewxy/math32 v1.10.1 // indirect
-	github.com/coder/hnsw v0.6.1 // indirect
+	github.com/chzyer/readline v1.5.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/renameio v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -32,7 +34,6 @@ require (
 	github.com/viterin/vek v0.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
-	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	modernc.org/libc v1.73.4 // indirect

@@ -56,7 +56,13 @@ func Execute() error {
 }
 
 func main() {
-	if err := Execute(); err != nil {
+	var err error
+	if len(os.Args) == 1 {
+		err = runREPL()
+	} else {
+		err = Execute()
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }

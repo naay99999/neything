@@ -8,6 +8,8 @@ ney search "how does billing work"
 ney ask "what are the retry policies for failed payments?"
 ```
 
+Or just run `ney` with no arguments for an interactive prompt — type a question directly, no command syntax to remember.
+
 ---
 
 ## Install
@@ -114,6 +116,23 @@ ney ask "how do I roll back a failed deploy?"
 | `--provider <name>` | Override embedder on `index`/`search`; override chat on `ask` |
 | `--path <dir>` | Limit results to files under this directory |
 | `--json` | Machine-readable JSON output |
+
+### Interactive mode
+
+Run `ney` with no arguments to drop into a prompt:
+
+```
+$ ney
+ney> status
+ney> search auth flow
+ney> what are the retry policies for failed payments?
+```
+
+- A line starting with a known command word (`ask`, `search`, `index`, `watch`, `status`, `config`, `doctor`, `models`, `reset`, `version`, `help`) dispatches that command — no quoting needed around `ask`/`search` queries.
+- Anything else is treated as a question and sent straight to `ask`.
+- Meta-commands: `:help`, `:clear`, `:quit` / `:exit`.
+- Line history persists across sessions in `~/.ney/history` (arrow keys to recall).
+- Each line runs statelessly, same as a one-shot CLI call — no conversation memory between lines yet.
 
 ### Workspaces
 
