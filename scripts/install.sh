@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -e
 
-REPO="naay/ney"
+REPO="naay99999/neything"
 INSTALL_DIR="${NEY_INSTALL_DIR:-/usr/local/bin}"
 
 # detect OS

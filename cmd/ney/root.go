@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/naay/ney/internal/config"
+	"github.com/naay99999/neything/internal/config"
 	"github.com/spf13/cobra"
 )
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/naay/ney/internal/chunk"
-	"github.com/naay/ney/internal/search"
+	"github.com/naay99999/neything/internal/chunk"
+	"github.com/naay99999/neything/internal/search"
 	"github.com/spf13/cobra"
 )
 

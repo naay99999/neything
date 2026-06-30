@@ -1,4 +1,4 @@
-module github.com/naay/ney
+module github.com/naay99999/neything
 
 go 1.26.4
 

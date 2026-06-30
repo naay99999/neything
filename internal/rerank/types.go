@@ -3,7 +3,7 @@ package rerank
 import (
 	"context"
 
-	"github.com/naay/ney/internal/vectorstore"
+	"github.com/naay99999/neything/internal/vectorstore"
 )
 
 type Reranker interface {

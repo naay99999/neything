@@ -3,7 +3,7 @@ package chat
 import (
 	"context"
 
-	"github.com/naay/ney/internal/chunk"
+	"github.com/naay99999/neything/internal/chunk"
 )
 
 type ChatModel interface {

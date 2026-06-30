@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -27,81 +29,127 @@ func (e *GeminiEmbedder) ModelID() string { return e.Model }
 
 func (e *GeminiEmbedder) Dimensions() int {
 	switch e.Model {
-	case "text-embedding-004", "gemini-embedding-exp-03-07":
+	case "text-embedding-004", "gemini-embedding-001":
 		return 768
+	case "gemini-embedding-004", "gemini-embedding-2", "gemini-embedding-2-preview":
+		return 3072
 	default:
-		return 768
+		return 3072
 	}
 }
 
 func (e *GeminiEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	const batchSize = 100
-	var all [][]float32
-	for i := 0; i < len(texts); i += batchSize {
-		end := i + batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
-		batch, err := e.embedBatch(ctx, texts[i:end])
+	results := make([][]float32, len(texts))
+	// sequential to stay within free-tier RPM limits
+	for i, text := range texts {
+		vec, err := e.embedOneWithRetry(ctx, text)
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, batch...)
+		results[i] = vec
 	}
-	return all, nil
+	return results, nil
 }
 
-func (e *GeminiEmbedder) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	type contentPart struct {
-		Text string `json:"text"`
-	}
-	type content struct {
-		Parts []contentPart `json:"parts"`
-	}
-	type embedReq struct {
-		Model   string  `json:"model"`
-		Content content `json:"content"`
-	}
-
-	requests := make([]embedReq, len(texts))
-	for i, t := range texts {
-		requests[i] = embedReq{
-			Model:   "models/" + e.Model,
-			Content: content{Parts: []contentPart{{Text: t}}},
+func (e *GeminiEmbedder) embedOneWithRetry(ctx context.Context, text string) ([]float32, error) {
+	const maxRetries = 5
+	delay := 5 * time.Second
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		vec, retryAfter, err := e.embedOne(ctx, text)
+		if err == nil {
+			return vec, nil
 		}
+		if retryAfter == 0 {
+			return nil, err // non-retryable error
+		}
+		wait := retryAfter
+		if wait < delay {
+			wait = delay
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+		delay *= 2
 	}
+	return nil, fmt.Errorf("gemini embeddings: exceeded max retries")
+}
 
-	body, _ := json.Marshal(map[string]any{"requests": requests})
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s", e.Model, e.APIKey)
+// embedOne returns (vector, retryAfter, error).
+// retryAfter > 0 means 429 and the caller should retry after that duration.
+func (e *GeminiEmbedder) embedOne(ctx context.Context, text string) ([]float32, time.Duration, error) {
+	body, _ := json.Marshal(map[string]any{
+		"model": "models/" + e.Model,
+		"content": map[string]any{
+			"parts": []map[string]string{{"text": text}},
+		},
+	})
 
+	url := fmt.Sprintf(
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s",
+		e.Model, e.APIKey,
+	)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		b, _ := io.ReadAll(resp.Body)
+		// parse retryDelay from error details if present
+		retryAfter := parseRetryDelay(b)
+		if retryAfter == 0 {
+			retryAfter = 60 * time.Second
+		}
+		return nil, retryAfter, fmt.Errorf("rate limited (retry in %s)", retryAfter.Round(time.Second))
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gemini embeddings: status %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		return nil, 0, fmt.Errorf("gemini embeddings: status %d: %s", resp.StatusCode, bytes.TrimSpace(b))
 	}
 
 	var out struct {
-		Embeddings []struct {
+		Embedding struct {
 			Values []float32 `json:"values"`
-		} `json:"embeddings"`
+		} `json:"embedding"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	if len(out.Embedding.Values) == 0 {
+		return nil, 0, fmt.Errorf("gemini embeddings: empty response")
+	}
+	return out.Embedding.Values, 0, nil
+}
 
-	result := make([][]float32, len(out.Embeddings))
-	for i, e := range out.Embeddings {
-		result[i] = e.Values
+// parseRetryDelay extracts the retry delay from a Gemini 429 response body.
+// The body contains {"error":{"details":[{"retryDelay":"37s"}]}}.
+func parseRetryDelay(body []byte) time.Duration {
+	// fast path: find "retryDelay" string value
+	s := string(body)
+	idx := strings.Index(s, `"retryDelay"`)
+	if idx < 0 {
+		return 0
 	}
-	return result, nil
+	rest := s[idx+len(`"retryDelay"`):]
+	// skip : whitespace "
+	rest = strings.TrimLeft(rest, `: "`)
+	end := strings.IndexAny(rest, `"`)
+	if end < 0 {
+		return 0
+	}
+	d, err := time.ParseDuration(rest[:end])
+	if err != nil {
+		return 0
+	}
+	return d
 }

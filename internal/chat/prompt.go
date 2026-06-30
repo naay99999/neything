@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/naay/ney/internal/chunk"
+	"github.com/naay99999/neything/internal/chunk"
 )
 
 func buildPrompt(question string, ctxChunks []chunk.Chunk) string {

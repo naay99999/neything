@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/naay/ney/internal/search"
+	"github.com/naay99999/neything/internal/search"
 	"github.com/spf13/cobra"
 )
 

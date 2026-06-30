@@ -4,7 +4,7 @@ import (
 	"sort"
 	"unicode"
 
-	"github.com/naay/ney/internal/loader"
+	"github.com/naay99999/neything/internal/loader"
 )
 
 type CharacterChunker struct {

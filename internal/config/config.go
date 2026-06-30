@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/naay/ney/internal/chat"
-	"github.com/naay/ney/internal/embed"
+	"github.com/naay99999/neything/internal/chat"
+	"github.com/naay99999/neything/internal/embed"
 	"github.com/spf13/viper"
 )
 
@@ -27,6 +27,7 @@ type EmbedderConfig struct {
 type ChatConfig struct {
 	Provider string `mapstructure:"provider"`
 	Model    string `mapstructure:"model"`
+	Endpoint string `mapstructure:"endpoint"`
 }
 
 type RetrievalConfig struct {
@@ -132,15 +133,15 @@ func Load() (*Config, error) {
 
 func Validate(cfg *Config) error {
 	if cfg.Embedder.Provider == "claude" {
-		return fmt.Errorf("Claude does not provide an embedding API.\nSet embedder.provider to: openai, gemini, or ollama")
+		return fmt.Errorf("Claude does not provide an embedding API.\nSet embedder.provider to: openai, gemini, ollama, or lmstudio")
 	}
-	validEmbed := map[string]bool{"openai": true, "gemini": true, "ollama": true}
+	validEmbed := map[string]bool{"openai": true, "gemini": true, "ollama": true, "lmstudio": true}
 	if !validEmbed[cfg.Embedder.Provider] {
-		return fmt.Errorf("unknown embedder provider %q (valid: openai, gemini, ollama)", cfg.Embedder.Provider)
+		return fmt.Errorf("unknown embedder provider %q (valid: openai, gemini, ollama, lmstudio)", cfg.Embedder.Provider)
 	}
-	validChat := map[string]bool{"claude": true, "openai": true, "gemini": true, "ollama": true}
+	validChat := map[string]bool{"claude": true, "openai": true, "gemini": true, "ollama": true, "lmstudio": true}
 	if !validChat[cfg.Chat.Provider] {
-		return fmt.Errorf("unknown chat provider %q (valid: claude, openai, gemini, ollama)", cfg.Chat.Provider)
+		return fmt.Errorf("unknown chat provider %q (valid: claude, openai, gemini, ollama, lmstudio)", cfg.Chat.Provider)
 	}
 	if cfg.Embedder.Model == "" {
 		return fmt.Errorf("embedder.model is required")
@@ -170,8 +171,13 @@ func NewEmbedder(cfg *Config) (embed.Embedder, error) {
 		}
 		return embed.NewGeminiEmbedder(key, cfg.Embedder.Model), nil
 	case "ollama":
+		return embed.NewOllamaEmbedder(cfg.Embedder.Endpoint, cfg.Embedder.Model)
+	case "lmstudio":
 		endpoint := cfg.Embedder.Endpoint
-		return embed.NewOllamaEmbedder(endpoint, cfg.Embedder.Model)
+		if endpoint == "" {
+			endpoint = "http://localhost:1234"
+		}
+		return embed.NewOpenAICompatibleEmbedder(endpoint, cfg.Embedder.Model), nil
 	default:
 		return nil, fmt.Errorf("unknown embedder provider: %s", cfg.Embedder.Provider)
 	}
@@ -198,8 +204,13 @@ func NewChatModel(cfg *Config) (chat.ChatModel, error) {
 		}
 		return chat.NewGeminiChatModel(key, cfg.Chat.Model), nil
 	case "ollama":
-		endpoint := cfg.Embedder.Endpoint
-		return chat.NewOllamaChatModel(endpoint, cfg.Chat.Model), nil
+		return chat.NewOllamaChatModel(cfg.Chat.Endpoint, cfg.Chat.Model), nil
+	case "lmstudio":
+		endpoint := cfg.Chat.Endpoint
+		if endpoint == "" {
+			endpoint = "http://localhost:1234"
+		}
+		return chat.NewOpenAICompatibleChatModel(endpoint, cfg.Chat.Model), nil
 	default:
 		return nil, fmt.Errorf("unknown chat provider: %s", cfg.Chat.Provider)
 	}

@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/naay/ney/internal/embed"
-	"github.com/naay/ney/internal/store"
-	"github.com/naay/ney/internal/vectorstore"
+	"github.com/naay99999/neything/internal/embed"
+	"github.com/naay99999/neything/internal/store"
+	"github.com/naay99999/neything/internal/vectorstore"
 )
 
 type EnrichedResult struct {

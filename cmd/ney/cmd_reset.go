@@ -6,9 +6,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/naay/ney/internal/config"
-	"github.com/naay/ney/internal/store"
-	"github.com/naay/ney/internal/vectorstore"
+	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/store"
+	"github.com/naay99999/neything/internal/vectorstore"
 	"github.com/spf13/cobra"
 )
 

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/naay/ney/internal/chunk"
+	"github.com/naay99999/neything/internal/chunk"
 )
 
 type GeminiChatModel struct {

@@ -1,6 +1,6 @@
 package chunk
 
-import "github.com/naay/ney/internal/loader"
+import "github.com/naay99999/neything/internal/loader"
 
 type Chunk struct {
 	ID         string

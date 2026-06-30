@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/naay/ney/internal/chunk"
-	"github.com/naay/ney/internal/index"
-	"github.com/naay/ney/internal/loader"
+	"github.com/naay99999/neything/internal/chunk"
+	"github.com/naay99999/neything/internal/index"
+	"github.com/naay99999/neything/internal/loader"
 	"github.com/spf13/cobra"
 )
 

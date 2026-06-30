@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/naay/ney/internal/config"
-	"github.com/naay/ney/internal/store"
+	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/store"
 	"github.com/spf13/cobra"
 )
 

@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/naay/ney/internal/chunk"
+	"github.com/naay99999/neything/internal/chunk"
 )
 
 type OpenAIChatModel struct {
-	APIKey string
-	Model  string
-	client *http.Client
+	APIKey  string
+	Model   string
+	BaseURL string // empty = use OpenAI default
+	client  *http.Client
 }
 
 func NewOpenAIChatModel(apiKey, model string) *OpenAIChatModel {
@@ -22,6 +23,14 @@ func NewOpenAIChatModel(apiKey, model string) *OpenAIChatModel {
 		APIKey: apiKey,
 		Model:  model,
 		client: &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+func NewOpenAICompatibleChatModel(baseURL, model string) *OpenAIChatModel {
+	return &OpenAIChatModel{
+		BaseURL: baseURL,
+		Model:   model,
+		client:  &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
@@ -38,11 +47,17 @@ func (m *OpenAIChatModel) Complete(ctx context.Context, prompt string, ctxChunks
 		},
 	})
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
+	baseURL := m.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.openai.com"
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+m.APIKey)
+	if m.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+m.APIKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.client.Do(req)

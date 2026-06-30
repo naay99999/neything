@@ -38,10 +38,10 @@ checksum:
 brews:
   - name: ney
     repository:
-      owner: naay
+      owner: naay99999
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    homepage: "https://github.com/naay/ney"
+    homepage: "https://github.com/naay99999/neything"
     description: "Local-first CLI knowledge engine — index files, search by meaning, ask questions with source citations"
     license: "MIT"
     install: |
@@ -51,7 +51,7 @@ brews:
 
 release:
   github:
-    owner: naay
-    name: ney
+    owner: naay99999
+    name: neything
   draft: false
   prerelease: auto

@@ -14,7 +14,7 @@ ney ask "what are the retry policies for failed payments?"
 
 **macOS / Linux — curl:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/naay/ney/main/scripts/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.sh | sh
 ```
 
 **macOS — Homebrew:**
@@ -25,14 +25,14 @@ brew install ney
 
 **Go users:**
 ```bash
-go install github.com/naay/ney/cmd/ney@latest
+go install github.com/naay99999/neything/cmd/ney@latest
 ```
 > Make sure `$(go env GOPATH)/bin` is in your PATH — add `export PATH="$HOME/go/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) if `ney` isn't found after install.
 
 **Build from source:**
 ```bash
-git clone https://github.com/naay/ney
-cd ney
+git clone https://github.com/naay99999/neything
+cd neything
 go build -o ney ./cmd/ney
 ```
 

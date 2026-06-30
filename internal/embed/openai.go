@@ -10,9 +10,10 @@ import (
 )
 
 type OpenAIEmbedder struct {
-	APIKey string
-	Model  string
-	client *http.Client
+	APIKey  string
+	Model   string
+	BaseURL string // empty = use OpenAI default
+	client  *http.Client
 }
 
 func NewOpenAIEmbedder(apiKey, model string) *OpenAIEmbedder {
@@ -20,6 +21,14 @@ func NewOpenAIEmbedder(apiKey, model string) *OpenAIEmbedder {
 		APIKey: apiKey,
 		Model:  model,
 		client: &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+func NewOpenAICompatibleEmbedder(baseURL, model string) *OpenAIEmbedder {
+	return &OpenAIEmbedder{
+		BaseURL: baseURL,
+		Model:   model,
+		client:  &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -31,7 +40,9 @@ func (e *OpenAIEmbedder) Dimensions() int {
 		return 3072
 	case "text-embedding-ada-002":
 		return 1536
-	default: // text-embedding-3-small and others
+	case "text-embedding-nomic-embed-text-v1.5", "nomic-embed-text":
+		return 768
+	default:
 		return 1536
 	}
 }
@@ -62,11 +73,18 @@ func (e *OpenAIEmbedder) embedBatch(ctx context.Context, texts []string) ([][]fl
 	var result [][]float32
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/embeddings", bytes.NewReader(body))
+		baseURL := e.BaseURL
+		if baseURL == "" {
+			baseURL = "https://api.openai.com"
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/embeddings", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+e.APIKey)
+		if e.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+e.APIKey)
+		}
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := e.client.Do(req)

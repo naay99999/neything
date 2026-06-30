@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/naay/ney/internal/chunk"
-	"github.com/naay/ney/internal/embed"
-	"github.com/naay/ney/internal/loader"
-	"github.com/naay/ney/internal/store"
-	"github.com/naay/ney/internal/vectorstore"
+	"github.com/naay99999/neything/internal/chunk"
+	"github.com/naay99999/neything/internal/embed"
+	"github.com/naay99999/neything/internal/loader"
+	"github.com/naay99999/neything/internal/store"
+	"github.com/naay99999/neything/internal/vectorstore"
 )
 
 type Stats struct {
@@ -125,7 +125,9 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		batchSize = 32
 	}
 
-	// upsert document record
+	// upsert document record — must happen BEFORE opening tx
+	// (SetMaxOpenConns(1): opening tx holds the one connection; calling
+	//  d.db.Exec inside that tx causes a deadlock)
 	sd := &store.Document{
 		WorkspaceID: workspaceID,
 		Path:        doc.Path,
@@ -133,15 +135,14 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		Hash:        hash,
 		SizeBytes:   int64(sizeBytes),
 	}
+	docID, err := ix.DB.UpsertDocument(sd)
+	if err != nil {
+		return fmt.Errorf("upsert doc: %w", err)
+	}
+
 	tx, err := ix.DB.Begin()
 	if err != nil {
 		return err
-	}
-
-	docID, err := ix.DB.UpsertDocument(sd)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("upsert doc: %w", err)
 	}
 
 	// clear stale chunks
