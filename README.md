@@ -27,6 +27,7 @@ brew install ney
 ```bash
 go install github.com/naay/ney/cmd/ney@latest
 ```
+> Make sure `$(go env GOPATH)/bin` is in your PATH — add `export PATH="$HOME/go/bin:$PATH"` to `~/.zshrc` (or `~/.bashrc`) if `ney` isn't found after install.
 
 **Build from source:**
 ```bash
