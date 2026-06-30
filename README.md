@@ -19,7 +19,8 @@ curl -sSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/inst
 
 **macOS — Homebrew:**
 ```bash
-brew tap naay/tap
+brew trust naay99999/tap   # required once for new taps
+brew tap naay99999/tap
 brew install ney
 ```
 
