@@ -5,15 +5,16 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
 var flagMigrateVectors bool
 
 var indexCmd = &cobra.Command{
-	Use:   "index <path>",
-	Short: "Index files in a directory",
-	Args:  cobra.ExactArgs(1),
+	Use:   "index [path]",
+	Short: "Index files in a directory (defaults to asking about the current one)",
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runIndex,
 }
 
@@ -22,7 +23,20 @@ func init() {
 }
 
 func runIndex(cmd *cobra.Command, args []string) error {
-	rootPath, err := filepath.Abs(expandTilde(args[0]))
+	var rawPath string
+	switch {
+	case len(args) == 1:
+		rawPath = args[0]
+	case isatty.IsTerminal(os.Stdin.Fd()):
+		rawPath = promptIndexPath()
+		if rawPath == "" {
+			return fmt.Errorf("no path given")
+		}
+	default:
+		return fmt.Errorf("usage: ney index <path>")
+	}
+
+	rootPath, err := filepath.Abs(expandTilde(rawPath))
 	if err != nil {
 		return err
 	}
