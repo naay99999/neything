@@ -56,7 +56,7 @@ func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 		ChunkResolver: chunkResolver,
 		BatchSize:     32,
 		OnProgress: func(file string, chunks int) {
-			fmt.Fprintf(os.Stderr, "  indexed %s (%d chunks)\n", file, chunks)
+			fmt.Fprintf(os.Stderr, "  indexed %s (%d chunks)\n", displayPath(file), chunks)
 		},
 	}, nil
 }

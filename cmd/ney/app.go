@@ -18,11 +18,9 @@ type AppState struct {
 	Reranker rerank.Reranker
 }
 
-func initApp(cfg *config.Config) (*AppState, error) {
-	return initAppWithOptions(cfg, false)
-}
-
-func initAppWithOptions(cfg *config.Config, migrateVectors bool) (*AppState, error) {
+// initAppWithOptions wires the app. needChat is false for commands that never
+// call the LLM (index/search/watch) so a missing chat API key can't block them.
+func initAppWithOptions(cfg *config.Config, migrateVectors, needChat bool) (*AppState, error) {
 	db, err := store.Open(config.DBPath())
 	if err != nil {
 		return nil, err
@@ -37,10 +35,13 @@ func initAppWithOptions(cfg *config.Config, migrateVectors bool) (*AppState, err
 		db.Close()
 		return nil, err
 	}
-	chatModel, err := config.NewChatModel(cfg)
-	if err != nil {
-		db.Close()
-		return nil, err
+	var chatModel chat.ChatModel
+	if needChat {
+		chatModel, err = config.NewChatModel(cfg)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	reranker, err := config.NewReranker(cfg)
 	if err != nil {

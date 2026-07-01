@@ -24,7 +24,7 @@ func init() {
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
-	rootPath, err := filepath.Abs(args[0])
+	rootPath, err := filepath.Abs(expandTilde(args[0]))
 	if err != nil {
 		return err
 	}
@@ -42,7 +42,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
-	app, err := initAppFromConfig(cfg)
+	app, err := initAppFromConfig(cfg, false)
 	if err != nil {
 		return err
 	}

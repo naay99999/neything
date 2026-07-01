@@ -17,9 +17,9 @@ func applyProviderOverride(cfg *config.Config, forEmbedder bool) {
 	}
 }
 
-func initAppFromConfig(cfg *config.Config) (*AppState, error) {
+func initAppFromConfig(cfg *config.Config, needChat bool) (*AppState, error) {
 	if err := config.Validate(cfg); err != nil {
 		return nil, fmt.Errorf("config error: %w", err)
 	}
-	return initApp(cfg)
+	return initAppWithOptions(cfg, false, needChat)
 }

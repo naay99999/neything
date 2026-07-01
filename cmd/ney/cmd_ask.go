@@ -25,11 +25,15 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, false)
-	app, err := initAppFromConfig(cfg)
+	app, err := initAppFromConfig(cfg, true)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
+
+	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
+		return err
+	}
 
 	topK := flagTopK
 	if topK <= 0 {
@@ -94,7 +98,7 @@ func dedupeSources(results []search.EnrichedResult) []string {
 	seen := make(map[string]bool)
 	var out []string
 	for _, r := range results {
-		src := citation.FormatSource(r.DocPath, r.DocType, r.StartPos, r.EndPos)
+		src := citation.FormatSource(displayPath(r.DocPath), r.DocType, r.StartPos, r.EndPos)
 		if seen[src] {
 			continue
 		}

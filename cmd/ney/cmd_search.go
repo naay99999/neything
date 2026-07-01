@@ -23,11 +23,15 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
-	app, err := initAppFromConfig(cfg)
+	app, err := initAppFromConfig(cfg, false)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
+
+	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
+		return err
+	}
 
 	topK := flagTopK
 	if topK <= 0 {
@@ -54,7 +58,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, g := range groups {
-		fmt.Printf("%s %s\n", Bold(g.DocPath), Dim(fmt.Sprintf("(best: %.4f)", g.BestScore)))
+		fmt.Printf("%s %s\n", Bold(displayPath(g.DocPath)), Dim(fmt.Sprintf("(best: %.4f)", g.BestScore)))
 		for i, r := range g.Chunks {
 			loc := citation.FormatLocation(r.DocType, r.StartPos, r.EndPos)
 			if loc != "" {

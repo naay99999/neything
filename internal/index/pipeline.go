@@ -3,8 +3,10 @@ package index
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,10 +24,30 @@ type Stats struct {
 	FilesScanned  int
 	FilesSkipped  int
 	FilesRemoved  int
+	FilesFailed   int
 	ChunksCreated int
 	VectorsPruned int
 	Duration      time.Duration
 }
+
+// EmbedUnavailableError marks an embedding failure caused by the provider
+// being unreachable (connection refused, timeout, DNS). It aborts the whole
+// run instead of burning one timeout per file on an endpoint that is down.
+type EmbedUnavailableError struct{ Err error }
+
+func (e *EmbedUnavailableError) Error() string { return e.Err.Error() }
+func (e *EmbedUnavailableError) Unwrap() error { return e.Err }
+
+// EmbedError marks any other embedding failure (e.g. HTTP 4xx). A few of
+// these in one run means the embedder is broken, not the files.
+type EmbedError struct{ Err error }
+
+func (e *EmbedError) Error() string { return e.Err.Error() }
+func (e *EmbedError) Unwrap() error { return e.Err }
+
+// maxEmbedFailures is how many embedding errors a run tolerates before
+// concluding the embedder itself is broken and aborting.
+const maxEmbedFailures = 3
 
 type Indexer struct {
 	DB            *store.DB
@@ -64,6 +86,7 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
 	pathToHash := make(map[string]string)
+	embedFailures := 0
 
 	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -90,7 +113,19 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*
 		pathToHash[path] = hash
 
 		if err := ix.indexFileIfNeeded(ctx, path, workspaceID, hash, len(fileData), stats); err != nil {
+			var unavailable *EmbedUnavailableError
+			if errors.As(err, &unavailable) || ctx.Err() != nil {
+				return err
+			}
+			stats.FilesFailed++
 			fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", path, err)
+			var embedErr *EmbedError
+			if errors.As(err, &embedErr) {
+				embedFailures++
+				if embedFailures >= maxEmbedFailures {
+					return fmt.Errorf("embedding failed %d times — the embedder looks broken, aborting: %w", embedFailures, embedErr.Err)
+				}
+			}
 		}
 		return nil
 	})
@@ -240,8 +275,13 @@ func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspace
 		return fmt.Errorf("get doc: %w", err)
 	}
 	if existing != nil && existing.Hash == hash {
-		stats.FilesSkipped++
-		return nil
+		// Only trust the hash if chunks actually exist — heals indexes
+		// where an earlier failed run left a hashed but chunk-less row.
+		ids, cErr := ix.DB.GetChunkIDsByDocument(existing.ID)
+		if cErr == nil && len(ids) > 0 {
+			stats.FilesSkipped++
+			return nil
+		}
 	}
 
 	if existing == nil {
@@ -328,11 +368,16 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		batchSize = 32
 	}
 
+	// The row is upserted without its content hash: the hash is only recorded
+	// after chunks are committed. Otherwise a failed embed would leave a
+	// fresh-looking document that every later run skips as "unchanged".
+	// (Upserting must stay outside the tx — the single SQLite connection is
+	// already held once the tx opens.)
 	sd := &store.Document{
 		WorkspaceID: workspaceID,
 		Path:        doc.Path,
 		Type:        doc.Type,
-		Hash:        hash,
+		Hash:        "",
 		SizeBytes:   int64(sizeBytes),
 	}
 	docID, err := ix.DB.UpsertDocument(sd)
@@ -360,7 +405,7 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 			}
 			stats.VectorsPruned += len(oldIDs)
 		}
-		return nil
+		return ix.DB.UpdateDocumentHash(docID, hash)
 	}
 
 	var storeChunks []*store.Chunk
@@ -381,7 +426,12 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		vecs, err := ix.Embedder.Embed(ctx, texts)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("embed batch: %w", err)
+			wrapped := fmt.Errorf("embed batch: %w", err)
+			var ue *url.Error
+			if errors.As(err, &ue) && ctx.Err() == nil {
+				return &EmbedUnavailableError{Err: wrapped}
+			}
+			return &EmbedError{Err: wrapped}
 		}
 
 		for j, c := range batch {
@@ -434,6 +484,10 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		if err := ix.Vectors.Add(ctx, vectorItems); err != nil {
 			return fmt.Errorf("add vectors: %w", err)
 		}
+	}
+
+	if err := ix.DB.UpdateDocumentHash(docID, hash); err != nil {
+		return fmt.Errorf("record hash: %w", err)
 	}
 
 	stats.ChunksCreated += len(storeChunks)

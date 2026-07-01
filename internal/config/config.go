@@ -89,16 +89,19 @@ type HNSWConfig struct {
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 
+# Tip: run 'ney init' to fill this in interactively.
+
 # embedder: used to create vectors (cannot be claude)
 embedder:
-  provider: ollama          # openai | gemini | ollama
+  provider: ollama          # openai | gemini | ollama | lmstudio
   model: bge-m3
-  # endpoint: http://localhost:11434   # ollama only
+  # endpoint: http://localhost:11434   # ollama / lmstudio (LM Studio default: http://localhost:1234)
 
 # chat: used to answer questions in 'ney ask'
 chat:
-  provider: claude          # claude | openai | gemini | ollama
+  provider: claude          # claude | openai | gemini | ollama | lmstudio
   model: claude-sonnet-4-6
+  # endpoint: http://localhost:1234    # ollama / lmstudio only
 
 # retrieval settings
 retrieval:
@@ -173,7 +176,7 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("write default config: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "Created default config at %s\n", cfgPath)
-		fmt.Fprintf(os.Stderr, "Edit it to configure your providers and API keys.\n\n")
+		fmt.Fprintf(os.Stderr, "Run `ney init` for interactive setup, or edit the file to configure providers.\n\n")
 	}
 
 	v := viper.New()

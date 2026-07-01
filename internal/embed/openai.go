@@ -92,7 +92,7 @@ func (e *OpenAIEmbedder) embedBatch(ctx context.Context, texts []string) ([][]fl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("openai embeddings: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("openai embeddings: status %d%s", resp.StatusCode, errBodySnippet(resp.Body))
 	}
 
 	var out struct {

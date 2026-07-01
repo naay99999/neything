@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
@@ -42,18 +43,28 @@ func runModels(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// if Ollama configured, list installed models
+	// if a local server is configured, list what it has available
 	var ollamaModels []string
 	if cfg.Embedder.Provider == "ollama" || cfg.Chat.Provider == "ollama" {
 		ollamaModels = listOllamaModels(cfg.Embedder.Endpoint)
+	}
+	var lmModels []string
+	lmConfigured := cfg.Embedder.Provider == "lmstudio" || cfg.Chat.Provider == "lmstudio"
+	if lmConfigured {
+		endpoint := cfg.Embedder.Endpoint
+		if cfg.Embedder.Provider != "lmstudio" {
+			endpoint = cfg.Chat.Endpoint
+		}
+		lmModels = listOpenAICompatModels(endpoint)
 	}
 
 	if flagJSON {
 		type out struct {
 			Configured []modelEntry `json:"configured"`
 			Ollama     []string     `json:"ollama_installed"`
+			LMStudio   []string     `json:"lmstudio_available"`
 		}
-		PrintJSON(out{Configured: entries, Ollama: ollamaModels})
+		PrintJSON(out{Configured: entries, Ollama: ollamaModels, LMStudio: lmModels})
 		return nil
 	}
 
@@ -76,7 +87,46 @@ func runModels(cmd *cobra.Command, args []string) error {
 	} else if cfg.Embedder.Provider == "ollama" || cfg.Chat.Provider == "ollama" {
 		fmt.Println("\n[Ollama offline or no models installed]")
 	}
+	if len(lmModels) > 0 {
+		fmt.Println("\nModels available on the OpenAI-compatible server:")
+		for _, m := range lmModels {
+			fmt.Printf("  - %s\n", m)
+		}
+	} else if lmConfigured {
+		fmt.Println("\n[LM Studio / OpenAI-compatible server offline or no models loaded]")
+	}
 	return nil
+}
+
+// listOpenAICompatModels queries an OpenAI-compatible /v1/models endpoint
+// (LM Studio, vLLM, llama.cpp server, …) and returns the model ids.
+func listOpenAICompatModels(endpoint string) []string {
+	if endpoint == "" {
+		endpoint = "http://localhost:1234"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(strings.TrimRight(endpoint, "/") + "/v1/models")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil
+	}
+	names := make([]string, len(out.Data))
+	for i, m := range out.Data {
+		names[i] = m.ID
+	}
+	return names
 }
 
 func listOllamaModels(endpoint string) []string {

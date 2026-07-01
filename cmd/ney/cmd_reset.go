@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"strings"
@@ -32,10 +31,7 @@ type resetResult struct {
 
 func runReset(cmd *cobra.Command, args []string) error {
 	if !resetForce {
-		fmt.Print("This will delete all indexed data. Continue? [y/N] ")
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Scan()
-		if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+		if strings.ToLower(promptLine("This will delete all indexed data. Continue? [y/N] ")) != "y" {
 			if flagJSON {
 				PrintJSON(resetResult{OK: false, Aborted: true})
 				return nil

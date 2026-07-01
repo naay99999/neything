@@ -154,7 +154,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			Check:   "embedder_not_claude",
 			OK:      false,
 			Message: "Claude cannot be used as embedder",
-			Hint:    "Set embedder.provider to: openai, gemini, or ollama",
+			Hint:    "Set embedder.provider to: openai, gemini, ollama, or lmstudio",
 		})
 	} else {
 		results = append(results, checkResult{
@@ -255,6 +255,59 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			}
 			if cfg.Chat.Provider == "ollama" {
 				checkModel(cfg.Chat.Model, "chat")
+			}
+		}
+	}
+
+	// 5b. LM Studio / OpenAI-compatible server reachable + model available
+	lmNeeded := cfg.Embedder.Provider == "lmstudio" || cfg.Chat.Provider == "lmstudio"
+	if lmNeeded {
+		endpoint := cfg.Embedder.Endpoint
+		if cfg.Embedder.Provider != "lmstudio" {
+			endpoint = cfg.Chat.Endpoint
+		}
+		if endpoint == "" {
+			endpoint = "http://localhost:1234"
+		}
+		available := listOpenAICompatModels(endpoint)
+		if available == nil {
+			results = append(results, checkResult{
+				Check:   "lmstudio_reachable",
+				OK:      false,
+				Message: "LM Studio / OpenAI-compatible server not reachable at " + endpoint,
+				Hint:    "Start the server (LM Studio: Developer tab → Start Server), or fix the endpoint: ney init",
+			})
+		} else {
+			results = append(results, checkResult{
+				Check:   "lmstudio_reachable",
+				OK:      true,
+				Message: fmt.Sprintf("OpenAI-compatible server reachable at %s (%d models)", endpoint, len(available)),
+			})
+			availableSet := map[string]bool{}
+			for _, m := range available {
+				availableSet[m] = true
+			}
+			checkLMModel := func(model, role string) {
+				if availableSet[model] {
+					results = append(results, checkResult{
+						Check:   "lmstudio_model_" + role,
+						OK:      true,
+						Message: fmt.Sprintf("Server %s model %q available", role, model),
+					})
+				} else {
+					results = append(results, checkResult{
+						Check:   "lmstudio_model_" + role,
+						OK:      false,
+						Message: fmt.Sprintf("Server %s model %q not found", role, model),
+						Hint:    "Load the model in LM Studio, or pick another: ney init",
+					})
+				}
+			}
+			if cfg.Embedder.Provider == "lmstudio" {
+				checkLMModel(cfg.Embedder.Model, "embedder")
+			}
+			if cfg.Chat.Provider == "lmstudio" {
+				checkLMModel(cfg.Chat.Model, "chat")
 			}
 		}
 	}

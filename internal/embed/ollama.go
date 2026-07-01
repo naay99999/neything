@@ -85,7 +85,7 @@ func (e *OllamaEmbedder) embedBatch(ctx context.Context, texts []string) ([][]fl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama embed: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("ollama embed: status %d%s", resp.StatusCode, errBodySnippet(resp.Body))
 	}
 
 	var out struct {

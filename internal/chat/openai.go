@@ -68,7 +68,7 @@ func (m *OpenAIChatModel) Complete(ctx context.Context, prompt string, ctxChunks
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("openai chat: status %d", resp.StatusCode)
+		return "", fmt.Errorf("openai chat: status %d%s", resp.StatusCode, errBodySnippet(resp.Body))
 	}
 
 	var out struct {

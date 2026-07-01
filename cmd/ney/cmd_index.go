@@ -22,7 +22,7 @@ func init() {
 }
 
 func runIndex(cmd *cobra.Command, args []string) error {
-	rootPath, err := filepath.Abs(args[0])
+	rootPath, err := filepath.Abs(expandTilde(args[0]))
 	if err != nil {
 		return err
 	}
@@ -40,7 +40,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
-	app, err := initAppWithOptions(cfg, flagMigrateVectors)
+	app, err := initAppWithOptions(cfg, flagMigrateVectors, false)
 	if err != nil {
 		return err
 	}
@@ -51,7 +51,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Indexing %s (workspace: %s)...\n", rootPath, workspaceName)
+	fmt.Fprintf(os.Stderr, "Indexing %s (workspace: %s)...\n", displayPath(rootPath), workspaceName)
 
 	stats, err := ix.Index(cmd.Context(), rootPath, workspaceName)
 	if err != nil {
@@ -63,6 +63,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		FilesScanned  int    `json:"files_scanned"`
 		FilesSkipped  int    `json:"files_skipped"`
 		FilesRemoved  int    `json:"files_removed"`
+		FilesFailed   int    `json:"files_failed"`
 		ChunksCreated int    `json:"chunks_created"`
 		VectorsPruned int    `json:"vectors_pruned"`
 		DurationMs    int64  `json:"duration_ms"`
@@ -72,6 +73,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		FilesScanned:  stats.FilesScanned,
 		FilesSkipped:  stats.FilesSkipped,
 		FilesRemoved:  stats.FilesRemoved,
+		FilesFailed:   stats.FilesFailed,
 		ChunksCreated: stats.ChunksCreated,
 		VectorsPruned: stats.VectorsPruned,
 		DurationMs:    stats.Duration.Milliseconds(),
@@ -79,6 +81,9 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	if flagJSON {
 		PrintJSON(r)
+		if stats.FilesFailed > 0 {
+			return fmt.Errorf("%d file(s) failed to index", stats.FilesFailed)
+		}
 		return nil
 	}
 
@@ -90,6 +95,9 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	fmt.Println(Green(fmt.Sprintf("✓ %d chunks embedded", stats.ChunksCreated)))
 	if stats.VectorsPruned > 0 {
 		fmt.Println(Green(fmt.Sprintf("✓ %d vectors pruned", stats.VectorsPruned)))
+	}
+	if stats.FilesFailed > 0 {
+		return fmt.Errorf("%d file(s) failed to index (see warnings above)", stats.FilesFailed)
 	}
 	fmt.Println(Green(fmt.Sprintf("✓ Index ready (%s) in %s", "~/.ney/index.db", stats.Duration.Round(1000000000))))
 	return nil

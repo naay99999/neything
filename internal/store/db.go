@@ -216,6 +216,14 @@ func (d *DB) DeleteDocumentWithCleanup(docID int64) ([]int64, error) {
 	return chunkIDs, nil
 }
 
+// UpdateDocumentHash records a document's content hash. Indexing sets the
+// hash only after its chunks are committed, so a failed run can't leave a
+// chunk-less document that later runs skip as "unchanged".
+func (d *DB) UpdateDocumentHash(docID int64, hash string) error {
+	_, err := d.db.Exec(`UPDATE documents SET hash=? WHERE id=?`, hash, docID)
+	return err
+}
+
 func (d *DB) UpdateDocumentPath(docID int64, newPath string) error {
 	_, err := d.db.Exec(
 		`UPDATE documents SET path=?, indexed_at=CURRENT_TIMESTAMP WHERE id=?`,
