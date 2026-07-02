@@ -20,9 +20,8 @@ func (d *DB) DeleteChunkFTS(tx *sql.Tx, chunkIDs []int64) error {
 	return d.deleteChunkFTSDirectTx(tx, chunkIDs)
 }
 
-func (d *DB) deleteChunkFTSDirect(chunkIDs []int64) error {
-	return d.deleteChunkFTSDirectTx(nil, chunkIDs)
-}
+// ftsDeleteBatch keeps IN(...) lists well under SQLite's bound-variable limit.
+const ftsDeleteBatch = 500
 
 func (d *DB) deleteChunkFTSDirectTx(tx *sql.Tx, chunkIDs []int64) error {
 	if len(chunkIDs) == 0 {
@@ -36,8 +35,19 @@ func (d *DB) deleteChunkFTSDirectTx(tx *sql.Tx, chunkIDs []int64) error {
 		_, err := d.db.Exec(query, args...)
 		return err
 	}
-	for _, id := range chunkIDs {
-		if err := exec(`DELETE FROM chunks_fts WHERE rowid=?`, id); err != nil {
+	for start := 0; start < len(chunkIDs); start += ftsDeleteBatch {
+		end := start + ftsDeleteBatch
+		if end > len(chunkIDs) {
+			end = len(chunkIDs)
+		}
+		batch := chunkIDs[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		if err := exec(`DELETE FROM chunks_fts WHERE rowid IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
 			return err
 		}
 	}

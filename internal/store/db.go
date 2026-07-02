@@ -200,17 +200,26 @@ func (d *DB) DeleteDocument(id int64) error {
 	return err
 }
 
-// DeleteDocumentWithCleanup removes a document, its FTS rows, and cascading chunks.
-// Returns deleted chunk IDs for vector store cleanup.
+// DeleteDocumentWithCleanup removes a document, its FTS rows, and cascading chunks
+// in one transaction. Returns deleted chunk IDs for vector store cleanup.
 func (d *DB) DeleteDocumentWithCleanup(docID int64) ([]int64, error) {
 	chunkIDs, err := d.GetChunkIDsByDocument(docID)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.deleteChunkFTSDirect(chunkIDs); err != nil {
+	tx, err := d.db.Begin()
+	if err != nil {
 		return nil, err
 	}
-	if _, err := d.db.Exec(`DELETE FROM documents WHERE id=?`, docID); err != nil {
+	if err := d.DeleteChunkFTS(tx, chunkIDs); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM documents WHERE id=?`, docID); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return chunkIDs, nil

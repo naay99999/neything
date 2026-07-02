@@ -49,6 +49,10 @@ func (e *EmbedError) Unwrap() error { return e.Err }
 // concluding the embedder itself is broken and aborting.
 const maxEmbedFailures = 3
 
+// flushEveryDocs bounds how much indexed work a crash can lose: vectors are
+// held in memory between flushes (SQLite commits per document regardless).
+const flushEveryDocs = 100
+
 type Indexer struct {
 	DB            *store.DB
 	Vectors       vectorstore.VectorStore
@@ -71,7 +75,7 @@ var supportedExts = map[string]bool{
 	".xml":      true,
 }
 
-func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*Stats, error) {
+func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_ *Stats, err error) {
 	start := time.Now()
 
 	if err := ix.checkEmbedderConsistency(); err != nil {
@@ -83,10 +87,19 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*
 		return nil, fmt.Errorf("upsert workspace: %w", err)
 	}
 
+	// Flush even on error so documents already committed to SQLite keep
+	// their vectors when a run aborts partway through.
+	defer func() {
+		if ferr := ix.Vectors.Flush(); ferr != nil && err == nil {
+			err = fmt.Errorf("flush vectors: %w", ferr)
+		}
+	}()
+
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
 	pathToHash := make(map[string]string)
 	embedFailures := 0
+	docsSinceFlush := 0
 
 	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -126,6 +139,14 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*
 					return fmt.Errorf("embedding failed %d times — the embedder looks broken, aborting: %w", embedFailures, embedErr.Err)
 				}
 			}
+			return nil
+		}
+		docsSinceFlush++
+		if docsSinceFlush >= flushEveryDocs {
+			docsSinceFlush = 0
+			if err := ix.Vectors.Flush(); err != nil {
+				return fmt.Errorf("flush vectors: %w", err)
+			}
 		}
 		return nil
 	})
@@ -137,7 +158,8 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*
 		fmt.Fprintf(os.Stderr, "warning: git history: %v\n", err)
 	}
 
-	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, pathToHash, stats); err != nil {
+	hashFor := func(path string) string { return pathToHash[path] }
+	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, hashFor, stats); err != nil {
 		return nil, err
 	}
 
@@ -170,8 +192,13 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 		return stats, err
 	}
 
-	ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
-	ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
+	if stats.FilesSkipped == 0 {
+		if err := ix.Vectors.Flush(); err != nil {
+			return stats, fmt.Errorf("flush vectors: %w", err)
+		}
+		ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
+		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
+	}
 	_ = workspaceName
 	return stats, nil
 }
@@ -194,6 +221,9 @@ func (ix *Indexer) RemovePath(ctx context.Context, path string) (*Stats, error) 
 		if err := ix.Vectors.Delete(ctx, store.Int64SliceToStrings(chunkIDs)); err != nil {
 			return nil, fmt.Errorf("delete vectors: %w", err)
 		}
+		if err := ix.Vectors.Flush(); err != nil {
+			return nil, fmt.Errorf("flush vectors: %w", err)
+		}
 		stats.VectorsPruned += len(chunkIDs)
 	}
 	stats.FilesRemoved++
@@ -205,7 +235,6 @@ func (ix *Indexer) RemovePath(ctx context.Context, path string) (*Stats, error) 
 func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceID int64) (*Stats, error) {
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
-	pathToHash := make(map[string]string)
 
 	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -222,19 +251,30 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 			return nil
 		}
 		seenPaths[path] = true
-		fileData, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		pathToHash[path] = fmt.Sprintf("%x", sha256.Sum256(fileData))
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, pathToHash, stats); err != nil {
+	// Hash lazily: pruneMissing only asks for rename candidates, and only
+	// when documents actually went missing — the common no-op sync (e.g.
+	// the watcher's periodic prune) never reads file contents at all.
+	hashFor := func(path string) string {
+		fileData, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		return fmt.Sprintf("%x", sha256.Sum256(fileData))
+	}
+
+	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, hashFor, stats); err != nil {
 		return nil, err
+	}
+	if stats.VectorsPruned > 0 {
+		if err := ix.Vectors.Flush(); err != nil {
+			return nil, fmt.Errorf("flush vectors: %w", err)
+		}
 	}
 	if stats.FilesRemoved > 0 {
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
@@ -314,22 +354,52 @@ func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspace
 	return nil
 }
 
-func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPaths map[string]bool, pathToHash map[string]string, stats *Stats) error {
+// pruneMissing deletes documents whose files are gone, first checking for
+// renames by content hash. hashFor returns a file's content hash ("" if
+// unknown); it is only called for rename candidates, and only when some
+// document is actually missing.
+func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPaths map[string]bool, hashFor func(path string) string, stats *Stats) error {
 	docs, err := ix.DB.GetDocumentsByWorkspace(workspaceID)
 	if err != nil {
 		return err
 	}
+
+	docPaths := make(map[string]bool, len(docs))
 	for _, doc := range docs {
-		if seenPaths[doc.Path] {
+		docPaths[doc.Path] = true
+	}
+	var missing []*store.Document
+	for _, doc := range docs {
+		if !seenPaths[doc.Path] {
+			missing = append(missing, doc)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	// Rename candidates are files without a document row of their own in
+	// this workspace; only those need hashing.
+	hashToPaths := make(map[string][]string)
+	for p := range seenPaths {
+		if docPaths[p] {
 			continue
 		}
+		if h := hashFor(p); h != "" {
+			hashToPaths[h] = append(hashToPaths[h], p)
+		}
+	}
 
+	claimed := make(map[string]bool)
+	for _, doc := range missing {
 		var renamePath string
 		matchCount := 0
-		for p, h := range pathToHash {
-			if h != doc.Hash {
+		for _, p := range hashToPaths[doc.Hash] {
+			if claimed[p] {
 				continue
 			}
+			// A candidate may still belong to a document in another
+			// workspace (paths are globally unique).
 			existing, err := ix.DB.GetDocumentByPath(p)
 			if err != nil {
 				return err
@@ -344,6 +414,7 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 			if err := ix.DB.UpdateDocumentPath(doc.ID, renamePath); err != nil {
 				return err
 			}
+			claimed[renamePath] = true
 			continue
 		}
 

@@ -353,6 +353,7 @@ func offerResetOnModelChange(ctx context.Context, cfg *config.Config, w *wizardC
 			}
 			os.Remove(config.VectorsPath())
 			os.Remove(config.HNSWPath())
+			os.Remove(config.HNSWPath() + ".graph")
 			fmt.Println(Green("✓ Index cleared — run: ney index <path>"))
 		} else {
 			fmt.Println(Dim("Left as-is. `ney index` will refuse until you run: ney reset"))

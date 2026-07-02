@@ -2,6 +2,7 @@ package vectorstore
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -76,7 +77,7 @@ func normalize(v []float32) {
 	if sum == 0 {
 		return
 	}
-	inv := float32(1.0 / sqrt(float64(sum)))
+	inv := float32(1.0 / math.Sqrt(float64(sum)))
 	for i := range v {
 		v[i] *= inv
 	}

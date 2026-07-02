@@ -16,6 +16,9 @@ type VectorStore interface {
 	Add(ctx context.Context, items []VectorItem) error
 	Search(ctx context.Context, query []float32, k int) ([]SearchResult, error)
 	Delete(ctx context.Context, ids []string) error
+	// Flush persists in-memory state to disk. Add and Delete only mutate
+	// memory; callers must Flush (or Close) after a batch of mutations.
+	Flush() error
 	Count() int
 	Close() error
 }

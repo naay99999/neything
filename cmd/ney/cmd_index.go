@@ -59,6 +59,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer app.DB.Close()
+	defer app.Vectors.Close()
 
 	ix, err := newIndexer(app, cfg)
 	if err != nil {

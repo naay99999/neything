@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS providers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(workspace_id, hash);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

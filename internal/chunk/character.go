@@ -19,6 +19,13 @@ func (c *CharacterChunker) Chunk(doc loader.Document) []Chunk {
 		return nil
 	}
 
+	// byteOff[i] is the byte offset of rune i (byteOff[total] = len).
+	byteOff := make([]int, 0, total+1)
+	for i := range doc.Content {
+		byteOff = append(byteOff, i)
+	}
+	byteOff = append(byteOff, len(doc.Content))
+
 	var chunks []Chunk
 	idx := 0
 	chunkIndex := 0
@@ -42,8 +49,8 @@ func (c *CharacterChunker) Chunk(doc loader.Document) []Chunk {
 		}
 
 		content := string(runes[idx:end])
-		byteStart := runeOffsetToByteOffset(doc.Content, idx)
-		byteEnd := runeOffsetToByteOffset(doc.Content, end)
+		byteStart := byteOff[idx]
+		byteEnd := byteOff[end]
 
 		chunks = append(chunks, Chunk{
 			DocumentID: 0,
@@ -61,16 +68,6 @@ func (c *CharacterChunker) Chunk(doc loader.Document) []Chunk {
 		idx = next
 	}
 	return chunks
-}
-
-func runeOffsetToByteOffset(s string, runeIdx int) int {
-	for i := range s {
-		if runeIdx == 0 {
-			return i
-		}
-		runeIdx--
-	}
-	return len(s)
 }
 
 func lookupPosition(posMap []loader.PositionEntry, byteOffset int) int {

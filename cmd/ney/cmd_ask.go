@@ -30,6 +30,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer app.DB.Close()
+	defer app.Vectors.Close()
 
 	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
 		return err

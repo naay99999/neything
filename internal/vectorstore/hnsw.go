@@ -1,10 +1,12 @@
 package vectorstore
 
 import (
+	"bufio"
 	"context"
-	"container/heap"
 	"fmt"
+	"math"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/coder/hnsw"
@@ -23,7 +25,14 @@ type HNSWStore struct {
 	path     string
 	m        int
 	efSearch int
-	dirty    bool
+	// dirty means the graph no longer matches items and must be rebuilt
+	// before searching. Adds are applied incrementally while the graph is
+	// clean; deletes always mark it dirty because hnsw.Graph.Delete leaves
+	// the graph (and any later export of it) in a state that can panic
+	// during search.
+	dirty        bool
+	itemsUnsaved bool // items differ from the flat vector file on disk
+	graphUnsaved bool // graph differs from the graph cache file on disk
 }
 
 func NewHNSWStore(path string, opts HNSWOptions) (*HNSWStore, error) {
@@ -40,11 +49,19 @@ func NewHNSWStore(path string, opts HNSWOptions) (*HNSWStore, error) {
 		efSearch: opts.EfSearch,
 		dirty:    true,
 	}
-	if err := s.load(); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("load hnsw vectors: %w", err)
+	if err := s.load(); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("load hnsw vectors: %w", err)
+		}
+		// Brand-new store: start with an empty clean graph so indexing
+		// builds it incrementally instead of forcing a rebuild later.
+		s.graph = s.newGraph()
+		s.dirty = false
 	}
 	return s, nil
 }
+
+func (s *HNSWStore) graphPath() string { return s.path + ".graph" }
 
 func (s *HNSWStore) load() error {
 	items, err := loadFlatVectors(s.path)
@@ -53,19 +70,69 @@ func (s *HNSWStore) load() error {
 	}
 	s.items = itemsToMap(items)
 	s.dirty = true
+	if g := s.importGraph(); g != nil {
+		s.graph = g
+		s.dirty = false
+	}
 	return nil
 }
 
-func (s *HNSWStore) persistLocked() error {
-	return saveFlatVectors(s.path, mapToItems(s.items))
+// importGraph loads the persisted graph cache and validates it against
+// items. The graph file is only a cache of the flat vector file; on any
+// mismatch it is discarded and the graph is rebuilt lazily.
+func (s *HNSWStore) importGraph() *hnsw.Graph[string] {
+	f, err := os.Open(s.graphPath())
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	g := s.newGraph()
+	if err := g.Import(bufio.NewReaderSize(f, 1<<20)); err != nil {
+		return nil
+	}
+	// Import restores the exported parameters; keep the configured ones.
+	g.M = s.m
+	g.EfSearch = s.efSearch
+	if g.Len() != len(s.items) {
+		return nil
+	}
+	for id := range s.items {
+		if _, ok := g.Lookup(id); !ok {
+			return nil
+		}
+	}
+	if !probeGraph(g, s.items) {
+		return nil
+	}
+	return g
 }
 
-func (s *HNSWStore) rebuildGraphLocked() {
+// probeGraph runs one throwaway search to reject cache files whose node
+// links are broken (searching such a graph panics deep in the library).
+func probeGraph(g *hnsw.Graph[string], items map[string]VectorItem) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	for _, item := range items {
+		g.Search(item.Vector, 1)
+		break
+	}
+	return true
+}
+
+func (s *HNSWStore) newGraph() *hnsw.Graph[string] {
 	g := hnsw.NewGraph[string]()
 	g.M = s.m
 	g.EfSearch = s.efSearch
 	g.Distance = hnsw.CosineDistance
+	return g
+}
 
+func (s *HNSWStore) rebuildGraphLocked() {
+	g := s.newGraph()
 	if len(s.items) > 0 {
 		nodes := make([]hnsw.Node[string], 0, len(s.items))
 		for _, item := range s.items {
@@ -75,31 +142,54 @@ func (s *HNSWStore) rebuildGraphLocked() {
 	}
 	s.graph = g
 	s.dirty = false
+	s.graphUnsaved = true
 }
+
+func (s *HNSWStore) graphReadyLocked() bool { return !s.dirty && s.graph != nil }
 
 func (s *HNSWStore) Add(_ context.Context, items []VectorItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, item := range items {
+		if s.graphReadyLocked() {
+			if _, exists := s.items[item.ID]; exists {
+				// Replacing a node needs a graph delete, which is unsafe
+				// (see dirty); rebuild lazily instead.
+				s.dirty = true
+			} else {
+				s.graph.Add(hnsw.MakeNode(item.ID, item.Vector))
+				s.graphUnsaved = true
+			}
+		}
 		s.items[item.ID] = item
 	}
-	s.dirty = true
-	return s.persistLocked()
+	s.itemsUnsaved = true
+	return nil
 }
 
 func (s *HNSWStore) Search(_ context.Context, query []float32, k int) ([]SearchResult, error) {
+	s.mu.RLock()
+	if s.graphReadyLocked() {
+		defer s.mu.RUnlock()
+		return s.searchLocked(query, k), nil
+	}
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.graphReadyLocked() {
+		s.rebuildGraphLocked()
+	}
+	return s.searchLocked(query, k), nil
+}
 
+func (s *HNSWStore) searchLocked(query []float32, k int) []SearchResult {
 	if k <= 0 || len(s.items) == 0 {
-		return nil, nil
+		return nil
 	}
 	if k > len(s.items) {
 		k = len(s.items)
-	}
-	if s.dirty || s.graph == nil {
-		s.rebuildGraphLocked()
 	}
 
 	nodes := s.graph.Search(query, k)
@@ -108,19 +198,76 @@ func (s *HNSWStore) Search(_ context.Context, query []float32, k int) ([]SearchR
 		score := cosineSimilarity(query, node.Value)
 		results = append(results, SearchResult{ID: node.Key, Score: score})
 	}
-	sortSearchResultsDesc(results)
-	return results, nil
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	return results
 }
 
 func (s *HNSWStore) Delete(_ context.Context, ids []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	removed := false
 	for _, id := range ids {
+		if _, exists := s.items[id]; !exists {
+			continue
+		}
 		delete(s.items, id)
+		removed = true
 	}
-	s.dirty = true
-	return s.persistLocked()
+	if removed {
+		s.dirty = true
+		s.itemsUnsaved = true
+	}
+	return nil
+}
+
+func (s *HNSWStore) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.itemsUnsaved {
+		if err := saveFlatVectors(s.path, mapToItems(s.items)); err != nil {
+			return err
+		}
+		s.itemsUnsaved = false
+	}
+	if s.graphReadyLocked() {
+		if s.graphUnsaved {
+			if err := s.exportGraphLocked(); err != nil {
+				// The graph file is only a cache; drop it rather than fail.
+				os.Remove(s.graphPath())
+			}
+			s.graphUnsaved = false
+		}
+	} else {
+		os.Remove(s.graphPath())
+		s.graphUnsaved = false
+	}
+	return nil
+}
+
+func (s *HNSWStore) exportGraphLocked() error {
+	tmp := s.graphPath() + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	if err := s.graph.Export(w); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, s.graphPath())
 }
 
 func (s *HNSWStore) Count() int {
@@ -129,11 +276,7 @@ func (s *HNSWStore) Count() int {
 	return len(s.items)
 }
 
-func (s *HNSWStore) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.persistLocked()
-}
+func (s *HNSWStore) Close() error { return s.Flush() }
 
 func ImportBruteForceToHNSW(brutePath, hnswPath string, opts HNSWOptions) error {
 	items, err := loadFlatVectors(brutePath)
@@ -147,32 +290,10 @@ func ImportBruteForceToHNSW(brutePath, hnswPath string, opts HNSWOptions) error 
 	if len(items) == 0 {
 		return nil
 	}
-	return s.Add(context.Background(), items)
-}
-
-func sortSearchResultsDesc(results []SearchResult) {
-	h := &searchMaxHeap{}
-	heap.Init(h)
-	for _, r := range results {
-		heap.Push(h, r)
+	if err := s.Add(context.Background(), items); err != nil {
+		return err
 	}
-	for i := len(results) - 1; i >= 0; i-- {
-		results[i] = heap.Pop(h).(SearchResult)
-	}
-}
-
-type searchMaxHeap []SearchResult
-
-func (h searchMaxHeap) Len() int            { return len(h) }
-func (h searchMaxHeap) Less(i, j int) bool  { return h[i].Score < h[j].Score }
-func (h searchMaxHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *searchMaxHeap) Push(x any)         { *h = append(*h, x.(SearchResult)) }
-func (h *searchMaxHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+	return s.Close()
 }
 
 func cosineSimilarity(a, b []float32) float32 {
@@ -189,16 +310,5 @@ func cosineSimilarity(a, b []float32) float32 {
 	if na == 0 || nb == 0 {
 		return 0
 	}
-	return dot / (float32(sqrt(float64(na))) * float32(sqrt(float64(nb))))
-}
-
-func sqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	z := x
-	for i := 0; i < 10; i++ {
-		z = (z + x/z) / 2
-	}
-	return z
+	return dot / (float32(math.Sqrt(float64(na))) * float32(math.Sqrt(float64(nb))))
 }

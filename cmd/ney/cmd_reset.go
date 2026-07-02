@@ -56,6 +56,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer vs.Close()
 
 	if flagWorkspace != "" {
 		ws, err := db.GetWorkspaceByName(flagWorkspace)
@@ -70,6 +71,9 @@ func runReset(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if err := vs.Delete(cmd.Context(), store.Int64SliceToStrings(chunkIDs)); err != nil {
+			return err
+		}
+		if err := vs.Flush(); err != nil {
 			return err
 		}
 		if err := db.DeleteWorkspace(ws.ID); err != nil {
@@ -88,6 +92,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 	}
 	os.Remove(config.VectorsPath())
 	os.Remove(config.HNSWPath())
+	os.Remove(config.HNSWPath() + ".graph")
 
 	if flagJSON {
 		PrintJSON(resetResult{OK: true, Scope: "full"})

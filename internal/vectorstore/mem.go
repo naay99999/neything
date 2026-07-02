@@ -1,8 +1,8 @@
 package vectorstore
 
 import (
-	"context"
 	"container/heap"
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -10,13 +10,16 @@ import (
 )
 
 type BruteForceStore struct {
-	mu    sync.RWMutex
-	items []VectorItem
-	path  string
+	mu      sync.RWMutex
+	items   []VectorItem
+	norms   []float32      // norms[i] = |items[i].Vector|, cached for search
+	idx     map[string]int // ID → position in items
+	path    string
+	unsaved bool
 }
 
 func NewBruteForceStore(path string) (*BruteForceStore, error) {
-	s := &BruteForceStore{path: path}
+	s := &BruteForceStore{path: path, idx: make(map[string]int)}
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("load vectors: %w", err)
 	}
@@ -29,31 +32,31 @@ func (s *BruteForceStore) load() error {
 		return err
 	}
 	s.items = items
+	s.norms = make([]float32, len(items))
+	s.idx = make(map[string]int, len(items))
+	for i, it := range items {
+		s.norms[i] = norm(it.Vector)
+		s.idx[it.ID] = i
+	}
 	return nil
-}
-
-func (s *BruteForceStore) save() error {
-	return saveFlatVectors(s.path, s.items)
 }
 
 func (s *BruteForceStore) Add(_ context.Context, items []VectorItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// build index of existing IDs for deduplication
-	idx := make(map[string]int, len(s.items))
-	for i, it := range s.items {
-		idx[it.ID] = i
-	}
 	for _, item := range items {
-		if pos, exists := idx[item.ID]; exists {
+		if pos, exists := s.idx[item.ID]; exists {
 			s.items[pos] = item
+			s.norms[pos] = norm(item.Vector)
 		} else {
-			idx[item.ID] = len(s.items)
+			s.idx[item.ID] = len(s.items)
 			s.items = append(s.items, item)
+			s.norms = append(s.norms, norm(item.Vector))
 		}
 	}
-	return s.save()
+	s.unsaved = true
+	return nil
 }
 
 func (s *BruteForceStore) Search(_ context.Context, query []float32, k int) ([]SearchResult, error) {
@@ -75,8 +78,8 @@ func (s *BruteForceStore) Search(_ context.Context, query []float32, k int) ([]S
 	h := &minHeap{}
 	heap.Init(h)
 
-	for _, item := range s.items {
-		n := norm(item.Vector)
+	for i, item := range s.items {
+		n := s.norms[i]
 		if n == 0 {
 			continue
 		}
@@ -104,14 +107,35 @@ func (s *BruteForceStore) Delete(_ context.Context, ids []string) error {
 	for _, id := range ids {
 		del[id] = true
 	}
-	filtered := s.items[:0]
-	for _, item := range s.items {
+	filteredItems := s.items[:0]
+	filteredNorms := s.norms[:0]
+	for i, item := range s.items {
 		if !del[item.ID] {
-			filtered = append(filtered, item)
+			filteredItems = append(filteredItems, item)
+			filteredNorms = append(filteredNorms, s.norms[i])
 		}
 	}
-	s.items = filtered
-	return s.save()
+	s.items = filteredItems
+	s.norms = filteredNorms
+	s.idx = make(map[string]int, len(s.items))
+	for i, item := range s.items {
+		s.idx[item.ID] = i
+	}
+	s.unsaved = true
+	return nil
+}
+
+func (s *BruteForceStore) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.unsaved {
+		return nil
+	}
+	if err := saveFlatVectors(s.path, s.items); err != nil {
+		return err
+	}
+	s.unsaved = false
+	return nil
 }
 
 func (s *BruteForceStore) Count() int {
@@ -120,7 +144,7 @@ func (s *BruteForceStore) Count() int {
 	return len(s.items)
 }
 
-func (s *BruteForceStore) Close() error { return nil }
+func (s *BruteForceStore) Close() error { return s.Flush() }
 
 // math helpers
 
@@ -148,10 +172,10 @@ func norm(v []float32) float32 {
 
 type minHeap []SearchResult
 
-func (h minHeap) Len() int            { return len(h) }
-func (h minHeap) Less(i, j int) bool  { return h[i].Score < h[j].Score }
-func (h minHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *minHeap) Push(x any)         { *h = append(*h, x.(SearchResult)) }
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].Score < h[j].Score }
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x any)        { *h = append(*h, x.(SearchResult)) }
 func (h *minHeap) Pop() any {
 	old := *h
 	n := len(old)

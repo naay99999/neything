@@ -40,6 +40,9 @@ func TestHNSWStoreAddSearchDelete(t *testing.T) {
 	if s.Count() != 2 {
 		t.Fatalf("expected 2 vectors after delete, got %d", s.Count())
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	s2, err := NewHNSWStore(path, HNSWOptions{M: 8, EfSearch: 20})
 	if err != nil {
@@ -62,6 +65,9 @@ func TestImportBruteForceToHNSW(t *testing.T) {
 	if err := brute.Add(context.Background(), []VectorItem{
 		{ID: "10", Vector: []float32{0.5, 0.5, 0}},
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := brute.Close(); err != nil {
 		t.Fatal(err)
 	}
 

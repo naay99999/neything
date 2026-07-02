@@ -23,12 +23,12 @@ type EnrichedResult struct {
 }
 
 type RetrieveOptions struct {
-	TopK         int
-	FetchK       int
-	Workspace    string
-	PathPrefix   string
-	Hybrid       bool
-	Rerank       bool
+	TopK       int
+	FetchK     int
+	Workspace  string
+	PathPrefix string
+	Hybrid     bool
+	Rerank     bool
 }
 
 type Retriever struct {
@@ -49,6 +49,11 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 	}
 	if fetchK < 10 {
 		fetchK = 10
+	}
+	// Workspace/path filters are applied after the vector and FTS fetches;
+	// overfetch so filtered-out hits don't starve the final result set.
+	if opts.Workspace != "" || opts.PathPrefix != "" {
+		fetchK *= 4
 	}
 
 	semantic, err := r.semanticSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)

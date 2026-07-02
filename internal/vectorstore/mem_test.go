@@ -42,6 +42,9 @@ func TestBruteForceStoreAddSearchDelete(t *testing.T) {
 	if store.Count() != 2 {
 		t.Fatalf("expected count 2 after delete, got %d", store.Count())
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// reload from disk
 	store2, err := NewBruteForceStore(path)
