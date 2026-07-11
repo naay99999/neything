@@ -89,18 +89,20 @@ type HNSWConfig struct {
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 
-# Tip: run 'ney init' to fill this in interactively.
+# Tip: run 'ney init' to enable semantic search and 'ney ask' interactively.
+# Without an embedder/chat provider, ney still indexes and searches by
+# keyword (FTS) — just run 'ney index' and 'ney search' to try it now.
 
-# embedder: used to create vectors (cannot be claude)
+# embedder: used to create vectors for semantic search (cannot be claude)
 embedder:
-  provider: ollama          # openai | gemini | ollama | lmstudio
-  model: bge-m3
+  provider: none            # none | openai | gemini | ollama | lmstudio
+  # model: bge-m3
   # endpoint: http://localhost:11434   # ollama / lmstudio (LM Studio default: http://localhost:1234)
 
 # chat: used to answer questions in 'ney ask'
 chat:
-  provider: claude          # claude | openai | gemini | ollama | lmstudio
-  model: claude-sonnet-4-6
+  provider: none            # none | claude | openai | gemini | ollama | lmstudio
+  # model: claude-sonnet-4-6
   # endpoint: http://localhost:1234    # ollama / lmstudio only
 
 # retrieval settings
@@ -248,19 +250,23 @@ func Validate(cfg *Config) error {
 	if cfg.Embedder.Provider == "claude" {
 		return fmt.Errorf("Claude does not provide an embedding API.\nSet embedder.provider to: openai, gemini, ollama, or lmstudio")
 	}
-	validEmbed := map[string]bool{"openai": true, "gemini": true, "ollama": true, "lmstudio": true}
-	if !validEmbed[cfg.Embedder.Provider] {
-		return fmt.Errorf("unknown embedder provider %q (valid: openai, gemini, ollama, lmstudio)", cfg.Embedder.Provider)
+	if cfg.Embedder.Provider != "" && cfg.Embedder.Provider != "none" {
+		validEmbed := map[string]bool{"openai": true, "gemini": true, "ollama": true, "lmstudio": true}
+		if !validEmbed[cfg.Embedder.Provider] {
+			return fmt.Errorf("unknown embedder provider %q (valid: none, openai, gemini, ollama, lmstudio)", cfg.Embedder.Provider)
+		}
+		if cfg.Embedder.Model == "" {
+			return fmt.Errorf("embedder.model is required")
+		}
 	}
-	validChat := map[string]bool{"claude": true, "openai": true, "gemini": true, "ollama": true, "lmstudio": true}
-	if !validChat[cfg.Chat.Provider] {
-		return fmt.Errorf("unknown chat provider %q (valid: claude, openai, gemini, ollama, lmstudio)", cfg.Chat.Provider)
-	}
-	if cfg.Embedder.Model == "" {
-		return fmt.Errorf("embedder.model is required")
-	}
-	if cfg.Chat.Model == "" {
-		return fmt.Errorf("chat.model is required")
+	if cfg.Chat.Provider != "" && cfg.Chat.Provider != "none" {
+		validChat := map[string]bool{"claude": true, "openai": true, "gemini": true, "ollama": true, "lmstudio": true}
+		if !validChat[cfg.Chat.Provider] {
+			return fmt.Errorf("unknown chat provider %q (valid: none, claude, openai, gemini, ollama, lmstudio)", cfg.Chat.Provider)
+		}
+		if cfg.Chat.Model == "" {
+			return fmt.Errorf("chat.model is required")
+		}
 	}
 	validChunk := map[string]bool{
 		"auto": true, "character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true, "page": true,
@@ -294,12 +300,30 @@ func Validate(cfg *Config) error {
 	return nil
 }
 
+// HasEmbedder reports whether an embedder provider is configured. When
+// false, ney runs in keyword-only (FTS) mode — no semantic search.
+func (c *Config) HasEmbedder() bool {
+	return c.Embedder.Provider != "" && c.Embedder.Provider != "none"
+}
+
+// HasChat reports whether a chat provider is configured. When false, `ney
+// ask` and the REPL's ask path are unavailable until `ney init` sets one up.
+func (c *Config) HasChat() bool {
+	return c.Chat.Provider != "" && c.Chat.Provider != "none"
+}
+
 func apiKey(envVar string) string {
 	return os.Getenv(envVar)
 }
 
+// NewEmbedder builds the configured embedder. It returns (nil, nil) when no
+// embedder is configured — that is a normal, supported state, not an error.
+// A provider that IS configured but fails to build (e.g. missing API key)
+// still returns an error.
 func NewEmbedder(cfg *Config) (embed.Embedder, error) {
 	switch cfg.Embedder.Provider {
+	case "", "none":
+		return nil, nil
 	case "openai":
 		key := apiKey("OPENAI_API_KEY")
 		if key == "" {
@@ -325,8 +349,15 @@ func NewEmbedder(cfg *Config) (embed.Embedder, error) {
 	}
 }
 
+// NewChatModel builds the configured chat model. It returns (nil, nil) when
+// no chat provider is configured — commands that need it (ask, REPL ask)
+// check for nil themselves and print a friendly hint rather than failing at
+// config load time. A provider that IS configured but fails to build still
+// returns an error.
 func NewChatModel(cfg *Config) (chat.ChatModel, error) {
 	switch cfg.Chat.Provider {
+	case "", "none":
+		return nil, nil
 	case "claude":
 		key := apiKey("ANTHROPIC_API_KEY")
 		if key == "" {

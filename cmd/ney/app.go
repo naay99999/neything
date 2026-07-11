@@ -20,6 +20,14 @@ type AppState struct {
 
 // initAppWithOptions wires the app. needChat is false for commands that never
 // call the LLM (index/search/watch) so a missing chat API key can't block them.
+//
+// A nil AppState.Embedder or AppState.Chat is a normal, expected state when
+// the corresponding provider is unset ("none") in config — config.NewEmbedder
+// / config.NewChatModel return (nil, nil) in that case, not an error.
+// Commands that need one (e.g. `ask`) check for nil themselves and print a
+// friendly hint. An explicit --provider override (applyProviderOverride)
+// still sets a concrete provider name, so a build failure for it (bad key,
+// unreachable endpoint) surfaces as an error here as before.
 func initAppWithOptions(cfg *config.Config, migrateVectors, needChat bool) (*AppState, error) {
 	db, err := store.Open(config.DBPath())
 	if err != nil {

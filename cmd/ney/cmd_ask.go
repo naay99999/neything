@@ -32,6 +32,10 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	defer app.DB.Close()
 	defer app.Vectors.Close()
 
+	if app.Chat == nil {
+		return fmt.Errorf("no chat provider configured — run `ney init` to set one up")
+	}
+
 	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
 		return err
 	}

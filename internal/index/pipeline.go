@@ -163,7 +163,9 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		return nil, err
 	}
 
-	ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
+	if ix.Embedder != nil {
+		ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
+	}
 	ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 
 	stats.Duration = time.Since(start)
@@ -196,7 +198,9 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 		if err := ix.Vectors.Flush(); err != nil {
 			return stats, fmt.Errorf("flush vectors: %w", err)
 		}
-		ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
+		if ix.Embedder != nil {
+			ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
+		}
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 	}
 	_ = workspaceName
@@ -494,18 +498,25 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 			texts[j] = c.Content
 		}
 
-		vecs, err := ix.Embedder.Embed(ctx, texts)
-		if err != nil {
-			tx.Rollback()
-			wrapped := fmt.Errorf("embed batch: %w", err)
-			var ue *url.Error
-			if errors.As(err, &ue) && ctx.Err() == nil {
-				return &EmbedUnavailableError{Err: wrapped}
+		// A nil Embedder means index-without-embedding (FTS-only, tier
+		// 0-1 mode): skip the embed call entirely and leave vecs empty so
+		// the vectorItems loop below naturally adds nothing.
+		var vecs [][]float32
+		if ix.Embedder != nil {
+			var err error
+			vecs, err = ix.Embedder.Embed(ctx, texts)
+			if err != nil {
+				tx.Rollback()
+				wrapped := fmt.Errorf("embed batch: %w", err)
+				var ue *url.Error
+				if errors.As(err, &ue) && ctx.Err() == nil {
+					return &EmbedUnavailableError{Err: wrapped}
+				}
+				return &EmbedError{Err: wrapped}
 			}
-			return &EmbedError{Err: wrapped}
 		}
 
-		for j, c := range batch {
+		for _, c := range batch {
 			sc := &store.Chunk{
 				DocumentID: docID,
 				ChunkIndex: c.Index,
@@ -514,7 +525,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 				EndPos:     c.EndPos,
 			}
 			storeChunks = append(storeChunks, sc)
-			_ = vecs[j]
 		}
 
 		batchStoreChunks := storeChunks[len(storeChunks)-len(batch):]
@@ -569,6 +579,9 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 }
 
 func (ix *Indexer) checkEmbedderConsistency() error {
+	if ix.Embedder == nil {
+		return nil
+	}
 	active, err := ix.DB.GetActiveEmbedder()
 	if err != nil || active == nil {
 		return nil
