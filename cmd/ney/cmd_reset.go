@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -45,6 +46,12 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	lock, err := lockfile.Acquire(config.NeyDir())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 
 	db, err := store.Open(config.DBPath())
 	if err != nil {

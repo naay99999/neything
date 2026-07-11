@@ -21,4 +21,7 @@ type VectorStore interface {
 	Flush() error
 	Count() int
 	Close() error
+	// IDs returns the IDs of all stored vectors. Order is unspecified. The
+	// returned slice is a snapshot copy safe for the caller to retain.
+	IDs() []string
 }

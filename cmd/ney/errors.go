@@ -56,6 +56,11 @@ func friendlyHints(err error) []string {
 			"Your server has no model loaded — load one in LM Studio (Developer tab) or run: lms load <model>",
 			"Then check with: ney doctor",
 		}
+	case has("is writing — stop it first"):
+		return []string{
+			"Wait for the other process to finish, or stop it and rerun this command",
+			"Check status with: ney status",
+		}
 	case has("status 401", "status 403"):
 		return []string{"The provider rejected your API key — check the relevant *_API_KEY env var"}
 	case has("status 404"):

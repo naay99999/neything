@@ -146,6 +146,16 @@ func (s *BruteForceStore) Count() int {
 
 func (s *BruteForceStore) Close() error { return s.Flush() }
 
+func (s *BruteForceStore) IDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.idx))
+	for id := range s.idx {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // math helpers
 
 func dot(a, b []float32) float32 {

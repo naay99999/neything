@@ -17,6 +17,11 @@ import (
 // embedder is configured ("none", the new zero-config default). It must not
 // panic, and must reindex the cwd workspace normally (FTS-only).
 func TestSyncWorkspaceIfKnownNilEmbedderNoPanic(t *testing.T) {
+	// syncWorkspaceIfKnown now takes the writer lock at config.NeyDir()
+	// (~/.ney); isolate it from the real home directory like other tests
+	// that touch config paths (see cmd_ask_test.go).
+	t.Setenv("HOME", t.TempDir())
+
 	dir := t.TempDir()
 	root := filepath.Join(dir, "corpus")
 	if err := os.MkdirAll(root, 0755); err != nil {

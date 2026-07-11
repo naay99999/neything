@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/watch"
 	"github.com/spf13/cobra"
 )
@@ -42,6 +44,13 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
+
+	lock, err := lockfile.Acquire(config.NeyDir())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	app, err := initAppFromConfig(cfg, false)
 	if err != nil {
 		return err

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 
 	"github.com/mattn/go-isatty"
+	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/spf13/cobra"
 )
 
@@ -54,6 +56,13 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	applyProviderOverride(cfg, true)
+
+	lock, err := lockfile.Acquire(config.NeyDir())
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	app, err := initAppWithOptions(cfg, flagMigrateVectors, false)
 	if err != nil {
 		return err

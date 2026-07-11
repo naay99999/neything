@@ -278,6 +278,16 @@ func (s *HNSWStore) Count() int {
 
 func (s *HNSWStore) Close() error { return s.Flush() }
 
+func (s *HNSWStore) IDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.items))
+	for id := range s.items {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func ImportBruteForceToHNSW(brutePath, hnswPath string, opts HNSWOptions) error {
 	items, err := loadFlatVectors(brutePath)
 	if err != nil {
