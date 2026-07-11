@@ -22,13 +22,39 @@ type EnrichedResult struct {
 	Workspace string
 }
 
+// Retrieval modes accepted by RetrieveOptions.Mode. An empty Mode is
+// treated as ModeAuto.
+const (
+	ModeAuto     = "auto"
+	ModeSemantic = "semantic"
+	ModeKeyword  = "keyword"
+	ModeHybrid   = "hybrid"
+)
+
 type RetrieveOptions struct {
 	TopK       int
 	FetchK     int
 	Workspace  string
 	PathPrefix string
-	Hybrid     bool
-	Rerank     bool
+	// Mode selects which signal(s) to use: auto (default, both when
+	// available, degrades gracefully), semantic (error if unavailable),
+	// keyword (FTS only), hybrid (force both, error if semantic
+	// unavailable). Empty behaves like auto.
+	Mode   string
+	Rerank bool
+}
+
+// SearchMeta reports what actually happened during a Search call, since
+// auto mode can silently fall back to a subset of signals instead of
+// failing outright.
+type SearchMeta struct {
+	SemanticUsed  bool    `json:"semantic_used"`
+	KeywordUsed   bool    `json:"keyword_used"`
+	EmbedCoverage float64 `json:"embed_coverage"`
+	// Degraded is a human-readable note when a requested signal couldn't be
+	// used (e.g. embedder down, no vectors yet). Empty when nothing was
+	// degraded.
+	Degraded string `json:"degraded,omitempty"`
 }
 
 type Retriever struct {
@@ -38,7 +64,7 @@ type Retriever struct {
 	Reranker rerank.Reranker
 }
 
-func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptions) ([]EnrichedResult, error) {
+func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptions) ([]EnrichedResult, SearchMeta, error) {
 	topK := opts.TopK
 	if topK <= 0 {
 		topK = 8
@@ -56,20 +82,57 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 		fetchK *= 4
 	}
 
-	semantic, err := r.semanticSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
-	if err != nil {
-		return nil, err
+	mode := opts.Mode
+	if mode == "" {
+		mode = ModeAuto
+	}
+
+	meta := SearchMeta{EmbedCoverage: r.embedCoverage()}
+
+	wantKeyword := mode == ModeAuto || mode == ModeKeyword || mode == ModeHybrid
+	wantSemantic := mode == ModeAuto || mode == ModeSemantic || mode == ModeHybrid
+
+	var keyword []EnrichedResult
+	if wantKeyword {
+		kw, err := r.keywordSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
+		if err != nil {
+			// FTS errors never fail the request — record and move on.
+			meta.Degraded = appendDegraded(meta.Degraded, fmt.Sprintf("keyword search failed: %v", err))
+		} else if len(kw) > 0 {
+			keyword = kw
+			meta.KeywordUsed = true
+		}
+	}
+
+	var semantic []EnrichedResult
+	if wantSemantic {
+		if reason := r.semanticUnavailableReason(); reason != "" {
+			if mode == ModeSemantic || mode == ModeHybrid {
+				return nil, meta, fmt.Errorf("semantic search unavailable: %s", reason)
+			}
+			meta.Degraded = appendDegraded(meta.Degraded, reason)
+		} else {
+			sem, err := r.semanticSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
+			if err != nil {
+				if mode == ModeSemantic || mode == ModeHybrid {
+					return nil, meta, fmt.Errorf("semantic search failed: %w", err)
+				}
+				meta.Degraded = appendDegraded(meta.Degraded, fmt.Sprintf("semantic search failed, degraded to keyword-only: %v", err))
+			} else if len(sem) > 0 {
+				semantic = sem
+				meta.SemanticUsed = true
+			}
+		}
 	}
 
 	var results []EnrichedResult
-	if opts.Hybrid {
-		keyword, err := r.keywordSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
-		if err != nil {
-			return nil, err
-		}
+	switch {
+	case meta.SemanticUsed && meta.KeywordUsed:
 		results = ReciprocalRankFusion(semantic, keyword, defaultRRFK)
-	} else {
+	case meta.SemanticUsed:
 		results = semantic
+	case meta.KeywordUsed:
+		results = keyword
 	}
 
 	if opts.Rerank && r.Reranker != nil && len(results) > 0 {
@@ -88,7 +151,7 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 		}
 		ranked, err := r.Reranker.Rerank(ctx, query, candidates)
 		if err != nil {
-			return nil, fmt.Errorf("rerank: %w", err)
+			return nil, meta, fmt.Errorf("rerank: %w", err)
 		}
 		results = make([]EnrichedResult, len(ranked))
 		for i, c := range ranked {
@@ -108,7 +171,49 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 	if len(results) > topK {
 		results = results[:topK]
 	}
-	return results, nil
+	return results, meta, nil
+}
+
+// semanticUnavailableReason reports why semantic search can't run right
+// now, or "" if it can. It never issues a query while the DB is mid-read
+// (Count() below only touches the in-memory vector store).
+func (r *Retriever) semanticUnavailableReason() string {
+	if r.Embedder == nil {
+		return "no embedder configured"
+	}
+	if r.Vectors == nil || r.Vectors.Count() == 0 {
+		return "no vectors indexed yet"
+	}
+	return ""
+}
+
+// embedCoverage returns Vectors.Count() / total chunk count, or 0 when
+// either isn't available. Best-effort: DB errors are swallowed since
+// coverage is informational, not load-bearing for the search itself.
+func (r *Retriever) embedCoverage() float64 {
+	if r.Vectors == nil || r.DB == nil {
+		return 0
+	}
+	vecCount := r.Vectors.Count()
+	if vecCount == 0 {
+		return 0
+	}
+	chunkCount, err := r.DB.CountChunks()
+	if err != nil || chunkCount == 0 {
+		return 0
+	}
+	coverage := float64(vecCount) / float64(chunkCount)
+	if coverage > 1 {
+		coverage = 1
+	}
+	return coverage
+}
+
+func appendDegraded(existing, msg string) string {
+	if existing == "" {
+		return msg
+	}
+	return existing + "; " + msg
 }
 
 func (r *Retriever) semanticSearch(ctx context.Context, query string, fetchK int, workspaceName, pathPrefix string) ([]EnrichedResult, error) {

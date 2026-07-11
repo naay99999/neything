@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/naay99999/neything/internal/config"
@@ -39,7 +40,7 @@ func retrieveOpts(db *store.DB, cfg *config.Config, topK int) search.RetrieveOpt
 		FetchK:     config.FetchK(cfg, topK),
 		Workspace:  effectiveWorkspaceName(db),
 		PathPrefix: flagPath,
-		Hybrid:     cfg.Retrieval.Hybrid,
+		Mode:       cfg.Retrieval.Mode,
 		Rerank:     cfg.Retrieval.Rerank,
 	}
 }
@@ -51,4 +52,20 @@ func newRetriever(app *AppState) *search.Retriever {
 		Embedder: app.Embedder,
 		Reranker: app.Reranker,
 	}
+}
+
+// printDegradationNote writes a short stderr note when auto/hybrid mode
+// couldn't use every signal it wanted (embedder down, no vectors yet, no
+// embedder configured at all), so the user understands why results look
+// keyword-only without the command failing outright. A no-op when nothing
+// was degraded.
+func printDegradationNote(meta search.SearchMeta) {
+	if meta.Degraded == "" {
+		return
+	}
+	if strings.Contains(meta.Degraded, "no embedder configured") {
+		fmt.Fprintln(os.Stderr, Dim("note: keyword-only search — run `ney init` to enable semantic search"))
+		return
+	}
+	fmt.Fprintln(os.Stderr, Dim("note: "+meta.Degraded))
 }

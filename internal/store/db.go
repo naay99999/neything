@@ -433,6 +433,16 @@ func (d *DB) Stats() (*StoreStats, error) {
 	return s, nil
 }
 
+// CountChunks returns the total number of chunk rows across all workspaces.
+// It's a single QueryRow (no open sql.Rows), so it's always safe to call
+// even with SetMaxOpenConns(1). Used by the retriever to compute embedding
+// coverage (vectors indexed / chunks total).
+func (d *DB) CountChunks() (int, error) {
+	var n int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&n)
+	return n, err
+}
+
 // GetChunkDocumentIDs returns chunk IDs → document IDs for vector delete on reset
 func (d *DB) GetChunkIDsByWorkspace(workspaceID int64) ([]int64, error) {
 	rows, err := d.db.Query(

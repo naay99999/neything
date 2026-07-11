@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/naay99999/neything/internal/chat"
 	"github.com/naay99999/neything/internal/embed"
@@ -37,11 +38,22 @@ type ChatConfig struct {
 }
 
 type RetrievalConfig struct {
-	TopK            int  `mapstructure:"top_k"`
-	MaxContextChars int  `mapstructure:"max_context_chars"`
-	Rerank          bool `mapstructure:"rerank"`
-	RerankTopK      int  `mapstructure:"rerank_top_k"`
-	Hybrid          bool `mapstructure:"hybrid"`
+	TopK            int    `mapstructure:"top_k"`
+	MaxContextChars int    `mapstructure:"max_context_chars"`
+	Rerank          bool   `mapstructure:"rerank"`
+	RerankTopK      int    `mapstructure:"rerank_top_k"`
+	// Mode is the canonical retrieval mode: auto | semantic | keyword |
+	// hybrid. Set by Load() via normalizeRetrievalMode, which also accepts
+	// the legacy "hybrid" YAML key (bool or string) for installs that
+	// predate auto mode. New code should read Mode, not Hybrid.
+	Mode string `mapstructure:"mode"`
+	// Hybrid is a legacy compatibility field derived from Mode (true only
+	// when Mode == "hybrid"). It intentionally excludes "hybrid" from
+	// mapstructure decoding (tag "-") because that YAML key can be either a
+	// bool (legacy) or a string in the wild; normalizeRetrievalMode handles
+	// both by reading the raw value directly. Kept only so existing callers
+	// that still branch on it keep compiling — do not set it directly.
+	Hybrid bool `mapstructure:"-"`
 }
 
 type RerankerConfig struct {
@@ -111,7 +123,9 @@ retrieval:
   max_context_chars: 12000
   rerank: false
   rerank_top_k: 24
-  hybrid: false
+  mode: auto                # auto | semantic | keyword | hybrid
+  # legacy installs may still have "hybrid: true/false" instead of "mode" —
+  # true maps to hybrid, false maps to auto; an explicit "mode" always wins
 
 # reranker: used when retrieval.rerank is true
 reranker:
@@ -240,10 +254,47 @@ func Load() (*Config, error) {
 		cfg.VectorStore.HNSW.EfSearch = 50
 	}
 
+	cfg.Retrieval.Mode = normalizeRetrievalMode(v)
+	// Legacy compat: some callers still branch on the old bool field.
+	cfg.Retrieval.Hybrid = cfg.Retrieval.Mode == "hybrid"
+
 	if err := Validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// normalizeRetrievalMode resolves retrieval.mode from either the canonical
+// "mode" string key or the legacy "hybrid" key. Installs from before auto
+// mode existed have "hybrid: false" (the old default) or "hybrid: true"
+// written to their config.yaml — those still need to load. An explicit
+// "mode" always wins over "hybrid". Defaults to "auto" when neither is set.
+func normalizeRetrievalMode(v *viper.Viper) string {
+	if v.IsSet("retrieval.mode") {
+		if m := strings.ToLower(strings.TrimSpace(v.GetString("retrieval.mode"))); m != "" {
+			return m
+		}
+	}
+	if v.IsSet("retrieval.hybrid") {
+		switch val := v.Get("retrieval.hybrid").(type) {
+		case bool:
+			if val {
+				return "hybrid"
+			}
+			return "auto"
+		case string:
+			switch s := strings.ToLower(strings.TrimSpace(val)); s {
+			case "true":
+				return "hybrid"
+			case "false", "":
+				return "auto"
+			default:
+				// Someone wrote a mode name under the legacy key — accept it.
+				return s
+			}
+		}
+	}
+	return "auto"
 }
 
 func Validate(cfg *Config) error {
@@ -296,6 +347,13 @@ func Validate(cfg *Config) error {
 	validVectorStore := map[string]bool{"brute": true, "hnsw": true}
 	if !validVectorStore[cfg.VectorStore.Backend] {
 		return fmt.Errorf("unknown vector_store.backend %q (valid: brute, hnsw)", cfg.VectorStore.Backend)
+	}
+	// "" is accepted here (treated as "auto" by callers) so structs built
+	// directly in tests without setting Retrieval.Mode don't need to know
+	// about this field. Load() always normalizes it to a concrete value.
+	validMode := map[string]bool{"": true, "auto": true, "semantic": true, "keyword": true, "hybrid": true}
+	if !validMode[cfg.Retrieval.Mode] {
+		return fmt.Errorf("unknown retrieval mode %q (valid: auto, semantic, keyword, hybrid)", cfg.Retrieval.Mode)
 	}
 	return nil
 }

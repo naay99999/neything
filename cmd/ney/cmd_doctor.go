@@ -148,19 +148,43 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// 2. Embedder is not Claude
-	if cfg.Embedder.Provider == "claude" {
+	// 2. Embedder is not Claude, and an informational note when unconfigured
+	switch {
+	case cfg.Embedder.Provider == "claude":
 		results = append(results, checkResult{
 			Check:   "embedder_not_claude",
 			OK:      false,
 			Message: "Claude cannot be used as embedder",
 			Hint:    "Set embedder.provider to: openai, gemini, ollama, or lmstudio",
 		})
-	} else {
+	case !cfg.HasEmbedder():
 		results = append(results, checkResult{
-			Check:   "embedder_not_claude",
+			Check:   "embedder_configured",
+			OK:      true,
+			Message: "Embedder not configured (keyword-only search)",
+			Hint:    "Run `ney init` to enable semantic search",
+		})
+	default:
+		results = append(results, checkResult{
+			Check:   "embedder_configured",
 			OK:      true,
 			Message: fmt.Sprintf("Embedder provider is %q (not Claude)", cfg.Embedder.Provider),
+		})
+	}
+
+	// 2b. Chat model configured — informational when unconfigured
+	if !cfg.HasChat() {
+		results = append(results, checkResult{
+			Check:   "chat_configured",
+			OK:      true,
+			Message: "Chat model not configured (ney ask unavailable)",
+			Hint:    "Run `ney init` to enable ney ask",
+		})
+	} else {
+		results = append(results, checkResult{
+			Check:   "chat_configured",
+			OK:      true,
+			Message: fmt.Sprintf("Chat provider is %q", cfg.Chat.Provider),
 		})
 	}
 
@@ -351,14 +375,22 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					})
 				} else {
 					vecCount := vs.Count()
-					if vecCount > stats.ChunkCount {
+					state, coverage := vectorParityState(vecCount, stats.ChunkCount)
+					switch state {
+					case "orphan":
 						results = append(results, checkResult{
 							Check:   "vector_parity",
 							OK:      false,
 							Message: fmt.Sprintf("Orphan vectors detected: %d vectors vs %d chunks", vecCount, stats.ChunkCount),
 							Hint:    "Run: ney index <path> to prune orphans",
 						})
-					} else {
+					case "embedding":
+						results = append(results, checkResult{
+							Check:   "vector_parity",
+							OK:      true,
+							Message: fmt.Sprintf("Embedding in progress (%d/%d chunks embedded, %.0f%%)", vecCount, stats.ChunkCount, coverage*100),
+						})
+					default: // "ok"
 						results = append(results, checkResult{
 							Check:   "vector_parity",
 							OK:      true,
@@ -426,7 +458,7 @@ func printDoctorResults(results []checkResult) {
 	for _, r := range results {
 		mark := CheckMark(r.OK)
 		fmt.Printf("%s %s\n", mark, r.Message)
-		if !r.OK && r.Hint != "" {
+		if r.Hint != "" {
 			fmt.Printf("    → %s\n", r.Hint)
 		}
 		if !r.OK {

@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestValidateRejectsClaudeEmbedder(t *testing.T) {
 	cfg := &Config{
@@ -259,12 +263,13 @@ func TestNewChatModelConfiguredButUnbuildableErrors(t *testing.T) {
 
 // TestValidateOldStyleConfigStillLoads guards against regressions for
 // existing installs whose config.yaml predates optional providers (explicit
-// embedder ollama + chat claude, hybrid: false).
+// embedder ollama + chat claude, hybrid: false → normalized to mode: auto
+// before Validate ever sees it — see TestLoadRetrievalModeLegacyHybridFalse).
 func TestValidateOldStyleConfigStillLoads(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3", Endpoint: "http://localhost:11434"},
 		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
-		Retrieval:   RetrievalConfig{TopK: 8, MaxContextChars: 12000, Hybrid: false},
+		Retrieval:   RetrievalConfig{TopK: 8, MaxContextChars: 12000, Mode: "auto"},
 		Chunking:    ChunkingConfig{Strategy: "markdown", TargetChars: 1200, OverlapChars: 150},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
@@ -273,5 +278,94 @@ func TestValidateOldStyleConfigStillLoads(t *testing.T) {
 	}
 	if !cfg.HasEmbedder() || !cfg.HasChat() {
 		t.Fatal("old-style config should report both providers configured")
+	}
+}
+
+// writeTestConfig points $HOME at a fresh temp dir, writes the given
+// retrieval-focused config.yaml under ~/.ney, and loads it through the real
+// config.Load() path (including normalizeRetrievalMode) so these tests
+// exercise the actual viper decode, not just Validate().
+func writeTestConfig(t *testing.T, yaml string) *Config {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	neyDir := filepath.Join(dir, ".ney")
+	if err := os.MkdirAll(neyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(neyDir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
+}
+
+func TestLoadRetrievalModeLegacyHybridTrue(t *testing.T) {
+	cfg := writeTestConfig(t, "retrieval:\n  hybrid: true\n")
+	if cfg.Retrieval.Mode != "hybrid" {
+		t.Fatalf("hybrid: true should normalize to mode=hybrid, got %q", cfg.Retrieval.Mode)
+	}
+	if !cfg.Retrieval.Hybrid {
+		t.Fatal("legacy Hybrid compat field should be true")
+	}
+}
+
+func TestLoadRetrievalModeLegacyHybridFalse(t *testing.T) {
+	cfg := writeTestConfig(t, "retrieval:\n  hybrid: false\n")
+	if cfg.Retrieval.Mode != "auto" {
+		t.Fatalf("hybrid: false should normalize to mode=auto, got %q", cfg.Retrieval.Mode)
+	}
+	if cfg.Retrieval.Hybrid {
+		t.Fatal("legacy Hybrid compat field should be false")
+	}
+}
+
+func TestLoadRetrievalModeMissingDefaultsAuto(t *testing.T) {
+	cfg := writeTestConfig(t, "retrieval:\n  top_k: 8\n")
+	if cfg.Retrieval.Mode != "auto" {
+		t.Fatalf("missing hybrid/mode should default to auto, got %q", cfg.Retrieval.Mode)
+	}
+}
+
+func TestLoadRetrievalModeExplicitStringWins(t *testing.T) {
+	cfg := writeTestConfig(t, "retrieval:\n  mode: keyword\n  hybrid: true\n")
+	if cfg.Retrieval.Mode != "keyword" {
+		t.Fatalf("explicit mode should win over legacy hybrid, got %q", cfg.Retrieval.Mode)
+	}
+}
+
+func TestLoadRetrievalModeInvalidRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	neyDir := filepath.Join(dir, ".ney")
+	if err := os.MkdirAll(neyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(neyDir, "config.yaml"), []byte("retrieval:\n  mode: bogus\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("expected Load to reject invalid retrieval.mode via Validate")
+	}
+}
+
+func TestValidateRejectsInvalidRetrievalMode(t *testing.T) {
+	cfg := baseValidCfg()
+	cfg.Retrieval.Mode = "bogus"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected error for invalid retrieval mode")
+	}
+}
+
+func TestValidateAcceptsAllRetrievalModes(t *testing.T) {
+	for _, mode := range []string{"", "auto", "semantic", "keyword", "hybrid"} {
+		cfg := baseValidCfg()
+		cfg.Retrieval.Mode = mode
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("mode %q should be valid: %v", mode, err)
+		}
 	}
 }

@@ -48,7 +48,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 
 	opts := retrieveOpts(app.DB, cfg, topK)
 	sp := startSpinner("searching")
-	results, err := newRetriever(app).Search(cmd.Context(), question, opts)
+	results, meta, err := newRetriever(app).Search(cmd.Context(), question, opts)
 	sp.Stop()
 	if err != nil {
 		return err
@@ -56,10 +56,14 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	if len(results) == 0 && opts.Workspace != "" {
 		globalOpts := opts
 		globalOpts.Workspace = ""
-		if fallback, ferr := newRetriever(app).Search(cmd.Context(), question, globalOpts); ferr == nil && len(fallback) > 0 {
+		if fallback, fmeta, ferr := newRetriever(app).Search(cmd.Context(), question, globalOpts); ferr == nil && len(fallback) > 0 {
 			results = fallback
+			meta = fmeta
 			fmt.Println(Dim("(nothing in this folder — showing results from other indexed workspaces)"))
 		}
+	}
+	if !flagJSON {
+		printDegradationNote(meta)
 	}
 	if len(results) == 0 {
 		return fmt.Errorf("no relevant context found — try indexing more files")
@@ -93,8 +97,9 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		type jsonAnswer struct {
 			Answer  string                  `json:"answer"`
 			Sources []search.EnrichedResult `json:"sources"`
+			Meta    search.SearchMeta       `json:"meta"`
 		}
-		PrintJSON(jsonAnswer{Answer: answer, Sources: results})
+		PrintJSON(jsonAnswer{Answer: answer, Sources: results, Meta: meta})
 		return nil
 	}
 

@@ -113,7 +113,7 @@ func TestIndexerIndexAndSearch(t *testing.T) {
 		Vectors:  ix.Vectors,
 		Embedder: &mockEmbedder{},
 	}
-	results, err := retriever.Search(context.Background(), unique, search.RetrieveOptions{
+	results, _, err := retriever.Search(context.Background(), unique, search.RetrieveOptions{
 		TopK:      3,
 		FetchK:    10,
 		Workspace: "test",

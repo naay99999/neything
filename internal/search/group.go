@@ -12,6 +12,7 @@ type FileGroup struct {
 
 type GroupedResults struct {
 	Files []FileGroup `json:"files"`
+	Meta  *SearchMeta `json:"meta,omitempty"`
 }
 
 func GroupByFile(results []EnrichedResult) []FileGroup {

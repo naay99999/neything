@@ -10,7 +10,7 @@ import (
 
 var searchCmd = &cobra.Command{
 	Use:   "search \"<query>\"",
-	Short: "Semantic search over indexed files",
+	Short: "Search indexed files (semantic + keyword, auto by default)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runSearch,
 }
@@ -42,7 +42,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 
 	opts := retrieveOpts(app.DB, cfg, topK)
 	sp := startSpinner("searching")
-	results, err := newRetriever(app).Search(cmd.Context(), query, opts)
+	results, meta, err := newRetriever(app).Search(cmd.Context(), query, opts)
 	sp.Stop()
 	if err != nil {
 		return err
@@ -51,8 +51,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if len(results) == 0 && opts.Workspace != "" {
 		globalOpts := opts
 		globalOpts.Workspace = ""
-		if fallback, ferr := newRetriever(app).Search(cmd.Context(), query, globalOpts); ferr == nil && len(fallback) > 0 {
+		if fallback, fmeta, ferr := newRetriever(app).Search(cmd.Context(), query, globalOpts); ferr == nil && len(fallback) > 0 {
 			results = fallback
+			meta = fmeta
 			fellBack = true
 		}
 	}
@@ -60,9 +61,11 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	groups := search.GroupByFile(results)
 
 	if flagJSON {
-		PrintJSON(search.GroupedResults{Files: groups})
+		PrintJSON(search.GroupedResults{Files: groups, Meta: &meta})
 		return nil
 	}
+
+	printDegradationNote(meta)
 
 	if len(groups) == 0 {
 		fmt.Println("No results found.")
