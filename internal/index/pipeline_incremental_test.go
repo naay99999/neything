@@ -42,6 +42,7 @@ func TestIndexerReindexPreservesVectorCount(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
+	runEmbedWorker(t, ix)
 	count1 := ix.Vectors.Count()
 
 	if err := os.WriteFile(path, []byte("version two with different content"), 0644); err != nil {
@@ -54,6 +55,7 @@ func TestIndexerReindexPreservesVectorCount(t *testing.T) {
 	if stats.VectorsPruned == 0 {
 		t.Fatal("expected vectors pruned on re-index")
 	}
+	runEmbedWorker(t, ix)
 	if ix.Vectors.Count() != count1 {
 		t.Fatalf("expected vector count %d after re-index, got %d", count1, ix.Vectors.Count())
 	}
@@ -108,6 +110,7 @@ func TestIndexerRemovesDeletedFile(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
+	runEmbedWorker(t, ix)
 	if err := os.Remove(remove); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +150,11 @@ func TestIndexerRenameByHash(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
+	runEmbedWorker(t, ix)
 	vectorCount := ix.Vectors.Count()
+	if vectorCount == 0 {
+		t.Fatal("expected vectors after embedding")
+	}
 
 	if err := os.Rename(oldPath, newPath); err != nil {
 		t.Fatal(err)
@@ -197,6 +204,10 @@ func TestIndexerRemovePath(t *testing.T) {
 	}
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
+	}
+	runEmbedWorker(t, ix)
+	if ix.Vectors.Count() == 0 {
+		t.Fatal("expected vectors after embedding")
 	}
 
 	stats, err := ix.RemovePath(context.Background(), path)

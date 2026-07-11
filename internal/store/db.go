@@ -446,7 +446,7 @@ func (d *DB) CountChunks() (int, error) {
 // GetChunkDocumentIDs returns chunk IDs → document IDs for vector delete on reset
 func (d *DB) GetChunkIDsByWorkspace(workspaceID int64) ([]int64, error) {
 	rows, err := d.db.Query(
-		`SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace_id=?`,
+		`SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace_id=? ORDER BY c.id`,
 		workspaceID,
 	)
 	if err != nil {
@@ -472,6 +472,30 @@ func (d *DB) GetAllChunkIDs() ([]int64, error) {
 	for rows.Next() {
 		var id int64
 		rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// GetChunkIDsPage returns chunk IDs with id > afterID, ordered by id
+// ascending, up to limit rows. It is the paginated counterpart of
+// GetAllChunkIDs, used by EmbedWorker so a corpus with millions of chunks
+// doesn't have to be loaded into memory in one query. Like every query
+// method here, it fully drains its sql.Rows (via defer) before returning —
+// safe to issue another query immediately after, even with the single
+// SetMaxOpenConns(1) connection.
+func (d *DB) GetChunkIDsPage(afterID int64, limit int) ([]int64, error) {
+	rows, err := d.db.Query(`SELECT id FROM chunks WHERE id > ? ORDER BY id LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()

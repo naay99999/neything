@@ -29,6 +29,11 @@ type Watcher struct {
 	Debounce    time.Duration
 	SyncEvery   time.Duration
 	OnEvent     func(msg string)
+	// OnFlush, if set, is called after each debounced batch of filesystem
+	// events has been processed (indexed/removed) — e.g. to nudge an
+	// EmbedWorker (Notify) that new chunks may be pending. It fires even
+	// when the batch turned out to be a no-op; it must be cheap.
+	OnFlush func()
 }
 
 func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
@@ -90,6 +95,9 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 			} else {
 				w.logf("indexed %s", path)
 			}
+		}
+		if w.OnFlush != nil {
+			w.OnFlush()
 		}
 	}
 

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/watch"
 	"github.com/spf13/cobra"
@@ -71,6 +73,33 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "Watching %s (workspace: %s, debounce: %s)...\n", rootPath, workspaceName, flagWatchDebounce)
 	fmt.Fprintf(os.Stderr, "Press Ctrl+C to stop.\n")
 
+	// Phase B runs beside the watcher for the whole watch: the watcher only
+	// writes chunks+FTS (Phase A), and nudges the worker after every flush
+	// batch. The worker gets its own cancel because the watcher handles
+	// SIGINT internally on a derived ctx — cmd.Context() survives Ctrl+C,
+	// so the worker must be stopped explicitly once Watcher.Run returns.
+	var worker *index.EmbedWorker
+	if app.Embedder != nil {
+		workerCtx, stopWorker := context.WithCancel(cmd.Context())
+		worker = &index.EmbedWorker{
+			DB:       app.DB,
+			Vectors:  app.Vectors,
+			Embedder: app.Embedder,
+		}
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			_ = worker.RunLoop(workerCtx)
+		}()
+		// Drain any backlog left by earlier runs (e.g. a --no-embed index)
+		// before the first filesystem event arrives.
+		worker.Notify()
+		defer func() {
+			stopWorker()
+			<-workerDone
+		}()
+	}
+
 	w := &watch.Watcher{
 		Indexer:     ix,
 		RootPath:    rootPath,
@@ -79,6 +108,9 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		OnEvent: func(msg string) {
 			fmt.Fprintf(os.Stderr, "  %s\n", msg)
 		},
+	}
+	if worker != nil {
+		w.OnFlush = worker.Notify
 	}
 
 	stats, err := w.Run(cmd.Context())

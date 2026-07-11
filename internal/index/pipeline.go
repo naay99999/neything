@@ -3,13 +3,10 @@ package index
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,27 +24,13 @@ type Stats struct {
 	FilesFailed   int
 	ChunksCreated int
 	VectorsPruned int
-	Duration      time.Duration
+	// ChunksPendingEmbed is the number of chunks written by this run that
+	// have no vector yet. Phase A (this file) never embeds — that's
+	// EmbedWorker's job now — so every chunk this run created is
+	// definitionally pending, no extra diff query needed.
+	ChunksPendingEmbed int
+	Duration           time.Duration
 }
-
-// EmbedUnavailableError marks an embedding failure caused by the provider
-// being unreachable (connection refused, timeout, DNS). It aborts the whole
-// run instead of burning one timeout per file on an endpoint that is down.
-type EmbedUnavailableError struct{ Err error }
-
-func (e *EmbedUnavailableError) Error() string { return e.Err.Error() }
-func (e *EmbedUnavailableError) Unwrap() error { return e.Err }
-
-// EmbedError marks any other embedding failure (e.g. HTTP 4xx). A few of
-// these in one run means the embedder is broken, not the files.
-type EmbedError struct{ Err error }
-
-func (e *EmbedError) Error() string { return e.Err.Error() }
-func (e *EmbedError) Unwrap() error { return e.Err }
-
-// maxEmbedFailures is how many embedding errors a run tolerates before
-// concluding the embedder itself is broken and aborting.
-const maxEmbedFailures = 3
 
 // flushEveryDocs bounds how much indexed work a crash can lose: vectors are
 // held in memory between flushes (SQLite commits per document regardless).
@@ -75,20 +58,31 @@ var supportedExts = map[string]bool{
 	".xml":      true,
 }
 
+// Index walks rootPath and performs Phase A only: parse → chunk → write
+// chunk rows + FTS rows. It never calls Embedder.Embed or Vectors.Add — that
+// is EmbedWorker's job (internal/index/embedworker.go), run separately so a
+// slow/unreachable embedder can't hold the single SQLite connection or block
+// indexing. Embedder may be nil (FTS-only, tier 0-1 mode); when set, it is
+// used only for model-consistency bookkeeping elsewhere (EmbedWorker), never
+// here.
+//
+// Model-consistency checking (comparing the configured embedder against the
+// one the existing index was built with) also moved to EmbedWorker: since
+// this pipeline no longer writes vectors, chunk+FTS writing is
+// embedder-neutral and has nothing to be inconsistent about.
 func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_ *Stats, err error) {
 	start := time.Now()
-
-	if err := ix.checkEmbedderConsistency(); err != nil {
-		return nil, err
-	}
 
 	workspaceID, err := ix.DB.UpsertWorkspace(workspaceName, rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("upsert workspace: %w", err)
 	}
 
-	// Flush even on error so documents already committed to SQLite keep
-	// their vectors when a run aborts partway through.
+	// Flush even on error so documents already committed to SQLite keep a
+	// consistent vector store when a run aborts partway through. Phase A
+	// only ever calls Vectors.Delete (for chunks that were re-chunked or
+	// removed) — never Add — but Delete still mutates in-memory state that
+	// needs persisting.
 	defer func() {
 		if ferr := ix.Vectors.Flush(); ferr != nil && err == nil {
 			err = fmt.Errorf("flush vectors: %w", ferr)
@@ -98,7 +92,6 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
 	pathToHash := make(map[string]string)
-	embedFailures := 0
 	docsSinceFlush := 0
 
 	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
@@ -126,19 +119,11 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		pathToHash[path] = hash
 
 		if err := ix.indexFileIfNeeded(ctx, path, workspaceID, hash, len(fileData), stats); err != nil {
-			var unavailable *EmbedUnavailableError
-			if errors.As(err, &unavailable) || ctx.Err() != nil {
+			if ctx.Err() != nil {
 				return err
 			}
 			stats.FilesFailed++
 			fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", path, err)
-			var embedErr *EmbedError
-			if errors.As(err, &embedErr) {
-				embedFailures++
-				if embedFailures >= maxEmbedFailures {
-					return fmt.Errorf("embedding failed %d times — the embedder looks broken, aborting: %w", embedFailures, embedErr.Err)
-				}
-			}
 			return nil
 		}
 		docsSinceFlush++
@@ -163,21 +148,16 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		return nil, err
 	}
 
-	if ix.Embedder != nil {
-		ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
-	}
 	ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 
+	stats.ChunksPendingEmbed = stats.ChunksCreated
 	stats.Duration = time.Since(start)
 	return stats, nil
 }
 
-// IndexPath indexes a single file. workspaceName is used only when creating a new workspace.
+// IndexPath indexes a single file (Phase A only — see Index). workspaceName
+// is used only when creating a new workspace.
 func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64, workspaceName string) (*Stats, error) {
-	if err := ix.checkEmbedderConsistency(); err != nil {
-		return nil, err
-	}
-
 	ext := strings.ToLower(filepath.Ext(path))
 	if !supportedExts[ext] {
 		return nil, fmt.Errorf("unsupported file type: %s", ext)
@@ -198,11 +178,9 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 		if err := ix.Vectors.Flush(); err != nil {
 			return stats, fmt.Errorf("flush vectors: %w", err)
 		}
-		if ix.Embedder != nil {
-			ix.DB.SetActiveEmbedder(ix.Embedder.ModelID(), ix.Embedder.ModelID(), ix.Embedder.Dimensions())
-		}
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 	}
+	stats.ChunksPendingEmbed = stats.ChunksCreated
 	_ = workspaceName
 	return stats, nil
 }
@@ -437,6 +415,12 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 	return nil
 }
 
+// indexDocument writes one loaded document's chunks. This is Phase A only:
+// upsert doc row → tx { delete old chunks+FTS → insert chunks → insert FTS }
+// → commit → Vectors.Delete(oldIDs) → record hash. It never calls
+// Embedder.Embed or Vectors.Add — embedding is EmbedWorker's job, run
+// entirely outside this transaction (and outside this pipeline) so a slow or
+// unreachable embedder never holds the single SQLite connection.
 func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, workspaceID int64, hash string, sizeBytes int, stats *Stats) error {
 	batchSize := ix.BatchSize
 	if batchSize <= 0 {
@@ -444,7 +428,7 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 	}
 
 	// The row is upserted without its content hash: the hash is only recorded
-	// after chunks are committed. Otherwise a failed embed would leave a
+	// after chunks are committed. Otherwise a failed run would leave a
 	// fresh-looking document that every later run skips as "unchanged".
 	// (Upserting must stay outside the tx — the single SQLite connection is
 	// already held once the tx opens.)
@@ -484,7 +468,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 	}
 
 	var storeChunks []*store.Chunk
-	var vectorItems []vectorstore.VectorItem
 
 	for i := 0; i < len(rawChunks); i += batchSize {
 		end := i + batchSize
@@ -492,29 +475,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 			end = len(rawChunks)
 		}
 		batch := rawChunks[i:end]
-
-		texts := make([]string, len(batch))
-		for j, c := range batch {
-			texts[j] = c.Content
-		}
-
-		// A nil Embedder means index-without-embedding (FTS-only, tier
-		// 0-1 mode): skip the embed call entirely and leave vecs empty so
-		// the vectorItems loop below naturally adds nothing.
-		var vecs [][]float32
-		if ix.Embedder != nil {
-			var err error
-			vecs, err = ix.Embedder.Embed(ctx, texts)
-			if err != nil {
-				tx.Rollback()
-				wrapped := fmt.Errorf("embed batch: %w", err)
-				var ue *url.Error
-				if errors.As(err, &ue) && ctx.Err() == nil {
-					return &EmbedUnavailableError{Err: wrapped}
-				}
-				return &EmbedError{Err: wrapped}
-			}
-		}
 
 		for _, c := range batch {
 			sc := &store.Chunk{
@@ -539,15 +499,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 				return fmt.Errorf("insert fts: %w", err)
 			}
 		}
-
-		for j, sc := range batchStoreChunks {
-			if j < len(vecs) {
-				vectorItems = append(vectorItems, vectorstore.VectorItem{
-					ID:     strconv.FormatInt(sc.ID, 10),
-					Vector: vecs[j],
-				})
-			}
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -561,12 +512,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		stats.VectorsPruned += len(oldIDs)
 	}
 
-	if len(vectorItems) > 0 {
-		if err := ix.Vectors.Add(ctx, vectorItems); err != nil {
-			return fmt.Errorf("add vectors: %w", err)
-		}
-	}
-
 	if err := ix.DB.UpdateDocumentHash(docID, hash); err != nil {
 		return fmt.Errorf("record hash: %w", err)
 	}
@@ -574,38 +519,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 	stats.ChunksCreated += len(storeChunks)
 	if ix.OnProgress != nil {
 		ix.OnProgress(doc.Path, len(storeChunks))
-	}
-	return nil
-}
-
-func (ix *Indexer) checkEmbedderConsistency() error {
-	if ix.Embedder == nil {
-		return nil
-	}
-	active, err := ix.DB.GetActiveEmbedder()
-	if err != nil || active == nil {
-		return nil
-	}
-	stored := active.Name
-	if stored == "" {
-		return nil
-	}
-	var storedModel string
-	if i := strings.Index(stored, `"model":"`); i >= 0 {
-		rest := stored[i+9:]
-		if j := strings.Index(rest, `"`); j >= 0 {
-			storedModel = rest[:j]
-		}
-	}
-	if storedModel == "" {
-		return nil
-	}
-	if storedModel != ix.Embedder.ModelID() {
-		return fmt.Errorf(
-			"embedder mismatch: index was built with model %q, current config uses %q\n"+
-				"Run: ney reset && ney index <path>",
-			storedModel, ix.Embedder.ModelID(),
-		)
 	}
 	return nil
 }
