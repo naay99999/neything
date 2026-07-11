@@ -99,6 +99,57 @@ type EmbedWorker struct {
 
 	notifyOnce sync.Once
 	notifyCh   chan struct{}
+
+	statusMu sync.Mutex
+	status   WorkerStatus
+}
+
+// Worker states reported by Status(). "disabled" means no embedder is
+// configured at all (Run/RunLoop are no-ops); "idle" means an embedder is
+// configured but the worker currently has nothing to do (pending drained, or
+// not yet started); "running" is an active drain; "backoff" is a drain
+// paused between retries after a transient embed failure; "blocked_mismatch"
+// is a drain that refused to proceed because the configured embedder's model
+// doesn't match the one the existing index was built with (see
+// ErrEmbedderMismatch) — recovering from this state requires `ney reset`, it
+// does not clear on its own.
+const (
+	WorkerStateDisabled        = "disabled"
+	WorkerStateIdle            = "idle"
+	WorkerStateRunning         = "running"
+	WorkerStateBackoff         = "backoff"
+	WorkerStateBlockedMismatch = "blocked_mismatch"
+)
+
+// WorkerStatus is a snapshot of an EmbedWorker's progress, safe to read
+// concurrently with Run/RunLoop via Status(). Done/Total describe the most
+// recent (or in-progress) drain; both are 0 before the first Run call.
+type WorkerStatus struct {
+	State string
+	Done  int
+	Total int
+}
+
+// Status returns a snapshot of the worker's current state — intended for
+// `ney mcp`'s index_status tool to poll cheaply without touching the DB or
+// VectorStore itself.
+func (w *EmbedWorker) Status() WorkerStatus {
+	w.statusMu.Lock()
+	defer w.statusMu.Unlock()
+	return w.status
+}
+
+func (w *EmbedWorker) setState(state string) {
+	w.statusMu.Lock()
+	w.status.State = state
+	w.statusMu.Unlock()
+}
+
+func (w *EmbedWorker) setProgress(done, total int) {
+	w.statusMu.Lock()
+	w.status.Done = done
+	w.status.Total = total
+	w.statusMu.Unlock()
 }
 
 func (w *EmbedWorker) init() {
@@ -196,11 +247,14 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 	w.init()
 
 	if w.Embedder == nil {
+		w.setState(WorkerStateDisabled)
 		return nil
 	}
 	if err := w.checkModelConsistency(); err != nil {
+		w.setState(WorkerStateBlockedMismatch)
 		return err
 	}
+	w.setState(WorkerStateRunning)
 
 	global := w.Workspace == ""
 
@@ -230,6 +284,7 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 	done := 0
 	batchesSinceFlush := 0
 	embedderRecorded := false
+	w.setProgress(done, total)
 
 	for done < total {
 		if ctx.Err() != nil {
@@ -299,6 +354,7 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 				return fmt.Errorf("flush vectors: %w", err)
 			}
 		}
+		w.setProgress(done, total)
 		if w.OnProgress != nil {
 			w.OnProgress(done, total)
 		}
@@ -315,6 +371,7 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 		}
 	}
 
+	w.setState(WorkerStateIdle)
 	return nil
 }
 
@@ -346,10 +403,12 @@ func (w *EmbedWorker) embedBatch(ctx context.Context, texts []string) ([][]float
 		}
 		fmt.Fprintf(os.Stderr, "warning: embed batch failed (attempt %d/%d): %v — retrying in %s\n",
 			attempt, maxConsecutiveFailures, err, backoff)
+		w.setState(WorkerStateBackoff)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(backoff):
+			w.setState(WorkerStateRunning)
 		}
 		backoff *= 2
 		if backoff > maxBackoff {
@@ -449,6 +508,17 @@ func (w *EmbedWorker) RunLoop(ctx context.Context) error {
 				return err
 			}
 			fmt.Fprintf(os.Stderr, "warning: embed worker: %v\n", err)
+			// A mismatch is sticky by design (§4.2: "ไม่ auto-reset") — Run
+			// already set WorkerStateBlockedMismatch, and status should keep
+			// reporting that until a `ney reset` changes the underlying
+			// model, not flip back to idle just because RunLoop is about to
+			// wait for the next Notify. Any other error (e.g. embedder gave
+			// up after repeated failures) does go back to idle: the next
+			// Notify is a fresh attempt worth reporting as such.
+			var mismatch *ErrEmbedderMismatch
+			if !errors.As(err, &mismatch) {
+				w.setState(WorkerStateIdle)
+			}
 		}
 		select {
 		case <-ctx.Done():

@@ -306,6 +306,32 @@ func (d *DB) GetChunksByIDs(ids []int64) ([]*Chunk, error) {
 	return out, rows.Err()
 }
 
+// GetChunksByDocumentOrdered returns every chunk row for docID ordered by
+// chunk_index — used by `ney mcp`'s read_document tool to reassemble a
+// binary-format (pdf/docx) document's text from its indexed chunks, since
+// those formats can't just be read back off disk as plain text. Like every
+// query method here it fully drains its sql.Rows (via defer) before
+// returning, safe to call again immediately (SetMaxOpenConns(1)).
+func (d *DB) GetChunksByDocumentOrdered(docID int64) ([]*Chunk, error) {
+	rows, err := d.db.Query(
+		`SELECT id, document_id, chunk_index, content, start_pos, end_pos FROM chunks WHERE document_id=? ORDER BY chunk_index`,
+		docID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Chunk
+	for rows.Next() {
+		c := &Chunk{}
+		if err := rows.Scan(&c.ID, &c.DocumentID, &c.ChunkIndex, &c.Content, &c.StartPos, &c.EndPos); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) DeleteChunksByDocument(tx *sql.Tx, docID int64) ([]int64, error) {
 	oldIDs, err := d.GetChunkIDsByDocumentInTx(tx, docID)
 	if err != nil {

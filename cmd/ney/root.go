@@ -46,6 +46,7 @@ func init() {
 		modelsCmd,
 		versionCmd,
 		resetCmd,
+		mcpCmd,
 	)
 }
 

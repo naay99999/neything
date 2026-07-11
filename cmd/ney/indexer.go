@@ -10,6 +10,31 @@ import (
 	"github.com/naay99999/neything/internal/loader"
 )
 
+// newLoaderRegistry builds the same loader set every indexing path uses
+// (order matters for .md sniffing — see CLAUDE.md). Factored out of
+// newIndexer so `ney mcp`'s read_document tool can reuse it for fresh-parse
+// of not-yet-indexed files without duplicating the loader list.
+func newLoaderRegistry(cfg *config.Config) loader.Registry {
+	ocrCfg := loader.OCRConfig{
+		Enabled:      cfg.Loaders.OCR.Enabled,
+		Lang:         cfg.Loaders.OCR.Lang,
+		TesseractCmd: cfg.Loaders.OCR.TesseractCmd,
+		PdftoppmCmd:  cfg.Loaders.OCR.PdftoppmCmd,
+		MinChars:     cfg.Loaders.OCR.MinChars,
+	}
+
+	return loader.NewRegistry(
+		&loader.NotionLoader{},
+		&loader.ObsidianLoader{},
+		&loader.MarkdownLoader{},
+		&loader.HTMLLoader{},
+		&loader.JSONLoader{},
+		&loader.ConfluenceLoader{},
+		&loader.PDFLoader{OCR: loader.NewOCRRunner(ocrCfg, nil)},
+		&loader.DOCXLoader{},
+	)
+}
+
 func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 	chunkResolver, err := chunk.NewResolver(
 		cfg.Chunking.Strategy,
@@ -23,25 +48,6 @@ func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 		return nil, err
 	}
 
-	ocrCfg := loader.OCRConfig{
-		Enabled:      cfg.Loaders.OCR.Enabled,
-		Lang:         cfg.Loaders.OCR.Lang,
-		TesseractCmd: cfg.Loaders.OCR.TesseractCmd,
-		PdftoppmCmd:  cfg.Loaders.OCR.PdftoppmCmd,
-		MinChars:     cfg.Loaders.OCR.MinChars,
-	}
-
-	reg := loader.NewRegistry(
-		&loader.NotionLoader{},
-		&loader.ObsidianLoader{},
-		&loader.MarkdownLoader{},
-		&loader.HTMLLoader{},
-		&loader.JSONLoader{},
-		&loader.ConfluenceLoader{},
-		&loader.PDFLoader{OCR: loader.NewOCRRunner(ocrCfg, nil)},
-		&loader.DOCXLoader{},
-	)
-
 	var gitHistory *loader.GitHistoryLoader
 	if cfg.Loaders.Git.RecentCommits > 0 {
 		gitHistory = loader.NewGitHistoryLoader(cfg.Loaders.Git.RecentCommits)
@@ -51,7 +57,7 @@ func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 		DB:            app.DB,
 		Vectors:       app.Vectors,
 		Embedder:      app.Embedder,
-		Loaders:       reg,
+		Loaders:       newLoaderRegistry(cfg),
 		GitHistory:    gitHistory,
 		ChunkResolver: chunkResolver,
 		BatchSize:     32,
