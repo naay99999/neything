@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 go build -o ney ./cmd/ney   # build binary
 go vet ./...                 # lint
 go test ./...                # run all tests
+go test ./internal/store -run TestName   # run a single test
 ```
 
 No external runtime dependencies for core indexing — SQLite is bundled via `modernc.org/sqlite` (pure Go, no cgo). Optional OCR uses external `pdftoppm` + `tesseract` when `loaders.ocr.enabled: true`.
@@ -42,6 +43,8 @@ Watch:  fsnotify → debounced IndexPath / RemovePath / PruneMissing
 | `internal/store/` | SQLite wrapper; schema in `schema.go`; FTS5 in `fts.go` |
 | `internal/vectorstore/` | `VectorStore` interface; `BruteForceStore` + `HNSWStore` (lazy graph rebuild) |
 | `internal/rerank/` | Reranker interface + Cohere, Jina, Ollama/local implementations |
+| `internal/apiretry/` | Shared HTTP retry helper (`apiretry.Do`) used by provider clients; honors `Retry-After` |
+| `internal/citation/` | Formats chunk locations for display (`lines`/`pages`/`paragraphs` by doc type) |
 
 **Key constraints:**
 
@@ -52,6 +55,8 @@ Watch:  fsnotify → debounced IndexPath / RemovePath / PruneMissing
 - Changing the embedding model invalidates the whole index. The indexer checks model consistency at the start of every `Index` call and refuses to proceed on mismatch.
 - Claude cannot be used as an embedder (Anthropic has no embedding API). `config.Validate` enforces this.
 - Provider factory functions live in `internal/config/config.go`, not in the provider packages themselves.
+
+**Workspace scoping (`cmd/ney/workspace.go`, `sync.go`):** `search`/`ask` default to the workspace whose `root_path` contains the cwd (longest match wins); `--workspace` overrides, `--all` forces global. Before searching, `syncWorkspaceIfKnown` silently re-indexes the cwd workspace (reusing the already-open DB/Vectors/Embedder — never open a second writer) and never fails the caller's request. If a scoped search returns nothing, commands fall back to a global search and label results with their workspace.
 
 **Adding a new provider:** implement `embed.Embedder` or `chat.ChatModel`, add a case to `config.NewEmbedder` / `config.NewChatModel`, update `config.Validate`'s allow-lists, and update `ney doctor` / `ney models` output.
 

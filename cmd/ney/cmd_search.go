@@ -33,17 +33,28 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
 		return err
 	}
+	syncWorkspaceIfKnown(cmd.Context(), app, cfg)
 
 	topK := flagTopK
 	if topK <= 0 {
 		topK = cfg.Retrieval.TopK
 	}
 
+	opts := retrieveOpts(app.DB, cfg, topK)
 	sp := startSpinner("searching")
-	results, err := newRetriever(app).Search(cmd.Context(), query, retrieveOpts(cfg, topK))
+	results, err := newRetriever(app).Search(cmd.Context(), query, opts)
 	sp.Stop()
 	if err != nil {
 		return err
+	}
+	fellBack := false
+	if len(results) == 0 && opts.Workspace != "" {
+		globalOpts := opts
+		globalOpts.Workspace = ""
+		if fallback, ferr := newRetriever(app).Search(cmd.Context(), query, globalOpts); ferr == nil && len(fallback) > 0 {
+			results = fallback
+			fellBack = true
+		}
 	}
 
 	groups := search.GroupByFile(results)
@@ -57,9 +68,17 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		fmt.Println("No results found.")
 		return nil
 	}
+	if fellBack {
+		fmt.Println(Dim("(nothing in this folder — showing results from other indexed workspaces)"))
+	}
 
+	mixed := mixedWorkspaces(results)
 	for _, g := range groups {
-		fmt.Printf("%s %s\n", Bold(displayPath(g.DocPath)), Dim(fmt.Sprintf("(best: %.4f)", g.BestScore)))
+		label := ""
+		if mixed && g.Workspace != "" {
+			label = " " + Dim("["+g.Workspace+"]")
+		}
+		fmt.Printf("%s%s %s\n", Bold(displayPath(g.DocPath)), label, Dim(fmt.Sprintf("(best: %.4f)", g.BestScore)))
 		for i, r := range g.Chunks {
 			loc := citation.FormatLocation(r.DocType, r.StartPos, r.EndPos)
 			if loc != "" {

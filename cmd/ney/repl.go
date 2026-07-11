@@ -38,7 +38,7 @@ func runREPL() error {
 	defer rl.Close()
 
 	state := printBanner()
-	if state.chunkCount == 0 && colorEnabled && isatty.IsTerminal(os.Stdin.Fd()) {
+	if !state.cwdIndexed && colorEnabled && isatty.IsTerminal(os.Stdin.Fd()) {
 		runOnboarding(state)
 	}
 
@@ -89,7 +89,15 @@ func handleMetaCommand(line string) (handled bool, exit bool) {
 }
 
 func dispatchLine(line string) error {
+	forceAll := false
+	if trimmed := strings.TrimSpace(line); strings.HasPrefix(strings.ToLower(trimmed), ":all ") {
+		forceAll = true
+		line = strings.TrimSpace(trimmed[len(":all "):])
+	}
 	line = strings.TrimPrefix(line, "/")
+	if line == "" {
+		return fmt.Errorf("usage: :all <question>")
+	}
 	firstWord := strings.Fields(line)[0]
 	known := knownCommandNames()
 
@@ -146,6 +154,9 @@ func dispatchLine(line string) error {
 
 	if tokens == nil {
 		return nil
+	}
+	if forceAll {
+		tokens = append(tokens, "--all")
 	}
 
 	resetAllFlags(rootCmd)

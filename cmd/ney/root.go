@@ -20,6 +20,7 @@ var (
 	flagProvider  string
 	flagJSON      bool
 	flagPath      string
+	flagAll       bool
 )
 
 func init() {
@@ -31,6 +32,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagProvider, "provider", "", "override provider (embedder for index/search/watch, chat for ask)")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "output JSON")
 	rootCmd.PersistentFlags().StringVar(&flagPath, "path", "", "limit scope to path")
+	rootCmd.PersistentFlags().BoolVar(&flagAll, "all", false, "search across all workspaces, ignoring the current folder's scope")
 
 	rootCmd.AddCommand(
 		initCmd,

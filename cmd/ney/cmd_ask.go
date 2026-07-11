@@ -35,17 +35,27 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
 		return err
 	}
+	syncWorkspaceIfKnown(cmd.Context(), app, cfg)
 
 	topK := flagTopK
 	if topK <= 0 {
 		topK = cfg.Retrieval.TopK
 	}
 
+	opts := retrieveOpts(app.DB, cfg, topK)
 	sp := startSpinner("searching")
-	results, err := newRetriever(app).Search(cmd.Context(), question, retrieveOpts(cfg, topK))
+	results, err := newRetriever(app).Search(cmd.Context(), question, opts)
 	sp.Stop()
 	if err != nil {
 		return err
+	}
+	if len(results) == 0 && opts.Workspace != "" {
+		globalOpts := opts
+		globalOpts.Workspace = ""
+		if fallback, ferr := newRetriever(app).Search(cmd.Context(), question, globalOpts); ferr == nil && len(fallback) > 0 {
+			results = fallback
+			fmt.Println(Dim("(nothing in this folder — showing results from other indexed workspaces)"))
+		}
 	}
 	if len(results) == 0 {
 		return fmt.Errorf("no relevant context found — try indexing more files")
@@ -96,10 +106,14 @@ func runAsk(cmd *cobra.Command, args []string) error {
 }
 
 func dedupeSources(results []search.EnrichedResult) []string {
+	mixed := mixedWorkspaces(results)
 	seen := make(map[string]bool)
 	var out []string
 	for _, r := range results {
 		src := citation.FormatSource(displayPath(r.DocPath), r.DocType, r.StartPos, r.EndPos)
+		if mixed && r.Workspace != "" {
+			src = fmt.Sprintf("[%s] %s", r.Workspace, src)
+		}
 		if seen[src] {
 			continue
 		}
@@ -107,4 +121,16 @@ func dedupeSources(results []search.EnrichedResult) []string {
 		out = append(out, src)
 	}
 	return out
+}
+
+// mixedWorkspaces reports whether results span more than one distinct
+// workspace — true when --all/:all was used or a fallback jumped scope.
+func mixedWorkspaces(results []search.EnrichedResult) bool {
+	seen := make(map[string]bool)
+	for _, r := range results {
+		if r.Workspace != "" {
+			seen[r.Workspace] = true
+		}
+	}
+	return len(seen) > 1
 }

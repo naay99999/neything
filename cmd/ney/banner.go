@@ -23,6 +23,7 @@ var logoGradient = []int{51, 50, 49, 48, 47, 46}
 type bannerState struct {
 	chunkCount int
 	configOK   bool
+	cwdIndexed bool
 }
 
 // printBanner renders the startup screen: logo on the left, live status
@@ -78,6 +79,7 @@ func bannerInfo() ([]string, bannerState) {
 				lines[4] = label("index") + " " + Yellow("empty")
 			}
 		}
+		state.cwdIndexed = cwdWorkspace(db) != nil
 		db.Close()
 	}
 	return lines, state

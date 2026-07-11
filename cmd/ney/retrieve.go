@@ -33,11 +33,11 @@ func requireWorkspace(db *store.DB, name string) error {
 	return fmt.Errorf("workspace %q not found — create it with: ney index <path> --workspace %s", name, name)
 }
 
-func retrieveOpts(cfg *config.Config, topK int) search.RetrieveOptions {
+func retrieveOpts(db *store.DB, cfg *config.Config, topK int) search.RetrieveOptions {
 	return search.RetrieveOptions{
 		TopK:       topK,
 		FetchK:     config.FetchK(cfg, topK),
-		Workspace:  flagWorkspace,
+		Workspace:  effectiveWorkspaceName(db),
 		PathPrefix: flagPath,
 		Hybrid:     cfg.Retrieval.Hybrid,
 		Rerank:     cfg.Retrieval.Rerank,
