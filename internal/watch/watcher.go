@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -34,8 +32,23 @@ type Watcher struct {
 	// EmbedWorker (Notify) that new chunks may be pending. It fires even
 	// when the batch turned out to be a no-op; it must be cheap.
 	OnFlush func()
+	// Serialize, if set, wraps every Indexer invocation made by the watcher
+	// (flush batches and PruneMissing calls) so a caller embedding multiple
+	// Watchers — e.g. the `ney mcp` server — can run them under a shared
+	// mutex alongside its own indexing work. When nil, Indexer calls run
+	// directly with no external synchronization (current/default behavior).
+	Serialize func(run func())
+	// DisablePrune, when true, turns off the periodic PruneMissing ticker
+	// (governed by SyncEvery) as well as the final prune performed on
+	// shutdown. Use this when an external owner (e.g. a server centralizing
+	// prune across many watched roots) already handles pruning.
+	DisablePrune bool
 }
 
+// Run watches RootPath for filesystem changes and indexes them until ctx is
+// canceled. It installs no signal handlers of its own — callers that want
+// Ctrl+C to stop a Run loop must derive ctx from a signal-aware context
+// (e.g. signal.NotifyContext) themselves.
 func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	if w.Debounce <= 0 {
 		w.Debounce = 2 * time.Second
@@ -57,6 +70,15 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	stats := &Stats{}
 	pending := make(map[string]struct{})
 	var pendingMu sync.Mutex
+
+	runSerialized := func(run func()) {
+		if w.Serialize != nil {
+			w.Serialize(run)
+		} else {
+			run()
+		}
+	}
+
 	flush := func() {
 		pendingMu.Lock()
 		paths := make([]string, 0, len(pending))
@@ -66,39 +88,73 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 		pending = make(map[string]struct{})
 		pendingMu.Unlock()
 
-		for _, path := range paths {
-			if _, err := os.Stat(path); err != nil {
-				s, err := w.Indexer.RemovePath(ctx, path)
-				if err != nil {
-					stats.Errors++
-					w.logf("warning: remove %s: %v", path, err)
+		if len(paths) == 0 {
+			if w.OnFlush != nil {
+				w.OnFlush()
+			}
+			return
+		}
+
+		runSerialized(func() {
+			for _, path := range paths {
+				if _, err := os.Stat(path); err != nil {
+					s, err := w.Indexer.RemovePath(ctx, path)
+					if err != nil {
+						stats.Errors++
+						w.logf("warning: remove %s: %v", path, err)
+						continue
+					}
+					stats.FilesRemoved += s.FilesRemoved
+					stats.VectorsPruned += s.VectorsPruned
+					w.logf("removed %s", path)
 					continue
 				}
-				stats.FilesRemoved += s.FilesRemoved
+				if !index.IsSupportedExt(path) {
+					continue
+				}
+				s, err := w.Indexer.IndexPath(ctx, path, w.WorkspaceID, "")
+				if err != nil {
+					stats.Errors++
+					w.logf("warning: index %s: %v", path, err)
+					continue
+				}
+				stats.FilesIndexed += s.FilesScanned - s.FilesSkipped
 				stats.VectorsPruned += s.VectorsPruned
-				w.logf("removed %s", path)
-				continue
+				if s.FilesSkipped > 0 {
+					w.logf("skipped %s (unchanged)", path)
+				} else {
+					w.logf("indexed %s", path)
+				}
 			}
-			if !index.IsSupportedExt(path) {
-				continue
-			}
-			s, err := w.Indexer.IndexPath(ctx, path, w.WorkspaceID, "")
-			if err != nil {
-				stats.Errors++
-				w.logf("warning: index %s: %v", path, err)
-				continue
-			}
-			stats.FilesIndexed += s.FilesScanned - s.FilesSkipped
-			stats.VectorsPruned += s.VectorsPruned
-			if s.FilesSkipped > 0 {
-				w.logf("skipped %s (unchanged)", path)
-			} else {
-				w.logf("indexed %s", path)
-			}
-		}
+		})
 		if w.OnFlush != nil {
 			w.OnFlush()
 		}
+	}
+
+	// pruneTick runs the periodic sweep for files removed without a
+	// filesystem event (e.g. deleted while the watcher wasn't running).
+	pruneTick := func() {
+		runSerialized(func() {
+			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err != nil {
+				stats.Errors++
+				w.logf("warning: prune sync: %v", err)
+			} else if s.FilesRemoved > 0 {
+				stats.FilesRemoved += s.FilesRemoved
+				stats.VectorsPruned += s.VectorsPruned
+				w.logf("pruned %d missing files", s.FilesRemoved)
+			}
+		})
+	}
+
+	// pruneFinal runs once on shutdown, silently folding results into stats.
+	pruneFinal := func() {
+		runSerialized(func() {
+			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err == nil {
+				stats.FilesRemoved += s.FilesRemoved
+				stats.VectorsPruned += s.VectorsPruned
+			}
+		})
 	}
 
 	var debounceTimer *time.Timer
@@ -112,37 +168,25 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 		debounceTimer = time.AfterFunc(w.Debounce, flush)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	syncTicker := time.NewTicker(w.SyncEvery)
-	defer syncTicker.Stop()
+	// syncTickerC stays nil (and so never fires) when pruning is disabled —
+	// an external owner is expected to centralize pruning across watchers.
+	var syncTickerC <-chan time.Time
+	if !w.DisablePrune {
+		syncTicker := time.NewTicker(w.SyncEvery)
+		defer syncTicker.Stop()
+		syncTickerC = syncTicker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			flush()
-			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err == nil {
-				stats.FilesRemoved += s.FilesRemoved
-				stats.VectorsPruned += s.VectorsPruned
+			if !w.DisablePrune {
+				pruneFinal()
 			}
 			return stats, nil
-		case <-sigCh:
-			w.logf("shutting down...")
-			cancel()
-		case <-syncTicker.C:
-			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err != nil {
-				stats.Errors++
-				w.logf("warning: prune sync: %v", err)
-			} else if s.FilesRemoved > 0 {
-				stats.FilesRemoved += s.FilesRemoved
-				stats.VectorsPruned += s.VectorsPruned
-				w.logf("pruned %d missing files", s.FilesRemoved)
-			}
+		case <-syncTickerC:
+			pruneTick()
 		case err, ok := <-fsw.Errors:
 			if !ok {
 				return stats, nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
@@ -73,11 +75,34 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "Watching %s (workspace: %s, debounce: %s)...\n", rootPath, workspaceName, flagWatchDebounce)
 	fmt.Fprintf(os.Stderr, "Press Ctrl+C to stop.\n")
 
+	onEvent := func(msg string) {
+		fmt.Fprintf(os.Stderr, "  %s\n", msg)
+	}
+
+	// Watcher.Run only responds to ctx now (it installs no signal handlers
+	// of its own), so we own SIGINT/SIGTERM here and cancel a derived ctx —
+	// this is what makes Ctrl+C trigger Run's final-flush-then-prune path
+	// and return cleanly.
+	watchCtx, cancelWatch := context.WithCancel(cmd.Context())
+	defer cancelWatch()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			onEvent("shutting down...")
+			cancelWatch()
+		case <-watchCtx.Done():
+		}
+	}()
+
 	// Phase B runs beside the watcher for the whole watch: the watcher only
 	// writes chunks+FTS (Phase A), and nudges the worker after every flush
-	// batch. The worker gets its own cancel because the watcher handles
-	// SIGINT internally on a derived ctx — cmd.Context() survives Ctrl+C,
-	// so the worker must be stopped explicitly once Watcher.Run returns.
+	// batch. The worker gets its own cancel, derived from cmd.Context()
+	// (not watchCtx) rather than tied to Watcher.Run's ctx, so Ctrl+C stops
+	// the watcher (flush + prune) first, and the worker is stopped
+	// explicitly once Watcher.Run returns.
 	var worker *index.EmbedWorker
 	if app.Embedder != nil {
 		workerCtx, stopWorker := context.WithCancel(cmd.Context())
@@ -105,15 +130,13 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		RootPath:    rootPath,
 		WorkspaceID: workspaceID,
 		Debounce:    flagWatchDebounce,
-		OnEvent: func(msg string) {
-			fmt.Fprintf(os.Stderr, "  %s\n", msg)
-		},
+		OnEvent:     onEvent,
 	}
 	if worker != nil {
 		w.OnFlush = worker.Notify
 	}
 
-	stats, err := w.Run(cmd.Context())
+	stats, err := w.Run(watchCtx)
 	if err != nil {
 		return err
 	}
