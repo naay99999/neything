@@ -13,6 +13,7 @@ import (
 	"github.com/naay99999/neything/internal/citation"
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/index"
+	"github.com/naay99999/neything/internal/scan"
 	"github.com/naay99999/neything/internal/search"
 )
 
@@ -45,8 +46,10 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 		Name: "search_documents",
 		Description: "Search the indexed local documents (hybrid keyword + semantic, mode depends on config). " +
 			"Results may be partial while background indexing/embedding is still in progress — check the " +
-			"returned index_status (phase_a_running, embedding_state) before concluding something isn't indexed.",
-	}, searchDocumentsHandler(app, cfg, state, worker))
+			"returned index_status (phase_a_running, embedding_state) before concluding something isn't indexed. " +
+			"While a root's initial scan is still running, results are supplemented with a live filesystem scan " +
+			"(source: \"live-scan\") so filename/content matches show up even before that root finishes indexing.",
+	}, searchDocumentsHandler(app, cfg, state, worker, roots))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_document",
@@ -104,7 +107,7 @@ type searchDocumentsOutput struct {
 	IndexStatus indexStatusBrief   `json:"index_status"`
 }
 
-func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
+func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, roots []mcpRoot) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchDocumentsInput) (*mcp.CallToolResult, searchDocumentsOutput, error) {
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, searchDocumentsOutput{}, fmt.Errorf("query is required")
@@ -142,6 +145,7 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 				Source:    "index",
 			}
 		}
+		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state)
 
 		chunkCount, _ := app.DB.CountChunks()
 		out := searchDocumentsOutput{
@@ -165,7 +169,11 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 				if loc != "" {
 					loc = " (" + loc + ")"
 				}
-				fmt.Fprintf(&b, "%d. %s%s [%s] score=%.4f\n   %s\n", i+1, it.Path, loc, it.Workspace, it.Score, it.Snippet)
+				tag := ""
+				if it.Source == "live-scan" {
+					tag = " [live-scan]"
+				}
+				fmt.Fprintf(&b, "%d. %s%s%s [%s] score=%.4f\n   %s\n", i+1, it.Path, loc, tag, it.Workspace, it.Score, it.Snippet)
 			}
 		}
 		if meta.Degraded != "" {
@@ -177,6 +185,78 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, out, nil
 	}
+}
+
+// appendLiveScanHits runs a tier-0 filesystem scan (internal/scan) on any
+// root whose Phase A indexing is still in flight and merges its hits after
+// the index results, deduped by path (an index hit always wins — it's
+// strictly more informative), tagged source "live-scan". This is the MCP
+// side of the design's §6.1 "index ready?" criterion: unlike the CLI (which
+// has no server state and falls back to a path/document-count heuristic —
+// see cmd_search.go's liveScanRoot), `ney mcp` knows exactly which roots
+// haven't finished their initial scan yet.
+func appendLiveScanHits(ctx context.Context, items []searchResultItem, query, workspace string, roots []mcpRoot, state *serverState) []searchResultItem {
+	targets := relevantScanRoots(workspace, roots, state)
+	if len(targets) == 0 {
+		return items
+	}
+	seen := make(map[string]bool, len(items))
+	for _, it := range items {
+		seen[it.Path] = true
+	}
+	for _, r := range targets {
+		hits, _, err := scan.Scan(ctx, r.Path, query, scan.Options{})
+		if err != nil {
+			continue
+		}
+		for _, h := range hits {
+			if seen[h.Path] {
+				continue
+			}
+			seen[h.Path] = true
+			snippet := h.Snippet
+			if snippet == "" {
+				snippet = "(filename match)"
+			}
+			items = append(items, searchResultItem{
+				Path:      h.Path,
+				Workspace: r.Name,
+				Score:     float32(h.Score),
+				Snippet:   snippet,
+				Source:    "live-scan",
+			})
+		}
+	}
+	return items
+}
+
+// relevantScanRoots returns the roots a live scan should cover for this
+// query: just the requested workspace's root if it's still on its initial
+// Phase A scan, or every still-scanning root when the query isn't scoped to
+// one workspace. Returns nil (no scan) once every root has finished Phase A.
+func relevantScanRoots(workspace string, roots []mcpRoot, state *serverState) []mcpRoot {
+	running := make(map[string]bool)
+	for _, name := range state.runningRoots() {
+		running[name] = true
+	}
+	if len(running) == 0 {
+		return nil
+	}
+	if workspace != "" {
+		for _, r := range roots {
+			if r.Name == workspace && running[r.Name] {
+				return []mcpRoot{r}
+			}
+		}
+		return nil
+	}
+	var targets []mcpRoot
+	for _, r := range roots {
+		if running[r.Name] {
+			targets = append(targets, r)
+		}
+	}
+	return targets
 }
 
 // --- read_document ------------------------------------------------------------

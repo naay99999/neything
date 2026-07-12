@@ -445,6 +445,20 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// 9. MCP readiness — always informational (pass-only): tells the user the
+	// exact command to wire ney into an MCP client, with the actual resolved
+	// binary path so it works regardless of how `ney` was installed/aliased.
+	mcpBin := "ney"
+	if bin, binErr := os.Executable(); binErr == nil {
+		mcpBin = bin
+	}
+	results = append(results, checkResult{
+		Check:   "mcp",
+		OK:      true,
+		Message: "MCP server available — point an AI client at ney for zero-setup search",
+		Hint:    fmt.Sprintf("claude mcp add ney -- %s mcp --root <path>", mcpBin),
+	})
+
 	printDoctorResults(results)
 	return nil
 }

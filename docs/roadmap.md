@@ -34,7 +34,7 @@
 | Incremental indexing เต็มรูปแบบ | Done — prune missing files, orphan vectors, rename-by-hash |
 | File watcher | Done — `ney watch <path>` |
 | TurbovecStore | Done — `HNSWStore` (pure Go) + `BruteForceStore` fallback |
-| OCR, loaders เพิ่ม, Web UI, REST API, MCP, VS Code | OCR + loaders done (Phase 3); Web UI, REST API, MCP, VS Code ยังไม่มี |
+| OCR, loaders เพิ่ม, Web UI, REST API, MCP, VS Code | OCR + loaders done (Phase 3); MCP done (Phase 4.2); Web UI, REST API, VS Code ยังไม่มี |
 
 ---
 
@@ -151,12 +151,14 @@ Implement ทีละ loader ผ่าน `Loader` interface:
 - [ ] Auth optional (token / localhost-only)
 - [ ] คำสั่ง `ney serve`
 
-#### 4.2 MCP Server
+#### 4.2 MCP Server — Done ✓
 
-- [ ] Expose tools: `search`, `ask`, `status`
-- [ ] ใช้ index จาก `~/.ney/` เดียวกับ CLI
-- [ ] คำสั่ง `ney mcp` (stdio transport)
-- [ ] เอกสาร integration กับ Cursor / Claude Code
+Implemented per [`docs/superpowers/specs/2026-07-12-mcp-tiered-search-design.md`](./superpowers/specs/2026-07-12-mcp-tiered-search-design.md) (expanded scope beyond the original bullets below: tiered zero-setup search, two-phase indexing, optional providers).
+
+- [x] Expose tools: `search_documents`, `read_document`, `list_workspaces`, `index_status`
+- [x] ใช้ index จาก `~/.ney/` เดียวกับ CLI
+- [x] คำสั่ง `ney mcp` (stdio transport)
+- [x] เอกสาร integration กับ Cursor / Claude Code / Claude Desktop (README §MCP)
 
 #### 4.3 Web UI Dashboard
 
@@ -206,7 +208,7 @@ Implement ทีละ loader ผ่าน `Loader` interface:
 | **v0.2** | Phase 1 ทั้งหมด | Done — rerank, hybrid, tokenizer chunking |
 | **v0.3** | Phase 2 ทั้งหมด | Done — incremental index, watch, HNSW vector store |
 | **v0.4** | Phase 3 ทั้งหมด | Done — OCR, loaders, per-format chunking |
-| **v0.5** | Phase 4 (API + MCP ก่อน UI) | เปิด ecosystem |
+| **v0.5** | Phase 4.2 (MCP) done; REST API + UI ต่อ | เปิด ecosystem |
 | **v1.0** | Phase 5 + polish | stable API, docs, release |
 
 ---

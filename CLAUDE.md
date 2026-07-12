@@ -15,48 +15,65 @@ No external runtime dependencies for core indexing — SQLite is bundled via `mo
 
 ## Architecture
 
-Ney is a local-first CLI RAG engine. Data lives in `~/.ney/`: `config.yaml`, `index.db` (SQLite), and vector files (`vectors.bin` for brute-force, `vectors.hnsw` for HNSW backend).
+Ney is a local-first CLI RAG engine, usable via the CLI or as an MCP server (`ney mcp`). Data lives in `~/.ney/`: `config.yaml`, `index.db` (SQLite), vector files (`vectors.bin` for brute-force, `vectors.hnsw` for HNSW backend), and `writer.lock` (single-writer coordination).
+
+Both the embedder and chat provider are **optional**: `provider: none`/unset in config runs ney in keyword-only (FTS) mode with no API key or local model needed — `ney init` is the upgrade path to semantic search / `ney ask`. `config.HasEmbedder()` / `HasChat()` check this; `NewEmbedder`/`NewChatModel` return `(nil, nil)` when unset (not an error).
 
 **Request flows:**
 
 ```
-Index:  Files → Loader → ChunkResolver → Embedder → VectorStore + SQLite + FTS
-        (+ optional GitHistoryLoader, OCR fallback in PDFLoader)
-Search: Query → Embed → VectorStore + optional FTS → RRF → optional rerank → chunks
-Ask:    Search → trim to MaxContextChars → ChatModel → answer + citations
-Watch:  fsnotify → debounced IndexPath / RemovePath / PruneMissing
+Index (Phase A):  Files → Loader → ChunkResolver → SQLite chunks + FTS (no embedding)
+                   (+ optional GitHistoryLoader, OCR fallback in PDFLoader)
+Index (Phase B):  EmbedWorker computes pending = chunk IDs − VectorStore IDs, embeds
+                   in batches outside any SQL transaction, sweeps orphan vectors
+Search:  Query → FTS (always, if rows exist) + semantic (if embedder configured and
+         vectors exist) → RRF fusion → optional rerank → chunks + SearchMeta
+         (degrades to keyword-only, never fails, if the embedder is down/unset)
+Ask:     Search → trim to MaxContextChars → ChatModel → answer + citations
+Watch:   fsnotify → debounced IndexPath / RemovePath / PruneMissing → Phase A only,
+         then EmbedWorker.Notify()
+MCP:     ney mcp → writer lock → Phase A per --root (background) → EmbedWorker loop
+         → watcher per root → serves search_documents/read_document/list_workspaces/
+         index_status immediately, before indexing finishes (tier 0 live scan fills
+         the gap — see internal/scan)
 ```
+
+Indexing is split into two phases specifically so a slow/unreachable embedder can never hold the single SQLite connection: Phase A (`internal/index/pipeline.go`) never calls `Embedder.Embed` or `Vectors.Add`; embedding is entirely `EmbedWorker`'s job (`internal/index/embedworker.go`), run outside any transaction. There is no "embedded?" column — pending/orphan state is computed by diffing SQLite chunk IDs against `VectorStore.IDs()` on each worker pass (relies on chunk IDs being `AUTOINCREMENT`, never reused).
 
 **Package map:**
 
 | Package | Role |
 |---|---|
-| `cmd/ney/` | Cobra commands; thin wrappers that wire internal packages |
+| `cmd/ney/` | Cobra commands; thin wrappers that wire internal packages. `cmd_mcp.go` + `mcp_tools.go` implement `ney mcp` |
 | `internal/config/` | Config loading (viper), validation, and **provider factory functions** (`NewEmbedder`, `NewChatModel`, `NewReranker`, `NewVectorStore`) |
 | `internal/loader/` | File loaders: `.md`/Obsidian/Notion, `.pdf` (+ OCR), `.docx`, `.html`, `.json`, Confluence `.xml`, Git history |
 | `internal/chunk/` | `ChunkStrategy` + `Resolver` (auto per doc type): `character`, `sentence`, `paragraph`, `markdown`, `tokenizer`, `page` |
 | `internal/embed/` | `Embedder` interface + OpenAI, Gemini, Ollama, OpenAI-compatible implementations |
 | `internal/chat/` | `ChatModel` interface + Claude, OpenAI, Gemini, Ollama implementations |
-| `internal/index/` | `Indexer` — hash-based skip, prune missing files, orphan vector cleanup, rename detection |
-| `internal/watch/` | File watcher with debounce for `ney watch` |
-| `internal/search/` | `Retriever` — hybrid search, RRF fusion, optional rerank |
+| `internal/index/` | `Indexer` (Phase A: chunk+FTS, hash-based skip, prune, rename detection) + `EmbedWorker` (Phase B: progressive embed, orphan cleanup, backoff, model-consistency check) |
+| `internal/watch/` | File watcher with debounce for `ney watch`; accepts an external ctx + optional `Serialize`/prune-disable so `ney mcp` can run several under one shared mutex |
+| `internal/search/` | `Retriever` — auto/semantic/keyword/hybrid modes, RRF fusion, optional rerank, `SearchMeta` (what actually ran, degradation reason) |
+| `internal/scan/` | Tier-0 "live scan": stateless filename + content-grep search of the raw filesystem, used before/without an index (`ney mcp` while Phase A runs; `ney search` on an unindexed folder) |
 | `internal/store/` | SQLite wrapper; schema in `schema.go`; FTS5 in `fts.go` |
-| `internal/vectorstore/` | `VectorStore` interface; `BruteForceStore` + `HNSWStore` (lazy graph rebuild) |
+| `internal/vectorstore/` | `VectorStore` interface (includes `IDs()` for the Phase B diff); `BruteForceStore` + `HNSWStore` (lazy graph rebuild, full rebuild on any `Delete`) |
 | `internal/rerank/` | Reranker interface + Cohere, Jina, Ollama/local implementations |
+| `internal/lockfile/` | Cross-process writer lock (`~/.ney/writer.lock`, pid + staleness check) held by every command that writes chunks/vectors |
 | `internal/apiretry/` | Shared HTTP retry helper (`apiretry.Do`) used by provider clients; honors `Retry-After` |
 | `internal/citation/` | Formats chunk locations for display (`lines`/`pages`/`paragraphs` by doc type) |
 
 **Key constraints:**
 
-- SQLite runs with `SetMaxOpenConns(1)`. Because of this, `indexDocument` in `pipeline.go` upserts the document row *before* opening the transaction — doing it inside the tx would deadlock since the single connection is already held.
+- SQLite runs with `SetMaxOpenConns(1)`. Because of this, `indexDocument` in `pipeline.go` upserts the document row *before* opening the transaction — doing it inside the tx would deadlock since the single connection is already held. The same rule applies to any new store method: **never issue a query while a prior query's `sql.Rows` is still open** — drain/close it first, or it hangs.
 - Do **not** rely on `LastInsertId()` after unrelated statements on the single SQLite connection — always `SELECT` the row id after upsert (see `UpsertWorkspace`, `UpsertDocument`).
 - Vector IDs are SQLite chunk row IDs serialized as strings. This is the join key between vector files and `index.db`.
-- Re-indexing must call `Vectors.Delete` for old chunk IDs before adding new ones; `Index()` also prunes documents missing from the filesystem.
-- Changing the embedding model invalidates the whole index. The indexer checks model consistency at the start of every `Index` call and refuses to proceed on mismatch.
+- Re-indexing must call `Vectors.Delete` for old chunk IDs before adding new ones; `Index()` also prunes documents missing from the filesystem. `EmbedWorker` owns writing `active_embedder` (`SetActiveEmbedder`, on first successful embed batch) and the model-consistency check — Phase A no longer does either, since it never touches vectors.
+- Changing the embedding model invalidates the whole index. `EmbedWorker` checks model consistency (via a substring scan of the `active_embedder` meta blob — `GetActiveEmbedder`'s `Sscanf`-based parse is broken, don't use it) at the start of every drain and refuses to proceed on mismatch (`blocked_mismatch`, sticky until `ney reset`).
 - Claude cannot be used as an embedder (Anthropic has no embedding API). `config.Validate` enforces this.
 - Provider factory functions live in `internal/config/config.go`, not in the provider packages themselves.
+- Any command that writes chunks or vectors (`index`, `watch`, `mcp`, `reset`) must acquire `internal/lockfile.Acquire(config.NeyDir())` before opening the DB/VectorStore, and release it on exit — two writers flushing the same vector file concurrently silently clobber each other. Read-only commands (`search`, `ask`, `status`) don't need it.
+- `ney mcp`'s stdout is reserved for the MCP protocol, full stop — every diagnostic goes to stderr. Never call `fmt.Println`/`PrintJSON`/the banner/spinner helpers (which write to stdout) from any code path `runMCP` can reach.
 
-**Workspace scoping (`cmd/ney/workspace.go`, `sync.go`):** `search`/`ask` default to the workspace whose `root_path` contains the cwd (longest match wins); `--workspace` overrides, `--all` forces global. Before searching, `syncWorkspaceIfKnown` silently re-indexes the cwd workspace (reusing the already-open DB/Vectors/Embedder — never open a second writer) and never fails the caller's request. If a scoped search returns nothing, commands fall back to a global search and label results with their workspace.
+**Workspace scoping (`cmd/ney/workspace.go`, `sync.go`):** `search`/`ask` default to the workspace whose `root_path` contains the cwd (longest match wins); `--workspace` overrides, `--all` forces global. Before searching, `syncWorkspaceIfKnown` silently re-indexes the cwd workspace (reusing the already-open DB/Vectors/Embedder — never open a second writer) and never fails the caller's request. If a scoped search returns nothing, commands fall back to a global search and label results with their workspace. When the scope isn't backed by an indexed workspace yet (or has zero documents), `ney search` additionally runs a tier-0 `internal/scan` pass and appends results labeled `source: "live-scan"`.
 
 **Adding a new provider:** implement `embed.Embedder` or `chat.ChatModel`, add a case to `config.NewEmbedder` / `config.NewChatModel`, update `config.Validate`'s allow-lists, and update `ney doctor` / `ney models` output.
 

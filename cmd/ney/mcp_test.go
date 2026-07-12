@@ -191,6 +191,77 @@ func TestMCPSearchDocumentsRequiresQuery(t *testing.T) {
 	}
 }
 
+// TestMCPSearchDocumentsLiveScanDuringPhaseA covers the M4 tier-0 wiring
+// (design §6.1): while a root's Phase A scan is still marked running in
+// serverState, search_documents supplements index results with a live
+// filesystem scan of that root, so a file that exists on disk but has no
+// chunk/FTS rows yet still shows up — tagged source "live-scan" — instead
+// of the query coming back empty.
+func TestMCPSearchDocumentsLiveScanDuringPhaseA(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "order-9999-receipt.md"), "Receipt for order-9999, paid by Bob.\n")
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := initAppWithOptions(cfg, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		app.DB.Close()
+		app.Vectors.Close()
+	})
+	if _, err := app.DB.UpsertWorkspace("corpus", resolvedRoot); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately skip ix.Index — nothing is indexed yet, simulating a
+	// query that arrives while Phase A (marked below) is still in flight.
+
+	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
+	state := newServerState(rootNames(roots))
+	state.setPhaseA("corpus", true)
+
+	server := newMCPServer(app, cfg, state, roots, nil)
+	t1, t2 := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := server.Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	env := &mcpTestEnv{cs: cs, app: app, state: state, root: resolvedRoot}
+	out := callTool[searchDocumentsOutput](t, env, "search_documents", searchDocumentsInput{Query: "order-9999"})
+
+	if !out.IndexStatus.PhaseARunning {
+		t.Fatal("expected index_status.phase_a_running=true while Phase A is marked running")
+	}
+	found := false
+	for _, r := range out.Results {
+		if strings.Contains(r.Path, "order-9999-receipt.md") {
+			found = true
+			if r.Source != "live-scan" {
+				t.Fatalf("expected source=live-scan for an unindexed hit found via scan, got %q", r.Source)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected a live-scan hit for order-9999-receipt.md, got %+v", out.Results)
+	}
+}
+
 // --- read_document: plain text + windowing -------------------------------------
 
 func TestMCPReadDocumentPlainTextWindowing(t *testing.T) {

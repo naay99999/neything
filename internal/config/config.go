@@ -104,6 +104,11 @@ const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 # Tip: run 'ney init' to enable semantic search and 'ney ask' interactively.
 # Without an embedder/chat provider, ney still indexes and searches by
 # keyword (FTS) — just run 'ney index' and 'ney search' to try it now.
+#
+# Recommended: 'ney mcp' plugs ney straight into Claude Code/Desktop/Cursor
+# as an MCP server (search_documents/read_document/list_workspaces/
+# index_status) and works zero-config — keyword search from the moment it
+# starts, semantic search once an embedder is configured. See README.md.
 
 # embedder: used to create vectors for semantic search (cannot be claude)
 embedder:

@@ -100,6 +100,51 @@ ney ask "how do I roll back a failed deploy?"
 
 ---
 
+## MCP
+
+Point an AI client at ney and it can search your files immediately — no waiting for indexing to finish, no embedder, no API key. `ney mcp` starts answering the moment it starts up, and layers in better results as indexing catches up in the background:
+
+- **Tier 0 (live scan)** — instantly, before anything is indexed: filename + content grep straight off disk.
+- **Tier 1 (keyword/FTS)** — seconds after startup, once Phase A (parse → chunk → SQLite FTS5) finishes for a root. No embedder required.
+- **Tier 2 (semantic)** — fills in progressively once you've run `ney init` and configured an embedder; `search_documents`'s `index_status` reports embedding progress so a client can tell partial results from final ones.
+
+**Claude Code:**
+```bash
+claude mcp add ney -- ney mcp --root ~/docs
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "ney": {
+      "command": "ney",
+      "args": ["mcp", "--root", "/Users/you/docs"]
+    }
+  }
+}
+```
+
+**Cursor** (`.cursor/mcp.json`):
+```json
+{
+  "mcpServers": {
+    "ney": {
+      "command": "ney",
+      "args": ["mcp", "--root", "/Users/you/docs"]
+    }
+  }
+}
+```
+
+`ney mcp` serves four tools over stdio: `search_documents`, `read_document`, `list_workspaces`, `index_status`. Omit `--root` to serve whatever workspaces are already in `~/.ney/index.db` from prior `ney index` runs; pass one or more `--root <path>` to index+serve fresh folders.
+
+Only one writer process (`index`, `watch`, `mcp`, `reset`) can hold `~/.ney/writer.lock` at a time. If `ney mcp` is running and you try `ney index` or `ney reset` from another terminal, that command fails fast with the pid/command currently holding the lock instead of racing a vector-file write. Read-only commands (`search`, `ask`, `status`) never need the lock.
+
+`ney index --no-embed` writes chunks + keyword index only (Phase A) and defers embedding for later — handy for a fast first pass over a big corpus, and exactly what `ney mcp` does under the hood before its background embed worker starts. `retrieval.mode` (`auto` | `semantic` | `keyword` | `hybrid`, default `auto`) controls which signals `search`/`ask`/`search_documents` combine — `auto` uses whatever's available and degrades gracefully (embedder unreachable, no vectors yet) instead of failing the request outright.
+
+---
+
 ## Commands
 
 | Command | Description |
@@ -114,6 +159,7 @@ ney ask "how do I roll back a failed deploy?"
 | `ney doctor` | Check config, API keys, Ollama, SQLite, index health |
 | `ney models` | List configured providers and Ollama installed models |
 | `ney reset` | Clear the index (add `--workspace <name>` for partial reset) |
+| `ney mcp` | Serve `search_documents`/`read_document`/`list_workspaces`/`index_status` over MCP (stdio) — see [MCP](#mcp) above |
 | `ney version` | Print version |
 
 ### Flags (all commands)
@@ -248,6 +294,7 @@ Ask:    Query → Search → optional Rerank → trim to context budget → LLM 
 - **Incremental sync** — deleted files and stale vectors are removed on re-index; renames detected by content hash
 - **Vector store** — `brute` (default) or `hnsw` via `vector_store.backend` in config; migrate with `ney index --migrate-vectors`
 - **Offline capable** — use Ollama for both embedder and chat to run fully air-gapped
+- **Tiered search** — `ney mcp` (and `ney search` on a not-yet-indexed folder) never returns nothing: live filesystem scan → keyword/FTS → semantic, whichever tiers are ready, see [MCP](#mcp)
 
 ---
 
@@ -261,11 +308,10 @@ Ask:    Query → Search → optional Rerank → trim to context budget → LLM 
 
 ## Roadmap
 
-Phase 3 (v0.4) is complete — see [docs/roadmap.md](docs/roadmap.md) for details.
+Phase 3 (v0.4) is complete, and Phase 4.2 (MCP server + tiered search) is complete — see [MCP](#mcp) above and [docs/roadmap.md](docs/roadmap.md) for details.
 
-Next up (Phase 4):
+Next up (rest of Phase 4):
 
 - REST API (`ney serve`)
-- MCP server (`ney mcp`)
 - Web UI dashboard
 - VS Code extension
