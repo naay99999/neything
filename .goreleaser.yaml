@@ -30,19 +30,26 @@ archives:
 checksum:
   name_template: "ney_{{.Version}}_checksums.txt"
 
-brews:
+# Casks are macOS-only; Linux users install via scripts/install.sh or go install.
+homebrew_casks:
   - name: ney
     repository:
       owner: naay99999
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    skip_upload: auto   # don't overwrite the cask from prerelease tags
+    commit_msg_template: "ney {{ .Tag }}"
     homepage: "https://github.com/naay99999/neything"
     description: "Local-first CLI knowledge engine — index files, search by meaning, ask questions with source citations"
-    license: "MIT"
-    install: |
-      bin.install "ney"
-    test: |
-      system "#{bin}/ney", "version"
+    hooks:
+      post:
+        # Go binaries are not notarized; strip the quarantine bit so
+        # Gatekeeper doesn't block the first run.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/ney"]
+          end
 
 release:
   github:

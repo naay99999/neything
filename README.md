@@ -25,8 +25,9 @@ curl -sSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/inst
 ```bash
 brew trust naay99999/tap   # required once for new taps
 brew tap naay99999/tap
-brew install ney
+brew install naay99999/tap/ney
 ```
+(Linux: use the curl installer or `go install` below — the brew package is macOS-only.)
 
 **Go users:**
 ```bash
