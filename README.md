@@ -8,6 +8,8 @@ ney search "how does billing work"
 ney ask "what are the retry policies for failed payments?"
 ```
 
+Works out of the box with **zero configuration** — no model server, no API key: keyword search and the [MCP server](#mcp) run immediately after install. Configure an embedder later (`ney init`) to add semantic search, and a chat model to enable `ney ask`.
+
 Or just run `ney` with no arguments for an interactive prompt — type a question directly, no command syntax to remember.
 
 ---
@@ -45,7 +47,16 @@ Single binary, no runtime dependencies.
 
 ## Quick start
 
-**1. Run the setup wizard**
+**1. Index and search — no setup needed**
+
+```bash
+ney index ~/my-notes
+ney search "order-1233"
+```
+
+With no providers configured, indexing writes the chunk + keyword (FTS5) index only — fast, CPU-only, fully offline. Search runs in keyword mode and tells you so. This is already enough for exact lookups (order numbers, names, error codes) and for serving AI clients over [MCP](#mcp).
+
+**2. Add semantic search + ask (optional)**
 
 ```bash
 ney init
@@ -53,16 +64,14 @@ ney init
 
 The wizard detects local model servers (Ollama, LM Studio), lists the models they expose, lets you pick an embedder and a chat model, and writes `~/.ney/config.yaml` for you. It also works with a remote server — just enter its URL (e.g. `http://192.168.1.150:1234`).
 
-Ney needs an embedder (to create vectors) and a chat model (to answer questions). The fastest local setup uses Ollama for both:
+The fastest local setup uses Ollama for both:
 
 ```bash
-ollama pull bge-m3          # embedder
-ollama pull llama3.2        # chat
+ollama pull bge-m3          # embedder → enables semantic search
+ollama pull llama3.2        # chat     → enables ney ask
 ```
 
-LM Studio works too: load a chat model plus an embedding model (e.g. `nomic-embed-text`) and enable its local server.
-
-Or use cloud providers — set API keys as environment variables:
+LM Studio works too: load a chat model plus an embedding model (e.g. `nomic-embed-text`) and enable its local server. Or use cloud providers — set API keys as environment variables:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...   # for Claude chat
@@ -70,19 +79,19 @@ export OPENAI_API_KEY=sk-...      # for OpenAI embed + chat
 export GEMINI_API_KEY=...         # for Gemini embed + chat
 ```
 
-**2. Or configure by hand**
-
-On first run, Ney creates `~/.ney/config.yaml` with defaults. Edit it to match your setup:
+You can also configure by hand — the default `~/.ney/config.yaml` (created on first run with both providers set to `none`) has commented examples:
 
 ```yaml
 embedder:
-  provider: ollama      # openai | gemini | ollama | lmstudio  (never claude)
+  provider: ollama      # none | openai | gemini | ollama | lmstudio  (never claude)
   model: bge-m3
 
 chat:
-  provider: claude      # claude | openai | gemini | ollama | lmstudio
+  provider: claude      # none | claude | openai | gemini | ollama | lmstudio
   model: claude-sonnet-4-6
 ```
+
+After configuring an embedder, the next `ney index` (or the background worker in `ney mcp`/`ney watch`) embeds the already-indexed chunks — no full re-index needed.
 
 **3. Check everything is ready**
 
@@ -90,11 +99,9 @@ chat:
 ney doctor
 ```
 
-**4. Index and search**
+**4. Ask questions**
 
 ```bash
-ney index ~/my-notes
-ney search "database migration strategy"
 ney ask "how do I roll back a failed deploy?"
 ```
 
@@ -150,9 +157,9 @@ Only one writer process (`index`, `watch`, `mcp`, `reset`) can hold `~/.ney/writ
 | Command | Description |
 |---|---|
 | `ney init` | Interactive setup — detects Ollama/LM Studio, picks models, writes the config |
-| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`); prunes missing files and orphan vectors |
+| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
 | `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
-| `ney search "<query>"` | Semantic search — returns chunks grouped by file with snippets |
+| `ney search "<query>"` | Search — semantic + keyword combined (`retrieval.mode: auto`), grouped by file with snippets; live-scans folders that aren't indexed yet |
 | `ney ask "<question>"` | RAG: retrieve → LLM → answer with source citations |
 | `ney status` | Index stats: files, chunks, DB size, last indexed |
 | `ney config` | Print current config (`config show` / `config edit` also work) |
@@ -231,12 +238,12 @@ Claude cannot be used as an embedder. `ney doctor` will catch this misconfigurat
 
 ```yaml
 embedder:
-  provider: ollama          # openai | gemini | ollama | lmstudio
+  provider: ollama          # none | openai | gemini | ollama | lmstudio (default: none — keyword-only)
   model: bge-m3
   endpoint: http://localhost:11434   # ollama/lmstudio only (LM Studio default: http://localhost:1234)
 
 chat:
-  provider: claude          # claude | openai | gemini | ollama | lmstudio
+  provider: claude          # none | claude | openai | gemini | ollama | lmstudio (default: none — ask disabled)
   model: claude-sonnet-4-6
   # endpoint: http://localhost:1234  # ollama/lmstudio only
 
@@ -245,7 +252,8 @@ retrieval:
   max_context_chars: 12000  # context window budget for LLM
   rerank: false             # set true to rerank before LLM (ask only)
   rerank_top_k: 24          # candidates fetched before rerank
-  hybrid: false             # combine semantic + BM25 keyword search
+  mode: auto                # auto | semantic | keyword | hybrid — auto uses what's available
+                            # (legacy key `hybrid: true/false` still accepted)
 
 reranker:                   # used when retrieval.rerank is true
   provider: cohere          # cohere | jina | ollama
@@ -281,9 +289,10 @@ API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_K
 ## How it works
 
 ```
-Index:  Files → Loader → Chunker → Embedder → VectorStore + SQLite + FTS
-Search: Query → Embed → VectorStore + optional FTS → RRF → ranked chunks
-Ask:    Query → Search → optional Rerank → trim to context budget → LLM → answer + Sources
+Index:   Files → Loader → Chunker → SQLite + FTS   (Phase A — instant, CPU-only)
+Embed:   pending chunks → Embedder → VectorStore    (Phase B — background worker)
+Search:  Query → FTS + (Embed → VectorStore) → RRF → ranked chunks   (auto mode: uses whatever's ready)
+Ask:     Query → Search → optional Rerank → trim to context budget → LLM → answer + Sources
 ```
 
 - **Loaders** extract text from `.md`, `.pdf`, `.docx`, `.html`, `.json`, `.xml`, plus Obsidian/Notion markdown and Confluence XML; optional git commit history and OCR for scanned PDFs
