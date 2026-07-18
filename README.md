@@ -1,16 +1,12 @@
 # Ney
 
-Local-first AI knowledge engine. Point it at a folder, search by meaning, ask questions — data stays on your machine.
+**Point your AI at your files.** Ney is a local-first MCP server + CLI that gives AI clients (Claude Code, Claude Desktop, Cursor) search and read access to your local documents — markdown, PDF, DOCX, HTML, and more. Your files never leave your machine, and secret files are never indexed or served.
 
-```
-ney index ~/docs
-ney search "how does billing work"
-ney ask "what are the retry policies for failed payments?"
+```bash
+claude mcp add ney -- ney mcp --root ~/docs
 ```
 
-Works out of the box with **zero configuration** — no model server, no API key: keyword search and the [MCP server](#mcp) run immediately after install. Configure an embedder later (`ney init`) to add semantic search, and a chat model to enable `ney ask`.
-
-Or just run `ney` with no arguments for an interactive prompt — type a question directly, no command syntax to remember.
+That's it — your AI can now search and read everything under `~/docs`. Works out of the box with **zero configuration**: no model server, no API key. Keyword search is available the moment the server starts; add a local embedder later (`ney init`) for semantic search.
 
 ---
 
@@ -46,75 +42,13 @@ Single binary, no runtime dependencies.
 
 ---
 
-## Quick start
+## MCP — connect your AI
 
-**1. Index and search — no setup needed**
-
-```bash
-ney index ~/my-notes
-ney search "order-1233"
-```
-
-With no providers configured, indexing writes the chunk + keyword (FTS5) index only — fast, CPU-only, fully offline. Search runs in keyword mode and tells you so. This is already enough for exact lookups (order numbers, names, error codes) and for serving AI clients over [MCP](#mcp).
-
-**2. Add semantic search + ask (optional)**
-
-```bash
-ney init
-```
-
-The wizard detects local model servers (Ollama, LM Studio), lists the models they expose, lets you pick an embedder and a chat model, and writes `~/.ney/config.yaml` for you. It also works with a remote server — just enter its URL (e.g. `http://192.168.1.150:1234`).
-
-The fastest local setup uses Ollama for both:
-
-```bash
-ollama pull bge-m3          # embedder → enables semantic search
-ollama pull llama3.2        # chat     → enables ney ask
-```
-
-LM Studio works too: load a chat model plus an embedding model (e.g. `nomic-embed-text`) and enable its local server. Or use cloud providers — set API keys as environment variables:
-
-```bash
-export ANTHROPIC_API_KEY=sk-...   # for Claude chat
-export OPENAI_API_KEY=sk-...      # for OpenAI embed + chat
-export GEMINI_API_KEY=...         # for Gemini embed + chat
-```
-
-You can also configure by hand — the default `~/.ney/config.yaml` (created on first run with both providers set to `none`) has commented examples:
-
-```yaml
-embedder:
-  provider: ollama      # none | openai | gemini | ollama | lmstudio  (never claude)
-  model: bge-m3
-
-chat:
-  provider: claude      # none | claude | openai | gemini | ollama | lmstudio
-  model: claude-sonnet-4-6
-```
-
-After configuring an embedder, the next `ney index` (or the background worker in `ney mcp`/`ney watch`) embeds the already-indexed chunks — no full re-index needed.
-
-**3. Check everything is ready**
-
-```bash
-ney doctor
-```
-
-**4. Ask questions**
-
-```bash
-ney ask "how do I roll back a failed deploy?"
-```
-
----
-
-## MCP
-
-Point an AI client at ney and it can search your files immediately — no waiting for indexing to finish, no embedder, no API key. `ney mcp` starts answering the moment it starts up, and layers in better results as indexing catches up in the background:
+`ney mcp` starts answering the moment it starts up, and layers in better results as indexing catches up in the background:
 
 - **Tier 0 (live scan)** — instantly, before anything is indexed: filename + content grep straight off disk.
-- **Tier 1 (keyword/FTS)** — seconds after startup, once Phase A (parse → chunk → SQLite FTS5) finishes for a root. No embedder required.
-- **Tier 2 (semantic)** — fills in progressively once you've run `ney init` and configured an embedder; `search_documents`'s `index_status` reports embedding progress so a client can tell partial results from final ones.
+- **Tier 1 (keyword/FTS)** — seconds after startup, once the initial parse → chunk → SQLite FTS5 pass finishes for a root. No embedder required.
+- **Tier 2 (semantic)** — fills in progressively once you've run `ney init` and configured an embedder; `index_status` reports embedding progress so a client can tell partial results from final ones.
 
 **Claude Code:**
 ```bash
@@ -145,29 +79,68 @@ claude mcp add ney -- ney mcp --root ~/docs
 }
 ```
 
-`ney mcp` serves four tools over stdio: `search_documents`, `read_document`, `list_workspaces`, `index_status`. Omit `--root` to serve whatever workspaces are already in `~/.ney/index.db` from prior `ney index` runs; pass one or more `--root <path>` to index+serve fresh folders.
+`ney mcp` serves five tools over stdio: `search_documents`, `search_folder`, `read_document`, `list_workspaces`, `index_status`. `search_folder` is the whole-machine fallback: when the index has no match, the AI asks you where the file might be (Downloads? Desktop?) and live-scans that folder on demand — bounded, home-directory-only, and secret-blind like everything else; files it surfaces become readable via `read_document` for the session. Omit `--root` to serve whatever workspaces are already in `~/.ney/index.db` from prior `ney index` runs; pass one or more `--root <path>` to index+serve fresh folders.
 
-Only one writer process (`index`, `watch`, `mcp`, `reset`) can hold `~/.ney/writer.lock` at a time. If `ney mcp` is running and you try `ney index` or `ney reset` from another terminal, that command fails fast with the pid/command currently holding the lock instead of racing a vector-file write. Read-only commands (`search`, `ask`, `status`) never need the lock.
+### Security
 
-`ney index --no-embed` writes chunks + keyword index only (Phase A) and defers embedding for later — handy for a fast first pass over a big corpus, and exactly what `ney mcp` does under the hood before its background embed worker starts. `retrieval.mode` (`auto` | `semantic` | `keyword` | `hybrid`, default `auto`) controls which signals `search`/`ask`/`search_documents` combine — `auto` uses whatever's available and degrades gracefully (embedder unreachable, no vectors yet) instead of failing the request outright.
+Ney is built to hand an AI *your documents* — not your secrets, and not the rest of your disk:
+
+- **Root containment** — `read_document` only serves files inside the roots you passed, plus files a user-directed `search_folder` call surfaced this session. Absolute paths, `..` traversal, and symlinks pointing outside a root are all rejected (paths are symlink-resolved on both sides before comparison).
+- **Secret files are never indexed or served** — dotfiles/dot-directories (`.env`, `.ssh/`, `.git/`) plus a built-in deny list of secret-looking names (`*secret*`, `*credential*`, `*password*`, `*.key`, `*.pem`, `id_rsa*`, `*.env`, keystores, ...) are excluded everywhere: the indexer, the live scan, and `read_document`. This is always on and cannot be disabled.
+- **Your own excludes** — add glob patterns under `index.exclude` in the config (see below). Files that were indexed before a pattern matched them are pruned automatically on the next index pass.
+- **Local-first** — with no cloud provider configured, nothing ever leaves your machine. With a cloud embedder, only file chunks are sent for embedding — configure a local embedder (Ollama / LM Studio) to keep even that on-device.
+
+### Concurrent access
+
+Only one writer process (`index`, `watch`, `mcp`, `reset`) holds `~/.ney/writer.lock` at a time. If a second `ney mcp` starts while one is already running — say Claude Desktop and Claude Code both spawn one — the second **serves read-only** instead of failing: search and read work off the existing index (as of its startup), while indexing/embedding/watching stay with the first process. `index_status` reports `mode: "read-only"` so clients can tell. `ney index`/`ney reset` from another terminal still fail fast with the holder's pid rather than racing a vector-file write. Read-only commands (`search`, `status`) never need the lock.
 
 ---
 
-## Commands
+## CLI
+
+The same engine is usable directly from the terminal:
+
+```bash
+ney index ~/my-notes
+ney search "order-1233"
+```
+
+With no providers configured, indexing writes the chunk + keyword (FTS5) index only — fast, CPU-only, fully offline. Search runs in keyword mode and tells you so. This is already enough for exact lookups (order numbers, names, error codes).
+
+**Add semantic search (optional):**
+
+```bash
+ney init
+```
+
+The wizard detects local model servers (Ollama, LM Studio), lists the models they expose, lets you pick an embedding model, and writes `~/.ney/config.yaml` for you. It also works with a remote server — just enter its URL. The fastest local setup:
+
+```bash
+ollama pull bge-m3          # embedder → enables semantic search
+```
+
+Or use a cloud embedder — set the API key as an environment variable (`OPENAI_API_KEY` / `GEMINI_API_KEY`). After configuring an embedder, the next `ney index` (or the background worker in `ney mcp`/`ney watch`) embeds the already-indexed chunks — no full re-index needed.
+
+**Check everything is ready:**
+
+```bash
+ney doctor
+```
+
+### Commands
 
 | Command | Description |
 |---|---|
-| `ney init` | Interactive setup — detects Ollama/LM Studio, picks models, writes the config |
-| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
+| `ney mcp` | Serve `search_documents`/`read_document`/`list_workspaces`/`index_status` over MCP (stdio) — see [MCP](#mcp--connect-your-ai) above |
+| `ney init` | Interactive setup — detects Ollama/LM Studio, picks an embedding model, writes the config |
+| `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`, ...); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
 | `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
 | `ney search "<query>"` | Search — semantic + keyword combined (`retrieval.mode: auto`), grouped by file with snippets; live-scans folders that aren't indexed yet |
-| `ney ask "<question>"` | RAG: retrieve → LLM → answer with source citations |
 | `ney status` | Index stats: files, chunks, DB size, last indexed |
 | `ney config` | Print current config (`config show` / `config edit` also work) |
 | `ney doctor` | Check config, API keys, Ollama, SQLite, index health |
-| `ney models` | List configured providers and Ollama installed models |
+| `ney models` | List configured providers and locally available models |
 | `ney reset` | Clear the index (add `--workspace <name>` for partial reset) |
-| `ney mcp` | Serve `search_documents`/`read_document`/`list_workspaces`/`index_status` over MCP (stdio) — see [MCP](#mcp) above |
 | `ney version` | Print version |
 
 ### Flags (all commands)
@@ -176,30 +149,9 @@ Only one writer process (`index`, `watch`, `mcp`, `reset`) can hold `~/.ney/writ
 |---|---|
 | `--workspace <name>` | Target a specific workspace |
 | `--top-k <n>` | Number of chunks to retrieve (default: 8) |
-| `--provider <name>` | Override embedder on `index`/`search`/`watch`; override chat on `ask` |
+| `--provider <name>` | Override the embedder provider |
 | `--path <dir>` | Limit results to files under this directory |
 | `--json` | Machine-readable JSON output |
-
-### Interactive mode
-
-Run `ney` with no arguments to drop into a prompt. It opens with a startup screen showing your configured models, index size, and data directory, then:
-
-```
-$ ney
-ney> status
-ney> search auth flow
-ney> what are the retry policies for failed payments?
-```
-
-If nothing is indexed yet, ney offers a short getting-started menu (set up providers / index a folder / skip) instead of a silent prompt. Type `?` at any time for help.
-
-- A line starting with a known command word (`init`, `ask`, `search`, `index`, `watch`, `status`, `config`, `doctor`, `models`, `reset`, `version`, `help`) dispatches that command — no quoting needed around `ask`/`search` queries. Commands can optionally be prefixed with `/` (e.g. `/config`).
-- Any *multi-word* line that isn't a command is treated as a question and sent straight to `ask`. A single unknown word is assumed to be a typo — ney suggests the nearest command instead of calling the LLM.
-- Type a bare `config`, `reset`, or `index` with no arguments and ney asks what you want instead of erroring — e.g. `config` prompts "Show or edit config? [s/e]", `reset` prompts for full vs. one workspace, `index` prompts for a path. Giving the full command (`config edit`, `reset --workspace foo`, `index ~/docs`) skips the prompt as before.
-- Leave with `exit`, `quit`, or `q` (`:quit` / `:exit` still work). Other meta-commands: `:help`, `:clear`.
-- Line history persists across sessions in `~/.ney/history` (arrow keys to recall).
-- Each line runs statelessly, same as a one-shot CLI call — no conversation memory between lines yet.
-- `ask`/`search` show a spinner while waiting on the embedder/LLM, and `ask` answers type out instead of appearing all at once. Output is colored on an interactive terminal; set `NO_COLOR=1` to disable, or pipe/redirect output to fall back to plain text automatically.
 
 ### Workspaces
 
@@ -210,24 +162,24 @@ ney index ~/work/code   --workspace code
 ney index ~/docs/notes  --workspace notes
 
 ney search "auth flow" --workspace code
-ney ask "sprint goals" --workspace notes
 ```
+
+`ney search` defaults to the workspace containing your current directory; `--all` forces a global search.
 
 ---
 
 ## Providers
 
-| Provider | Embed | Chat | Notes |
-|---|:---:|:---:|---|
-| **Ollama** | ✓ | ✓ | Local, offline, no API key |
-| **LM Studio** (`lmstudio`) | ✓ | ✓ | Any OpenAI-compatible server (LM Studio, vLLM, llama.cpp); set `endpoint`, no API key |
-| **OpenAI** | ✓ | ✓ | `text-embedding-3-small/large`, `gpt-4o` |
-| **Gemini** | ✓ | ✓ | `text-embedding-004`, `gemini-2.0-flash` |
-| **Claude** | ✗ | ✓ | Chat only — Anthropic has no embedding API |
+Embedding providers (for semantic search — entirely optional):
 
-Claude cannot be used as an embedder. `ney doctor` will catch this misconfiguration.
+| Provider | Notes |
+|---|---|
+| **Ollama** | Local, offline, no API key |
+| **LM Studio** (`lmstudio`) | Any OpenAI-compatible server (LM Studio, vLLM, llama.cpp); set `endpoint`, no API key |
+| **OpenAI** | `text-embedding-3-small/large` |
+| **Gemini** | `text-embedding-004` |
 
-**Mixing providers** (e.g. Ollama embed + Claude chat) is supported and recommended for privacy — only questions reach the cloud, not your indexed content.
+Claude cannot be used as an embedder (Anthropic has no embedding API); `ney doctor` will catch this misconfiguration.
 
 > **Note:** Changing the embedding model invalidates the existing index. `ney doctor` detects the mismatch; run `ney reset && ney index <path>` to rebuild.
 
@@ -243,18 +195,19 @@ embedder:
   model: bge-m3
   endpoint: http://localhost:11434   # ollama/lmstudio only (LM Studio default: http://localhost:1234)
 
-chat:
-  provider: claude          # none | claude | openai | gemini | ollama | lmstudio (default: none — ask disabled)
-  model: claude-sonnet-4-6
-  # endpoint: http://localhost:1234  # ollama/lmstudio only
-
 retrieval:
   top_k: 8                  # chunks retrieved per query
-  max_context_chars: 12000  # context window budget for LLM
-  rerank: false             # set true to rerank before LLM (ask only)
+  rerank: false             # set true to rerank retrieved results
   rerank_top_k: 24          # candidates fetched before rerank
   mode: auto                # auto | semantic | keyword | hybrid — auto uses what's available
                             # (legacy key `hybrid: true/false` still accepted)
+
+# indexing — extra exclude patterns (globs matched case-insensitively against
+# file/dir names), on top of the built-in always-on excludes (dotfiles +
+# secret-file names — see Security above)
+index:
+  exclude: []
+  # exclude: ["*.bak", "drafts-*", "node_modules"]
 
 reranker:                   # used when retrieval.rerank is true
   provider: cohere          # cohere | jina | ollama
@@ -273,8 +226,6 @@ chunking:
   #   docx: paragraph
 
 loaders:
-  git:
-    recent_commits: 0       # index recent git commits (0 = disabled)
   ocr:
     enabled: false          # requires: brew install tesseract poppler
     lang: eng
@@ -283,7 +234,7 @@ loaders:
 telemetry: false            # always off
 ```
 
-API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`). They can also be set directly in the config file, but env vars are recommended.
+API keys are read from environment variables (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`). They can also be set directly in the config file, but env vars are recommended.
 
 ---
 
@@ -293,18 +244,18 @@ API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_K
 Index:   Files → Loader → Chunker → SQLite + FTS   (Phase A — instant, CPU-only)
 Embed:   pending chunks → Embedder → VectorStore    (Phase B — background worker)
 Search:  Query → FTS + (Embed → VectorStore) → RRF → ranked chunks   (auto mode: uses whatever's ready)
-Ask:     Query → Search → optional Rerank → trim to context budget → LLM → answer + Sources
 ```
 
-- **Loaders** extract text from `.md`, `.pdf`, `.docx`, `.html`, `.json`, `.xml`, plus Obsidian/Notion markdown and Confluence XML; optional git commit history and OCR for scanned PDFs
+- **Loaders** extract text from `.md`, `.pdf`, `.docx`, `.html`, `.json`, `.xml`, plus Obsidian/Notion markdown and Confluence XML; optional OCR for scanned PDFs
+- **Path filter** (always on) excludes dotfiles and secret-file patterns from every surface — indexing, live scan, and MCP reads
 - **Chunkers** split text with format-aware defaults (`chunking.strategy: auto`) — markdown by heading, PDF by page, docx/html by paragraph
 - **Embedder** converts chunks to float32 vectors; stored in `~/.ney/vectors.bin` (brute) or `~/.ney/vectors.hnsw` (HNSW backend)
 - **SQLite** (`~/.ney/index.db`) stores metadata, chunk content, and workspace info
 - **Hash-based skip** — unchanged files are not re-embedded on re-index
 - **Incremental sync** — deleted files and stale vectors are removed on re-index; renames detected by content hash
 - **Vector store** — `brute` (default) or `hnsw` via `vector_store.backend` in config; migrate with `ney index --migrate-vectors`
-- **Offline capable** — use Ollama for both embedder and chat to run fully air-gapped
-- **Tiered search** — `ney mcp` (and `ney search` on a not-yet-indexed folder) never returns nothing: live filesystem scan → keyword/FTS → semantic, whichever tiers are ready, see [MCP](#mcp)
+- **Offline capable** — use Ollama as the embedder to run fully air-gapped
+- **Tiered search** — `ney mcp` (and `ney search` on a not-yet-indexed folder) never returns nothing: live filesystem scan → keyword/FTS → semantic, whichever tiers are ready
 
 ---
 
@@ -312,16 +263,17 @@ Ask:     Query → Search → optional Rerank → trim to context budget → LLM
 
 - All data lives in `~/.ney/` — nothing is sent anywhere unless you configure a cloud provider
 - `telemetry: false` is the default and cannot be flipped remotely
-- Cloud providers only receive: (a) file chunks during `ney index`, (b) your question + retrieved chunks during `ney ask`
+- A cloud embedder (if configured) only receives file chunks during indexing — use a local embedder to keep everything on-device
+- Secret files (dotfiles, keys, credentials — see [Security](#security)) are never indexed, never searchable, and never served over MCP
 
 ---
 
 ## Roadmap
 
-Phase 3 (v0.4) is complete, and Phase 4.2 (MCP server + tiered search) is complete — see [MCP](#mcp) above and [docs/roadmap.md](docs/roadmap.md) for details.
+Ney is focused on being the best way to connect an AI client to your local documents. Next up:
 
-Next up (rest of Phase 4):
-
-- REST API (`ney serve`)
-- Web UI dashboard
+- Better MCP ergonomics: resource templates, per-root tool scoping
+- Smarter incremental embedding and index compaction
 - VS Code extension
+
+See [docs/roadmap.md](docs/roadmap.md) for history and details.

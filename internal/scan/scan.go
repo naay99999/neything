@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/naay99999/neything/internal/pathfilter"
 )
 
 // Default caps (Options.withDefaults fills these in for zero-valued fields).
@@ -69,6 +71,10 @@ type Options struct {
 	MaxFiles int
 	Timeout  time.Duration
 	MaxHits  int
+	// Exclude filters out files/dirs (dotfiles + secret patterns + user
+	// config). nil is valid: pathfilter's nil receiver applies the built-in
+	// deny rules, so a live scan never reports secret files either way.
+	Exclude *pathfilter.Filter
 }
 
 func (o Options) withDefaults() Options {
@@ -91,11 +97,11 @@ func (o Options) withDefaults() Options {
 // caller can tell "no matches" apart from "stopped early, there may be
 // more".
 //
-// Directory walking uses the same dot-dir/dotfile skip rule as
-// internal/index/pipeline.go's Index, but — unlike the indexer — never
-// restricts filename matching to a fixed set of supported extensions: a hit
-// on order-1233.xlsx is still useful information even though ney can't
-// parse xlsx.
+// Directory walking applies the same exclusion rules as the indexer's walk
+// (pathfilter: dotfiles, secret-file patterns, user config), but — unlike
+// the indexer — never restricts filename matching to a fixed set of
+// supported extensions: a hit on order-1233.xlsx is still useful information
+// even though ney can't parse xlsx.
 func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, truncated bool, err error) {
 	opts = opts.withDefaults()
 	tokens := tokenize(query)
@@ -115,12 +121,12 @@ func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, tr
 			return nil
 		}
 		if d.IsDir() {
-			if path != root && strings.HasPrefix(d.Name(), ".") {
+			if path != root && opts.Exclude.ExcludedDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), ".") {
+		if opts.Exclude.ExcludedFile(d.Name()) {
 			return nil
 		}
 

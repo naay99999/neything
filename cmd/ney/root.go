@@ -11,7 +11,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "ney",
 	Short: "Local-first AI knowledge engine",
-	Long:  "Ney — index your files, search by meaning, ask questions with source citations.",
+	Long:  "Ney — give your AI agent search + read access to your local documents over MCP. Local-first: your files never leave your machine.",
 }
 
 var (
@@ -29,7 +29,7 @@ func init() {
 
 	rootCmd.PersistentFlags().StringVar(&flagWorkspace, "workspace", "", "workspace name")
 	rootCmd.PersistentFlags().IntVar(&flagTopK, "top-k", 8, "number of chunks to retrieve")
-	rootCmd.PersistentFlags().StringVar(&flagProvider, "provider", "", "override provider (embedder for index/search/watch, chat for ask)")
+	rootCmd.PersistentFlags().StringVar(&flagProvider, "provider", "", "override embedder provider")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "output JSON")
 	rootCmd.PersistentFlags().StringVar(&flagPath, "path", "", "limit scope to path")
 	rootCmd.PersistentFlags().BoolVar(&flagAll, "all", false, "search across all workspaces, ignoring the current folder's scope")
@@ -39,7 +39,6 @@ func init() {
 		indexCmd,
 		watchCmd,
 		searchCmd,
-		askCmd,
 		statusCmd,
 		configCmd,
 		doctorCmd,
@@ -63,13 +62,7 @@ func Execute() error {
 }
 
 func main() {
-	var err error
-	if len(os.Args) == 1 {
-		err = runREPL()
-	} else {
-		err = Execute()
-	}
-	if err != nil {
+	if err := Execute(); err != nil {
 		printCLIError(err)
 		os.Exit(1)
 	}

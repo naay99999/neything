@@ -47,7 +47,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	applyProviderOverride(cfg, true)
+	applyProviderOverride(cfg)
 
 	lock, err := lockfile.Acquire(config.NeyDir())
 	if err != nil {
@@ -55,7 +55,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	}
 	defer lock.Release()
 
-	app, err := initAppFromConfig(cfg, false)
+	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}

@@ -55,17 +55,3 @@ func (s *spinner) Stop() {
 	})
 	s.wg.Wait()
 }
-
-// typewrite prints s with a brief per-rune delay on an interactive terminal,
-// falling back to a plain Println for JSON output or non-TTY stdout.
-func typewrite(s string) {
-	if !colorEnabled || flagJSON {
-		fmt.Println(s)
-		return
-	}
-	for _, r := range s {
-		fmt.Print(string(r))
-		time.Sleep(2 * time.Millisecond)
-	}
-	fmt.Println()
-}

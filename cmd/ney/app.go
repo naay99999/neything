@@ -1,7 +1,6 @@
 package main
 
 import (
-	"github.com/naay99999/neything/internal/chat"
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/embed"
 	"github.com/naay99999/neything/internal/rerank"
@@ -14,21 +13,18 @@ type AppState struct {
 	DB       *store.DB
 	Vectors  vectorstore.VectorStore
 	Embedder embed.Embedder
-	Chat     chat.ChatModel
 	Reranker rerank.Reranker
 }
 
-// initAppWithOptions wires the app. needChat is false for commands that never
-// call the LLM (index/search/watch) so a missing chat API key can't block them.
+// initAppWithOptions wires the app.
 //
-// A nil AppState.Embedder or AppState.Chat is a normal, expected state when
-// the corresponding provider is unset ("none") in config — config.NewEmbedder
-// / config.NewChatModel return (nil, nil) in that case, not an error.
-// Commands that need one (e.g. `ask`) check for nil themselves and print a
-// friendly hint. An explicit --provider override (applyProviderOverride)
-// still sets a concrete provider name, so a build failure for it (bad key,
-// unreachable endpoint) surfaces as an error here as before.
-func initAppWithOptions(cfg *config.Config, migrateVectors, needChat bool) (*AppState, error) {
+// A nil AppState.Embedder is a normal, expected state when the embedder
+// provider is unset ("none") in config — config.NewEmbedder returns
+// (nil, nil) in that case, not an error; search degrades to keyword-only.
+// An explicit --provider override (applyProviderOverride) still sets a
+// concrete provider name, so a build failure for it (bad key, unreachable
+// endpoint) surfaces as an error here as before.
+func initAppWithOptions(cfg *config.Config, migrateVectors bool) (*AppState, error) {
 	db, err := store.Open(config.DBPath())
 	if err != nil {
 		return nil, err
@@ -43,14 +39,6 @@ func initAppWithOptions(cfg *config.Config, migrateVectors, needChat bool) (*App
 		db.Close()
 		return nil, err
 	}
-	var chatModel chat.ChatModel
-	if needChat {
-		chatModel, err = config.NewChatModel(cfg)
-		if err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
 	reranker, err := config.NewReranker(cfg)
 	if err != nil {
 		db.Close()
@@ -61,7 +49,6 @@ func initAppWithOptions(cfg *config.Config, migrateVectors, needChat bool) (*App
 		DB:       db,
 		Vectors:  vs,
 		Embedder: emb,
-		Chat:     chatModel,
 		Reranker: reranker,
 	}, nil
 }

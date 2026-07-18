@@ -9,7 +9,6 @@ import (
 func TestValidateRejectsClaudeEmbedder(t *testing.T) {
 	cfg := &Config{
 		Embedder: EmbedderConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
-		Chat:     ChatConfig{Provider: "openai", Model: "gpt-4o"},
 	}
 	if err := Validate(cfg); err == nil {
 		t.Fatal("expected error for claude embedder")
@@ -19,7 +18,6 @@ func TestValidateRejectsClaudeEmbedder(t *testing.T) {
 func TestValidateAcceptsValidProviders(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Chunking:    ChunkingConfig{Strategy: "markdown"},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
@@ -31,7 +29,6 @@ func TestValidateAcceptsValidProviders(t *testing.T) {
 func TestValidateRejectsInvalidVectorStore(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Chunking:    ChunkingConfig{Strategy: "markdown"},
 		VectorStore: VectorStoreConfig{Backend: "faiss"},
 	}
@@ -43,7 +40,6 @@ func TestValidateRejectsInvalidVectorStore(t *testing.T) {
 func TestValidateRequiresModels(t *testing.T) {
 	cfg := &Config{
 		Embedder: EmbedderConfig{Provider: "ollama", Model: ""},
-		Chat:     ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 	}
 	if err := Validate(cfg); err == nil {
 		t.Fatal("expected error for empty embedder model")
@@ -53,7 +49,6 @@ func TestValidateRequiresModels(t *testing.T) {
 func TestValidateRerankRequiresProvider(t *testing.T) {
 	cfg := &Config{
 		Embedder:  EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:      ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Retrieval: RetrievalConfig{Rerank: true},
 		Reranker:  RerankerConfig{Provider: "invalid", Model: "x"},
 		Chunking:  ChunkingConfig{Strategy: "markdown"},
@@ -66,7 +61,6 @@ func TestValidateRerankRequiresProvider(t *testing.T) {
 func TestValidateAutoChunkingByFormat(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"pdf": "page"}},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
@@ -78,7 +72,6 @@ func TestValidateAutoChunkingByFormat(t *testing.T) {
 func TestValidateAutoRejectsInvalidByFormat(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"pdf": "invalid"}},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
@@ -99,7 +92,6 @@ func TestFetchKUsesRerankTopK(t *testing.T) {
 func baseValidCfg() *Config {
 	return &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
 		Chunking:    ChunkingConfig{Strategy: "markdown"},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
@@ -157,48 +149,19 @@ func TestValidateEmbedderConfiguredRequiresModel(t *testing.T) {
 	}
 }
 
-func TestValidateChatOptional(t *testing.T) {
-	tests := []struct {
-		name     string
-		provider string
-		model    string
-		wantErr  bool
-	}{
-		{"empty provider skips validation", "", "", false},
-		{"none provider skips validation", "none", "", false},
-		{"valid provider requires model", "claude", "claude-sonnet-4-6", false},
-		{"configured provider missing model errors", "claude", "", true},
-		{"unknown provider rejected", "bogus", "x", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := baseValidCfg()
-			cfg.Chat.Provider = tt.provider
-			cfg.Chat.Model = tt.model
-			err := Validate(cfg)
-			if tt.wantErr && err == nil {
-				t.Fatalf("expected error for chat provider %q model %q", tt.provider, tt.model)
-			}
-			if !tt.wantErr && err != nil {
-				t.Fatalf("unexpected error for chat provider %q model %q: %v", tt.provider, tt.model, err)
-			}
-		})
-	}
-}
-
-func TestValidateBothOptionalPassesTogether(t *testing.T) {
-	cfg := &Config{
-		Embedder:    EmbedderConfig{Provider: "none"},
-		Chat:        ChatConfig{Provider: ""},
-		Chunking:    ChunkingConfig{Strategy: "markdown"},
-		VectorStore: VectorStoreConfig{Backend: "brute"},
-	}
+func TestValidateIndexExclude(t *testing.T) {
+	cfg := baseValidCfg()
+	cfg.Index.Exclude = []string{"*.bak", "drafts-*"}
 	if err := Validate(cfg); err != nil {
-		t.Fatalf("unexpected error with both providers unset: %v", err)
+		t.Fatalf("valid exclude globs should pass: %v", err)
+	}
+	cfg.Index.Exclude = []string{"[unclosed"}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected error for malformed exclude glob")
 	}
 }
 
-func TestHasEmbedderHasChat(t *testing.T) {
+func TestHasEmbedder(t *testing.T) {
 	cases := []struct {
 		provider string
 		want     bool
@@ -209,12 +172,9 @@ func TestHasEmbedderHasChat(t *testing.T) {
 		{"claude", true},
 	}
 	for _, c := range cases {
-		cfg := &Config{Embedder: EmbedderConfig{Provider: c.provider}, Chat: ChatConfig{Provider: c.provider}}
+		cfg := &Config{Embedder: EmbedderConfig{Provider: c.provider}}
 		if got := cfg.HasEmbedder(); got != c.want {
 			t.Errorf("HasEmbedder() provider=%q = %v, want %v", c.provider, got, c.want)
-		}
-		if got := cfg.HasChat(); got != c.want {
-			t.Errorf("HasChat() provider=%q = %v, want %v", c.provider, got, c.want)
 		}
 	}
 }
@@ -232,19 +192,6 @@ func TestNewEmbedderNoneReturnsNilNil(t *testing.T) {
 	}
 }
 
-func TestNewChatModelNoneReturnsNilNil(t *testing.T) {
-	for _, provider := range []string{"", "none"} {
-		cfg := &Config{Chat: ChatConfig{Provider: provider}}
-		cm, err := NewChatModel(cfg)
-		if err != nil {
-			t.Fatalf("provider %q: unexpected error: %v", provider, err)
-		}
-		if cm != nil {
-			t.Fatalf("provider %q: expected nil chat model, got %v", provider, cm)
-		}
-	}
-}
-
 func TestNewEmbedderConfiguredButUnbuildableErrors(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
 	cfg := &Config{Embedder: EmbedderConfig{Provider: "openai", Model: "text-embedding-3-small"}}
@@ -253,31 +200,22 @@ func TestNewEmbedderConfiguredButUnbuildableErrors(t *testing.T) {
 	}
 }
 
-func TestNewChatModelConfiguredButUnbuildableErrors(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "")
-	cfg := &Config{Chat: ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"}}
-	if _, err := NewChatModel(cfg); err == nil {
-		t.Fatal("expected error: claude chat configured without API key")
-	}
-}
-
 // TestValidateOldStyleConfigStillLoads guards against regressions for
-// existing installs whose config.yaml predates optional providers (explicit
-// embedder ollama + chat claude, hybrid: false → normalized to mode: auto
-// before Validate ever sees it — see TestLoadRetrievalModeLegacyHybridFalse).
+// existing installs whose config.yaml predates optional providers. Stale
+// keys the current Config no longer has (chat:, max_context_chars,
+// loaders.git) are silently ignored by viper — see TestLoadIgnoresRemovedKeys.
 func TestValidateOldStyleConfigStillLoads(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3", Endpoint: "http://localhost:11434"},
-		Chat:        ChatConfig{Provider: "claude", Model: "claude-sonnet-4-6"},
-		Retrieval:   RetrievalConfig{TopK: 8, MaxContextChars: 12000, Mode: "auto"},
+		Retrieval:   RetrievalConfig{TopK: 8, Mode: "auto"},
 		Chunking:    ChunkingConfig{Strategy: "markdown", TargetChars: 1200, OverlapChars: 150},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("old-style config should still validate: %v", err)
 	}
-	if !cfg.HasEmbedder() || !cfg.HasChat() {
-		t.Fatal("old-style config should report both providers configured")
+	if !cfg.HasEmbedder() {
+		t.Fatal("old-style config should report the embedder configured")
 	}
 }
 
@@ -301,6 +239,27 @@ func writeTestConfig(t *testing.T, yaml string) *Config {
 		t.Fatalf("Load: %v", err)
 	}
 	return cfg
+}
+
+// TestLoadIgnoresRemovedKeys: configs written by older ney versions still
+// contain chat:, retrieval.max_context_chars, and loaders.git — none of
+// which exist in the Config struct anymore. They must load without error.
+func TestLoadIgnoresRemovedKeys(t *testing.T) {
+	cfg := writeTestConfig(t, `embedder:
+  provider: none
+chat:
+  provider: claude
+  model: claude-sonnet-4-6
+retrieval:
+  top_k: 8
+  max_context_chars: 12000
+loaders:
+  git:
+    recent_commits: 5
+`)
+	if cfg.Retrieval.TopK != 8 {
+		t.Fatalf("expected top_k 8, got %d", cfg.Retrieval.TopK)
+	}
 }
 
 func TestLoadRetrievalModeLegacyHybridTrue(t *testing.T) {

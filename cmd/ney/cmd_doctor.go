@@ -101,23 +101,6 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		Message: "Supported formats: .md, .pdf, .docx, .html, .json, .xml (+ Obsidian/Notion .md, Confluence .xml)",
 	})
 
-	if cfg.Loaders.Git.RecentCommits > 0 {
-		if loader.GitAvailable(nil) {
-			results = append(results, checkResult{
-				Check:   "git_loader",
-				OK:      true,
-				Message: fmt.Sprintf("Git history indexing enabled (recent_commits: %d)", cfg.Loaders.Git.RecentCommits),
-			})
-		} else {
-			results = append(results, checkResult{
-				Check:   "git_loader",
-				OK:      false,
-				Message: "Git history indexing enabled but git not found on PATH",
-				Hint:    "Install git or set loaders.git.recent_commits: 0",
-			})
-		}
-	}
-
 	if cfg.Loaders.OCR.Enabled {
 		ocrCfg := loader.OCRConfig{
 			Enabled:      cfg.Loaders.OCR.Enabled,
@@ -172,35 +155,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// 2b. Chat model configured — informational when unconfigured
-	if !cfg.HasChat() {
-		results = append(results, checkResult{
-			Check:   "chat_configured",
-			OK:      true,
-			Message: "Chat model not configured (ney ask unavailable)",
-			Hint:    "Run `ney init` to enable ney ask",
-		})
-	} else {
-		results = append(results, checkResult{
-			Check:   "chat_configured",
-			OK:      true,
-			Message: fmt.Sprintf("Chat provider is %q", cfg.Chat.Provider),
-		})
-	}
-
 	// 3. API keys
-	type apiCheck struct {
-		envVar   string
-		provider string
-	}
 	needed := map[string]bool{}
-	if cfg.Embedder.Provider == "openai" || cfg.Chat.Provider == "openai" {
+	if cfg.Embedder.Provider == "openai" {
 		needed["OPENAI_API_KEY"] = true
 	}
-	if cfg.Chat.Provider == "claude" {
-		needed["ANTHROPIC_API_KEY"] = true
-	}
-	if cfg.Embedder.Provider == "gemini" || cfg.Chat.Provider == "gemini" {
+	if cfg.Embedder.Provider == "gemini" {
 		needed["GEMINI_API_KEY"] = true
 	}
 	for envVar := range needed {
@@ -221,8 +181,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 
 	// 4 & 5. Ollama reachable + model installed
-	ollamaNeeded := cfg.Embedder.Provider == "ollama" || cfg.Chat.Provider == "ollama"
-	if ollamaNeeded {
+	if cfg.Embedder.Provider == "ollama" {
 		endpoint := cfg.Embedder.Endpoint
 		if endpoint == "" {
 			endpoint = "http://localhost:11434"
@@ -274,22 +233,13 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					})
 				}
 			}
-			if cfg.Embedder.Provider == "ollama" {
-				checkModel(cfg.Embedder.Model, "embedder")
-			}
-			if cfg.Chat.Provider == "ollama" {
-				checkModel(cfg.Chat.Model, "chat")
-			}
+			checkModel(cfg.Embedder.Model, "embedder")
 		}
 	}
 
 	// 5b. LM Studio / OpenAI-compatible server reachable + model available
-	lmNeeded := cfg.Embedder.Provider == "lmstudio" || cfg.Chat.Provider == "lmstudio"
-	if lmNeeded {
+	if cfg.Embedder.Provider == "lmstudio" {
 		endpoint := cfg.Embedder.Endpoint
-		if cfg.Embedder.Provider != "lmstudio" {
-			endpoint = cfg.Chat.Endpoint
-		}
 		if endpoint == "" {
 			endpoint = "http://localhost:1234"
 		}
@@ -327,12 +277,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					})
 				}
 			}
-			if cfg.Embedder.Provider == "lmstudio" {
-				checkLMModel(cfg.Embedder.Model, "embedder")
-			}
-			if cfg.Chat.Provider == "lmstudio" {
-				checkLMModel(cfg.Chat.Model, "chat")
-			}
+			checkLMModel(cfg.Embedder.Model, "embedder")
 		}
 	}
 
@@ -399,9 +344,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					}
 				}
 
-				// 8. Embedder consistency
+				// 8. Embedder consistency — only meaningful when an embedder
+				// is configured. With provider none the old vectors just sit
+				// unused (auto mode never consults them), so a "mismatch"
+				// against the empty model would be a false positive.
 				active, err := db2.GetActiveEmbedder()
-				if err == nil && active != nil {
+				if err == nil && active != nil && cfg.HasEmbedder() {
 					var storedModel string
 					val := active.Name
 					if i := strings.Index(val, `"model":"`); i >= 0 {

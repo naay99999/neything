@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/naay99999/neything/internal/chat"
 	"github.com/naay99999/neything/internal/embed"
+	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/rerank"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/naay99999/neything/internal/vectorstore"
@@ -16,8 +16,8 @@ import (
 
 type Config struct {
 	Embedder    EmbedderConfig    `mapstructure:"embedder"`
-	Chat        ChatConfig        `mapstructure:"chat"`
 	Retrieval   RetrievalConfig   `mapstructure:"retrieval"`
+	Index       IndexConfig       `mapstructure:"index"`
 	Reranker    RerankerConfig    `mapstructure:"reranker"`
 	Chunking    ChunkingConfig    `mapstructure:"chunking"`
 	Loaders     LoadersConfig     `mapstructure:"loaders"`
@@ -31,17 +31,18 @@ type EmbedderConfig struct {
 	Endpoint string `mapstructure:"endpoint"`
 }
 
-type ChatConfig struct {
-	Provider string `mapstructure:"provider"`
-	Model    string `mapstructure:"model"`
-	Endpoint string `mapstructure:"endpoint"`
+// IndexConfig controls what the indexer (and live scan / read_document)
+// will touch. Exclude patterns are globs matched case-insensitively against
+// file and directory basenames, on top of the built-in always-on deny list
+// (dotfiles + common secret-file names — see internal/pathfilter).
+type IndexConfig struct {
+	Exclude []string `mapstructure:"exclude"`
 }
 
 type RetrievalConfig struct {
-	TopK            int    `mapstructure:"top_k"`
-	MaxContextChars int    `mapstructure:"max_context_chars"`
-	Rerank          bool   `mapstructure:"rerank"`
-	RerankTopK      int    `mapstructure:"rerank_top_k"`
+	TopK       int  `mapstructure:"top_k"`
+	Rerank     bool `mapstructure:"rerank"`
+	RerankTopK int  `mapstructure:"rerank_top_k"`
 	// Mode is the canonical retrieval mode: auto | semantic | keyword |
 	// hybrid. Set by Load() via normalizeRetrievalMode, which also accepts
 	// the legacy "hybrid" YAML key (bool or string) for installs that
@@ -72,12 +73,7 @@ type ChunkingConfig struct {
 }
 
 type LoadersConfig struct {
-	Git GitLoaderConfig `mapstructure:"git"`
-	OCR OCRConfig       `mapstructure:"ocr"`
-}
-
-type GitLoaderConfig struct {
-	RecentCommits int `mapstructure:"recent_commits"`
+	OCR OCRConfig `mapstructure:"ocr"`
 }
 
 type OCRConfig struct {
@@ -101,14 +97,13 @@ type HNSWConfig struct {
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 
-# Tip: run 'ney init' to enable semantic search and 'ney ask' interactively.
-# Without an embedder/chat provider, ney still indexes and searches by
-# keyword (FTS) — just run 'ney index' and 'ney search' to try it now.
-#
 # Recommended: 'ney mcp' plugs ney straight into Claude Code/Desktop/Cursor
 # as an MCP server (search_documents/read_document/list_workspaces/
 # index_status) and works zero-config — keyword search from the moment it
 # starts, semantic search once an embedder is configured. See README.md.
+#
+# Tip: run 'ney init' to enable semantic search. Without an embedder, ney
+# still indexes and searches by keyword (FTS).
 
 # embedder: used to create vectors for semantic search (cannot be claude)
 embedder:
@@ -116,21 +111,22 @@ embedder:
   # model: bge-m3
   # endpoint: http://localhost:11434   # ollama / lmstudio (LM Studio default: http://localhost:1234)
 
-# chat: used to answer questions in 'ney ask'
-chat:
-  provider: none            # none | claude | openai | gemini | ollama | lmstudio
-  # model: claude-sonnet-4-6
-  # endpoint: http://localhost:1234    # ollama / lmstudio only
-
 # retrieval settings
 retrieval:
   top_k: 8
-  max_context_chars: 12000
   rerank: false
   rerank_top_k: 24
   mode: auto                # auto | semantic | keyword | hybrid
   # legacy installs may still have "hybrid: true/false" instead of "mode" —
   # true maps to hybrid, false maps to auto; an explicit "mode" always wins
+
+# indexing — extra exclude patterns (globs matched case-insensitively
+# against file and directory names). These add to the built-in always-on
+# excludes: dotfiles/dot-directories and common secret-file names
+# (*secret*, *credential*, *password*, *.key, *.pem, id_rsa*, ...).
+index:
+  exclude: []
+  # exclude: ["*.bak", "drafts-*", "node_modules"]
 
 # reranker: used when retrieval.rerank is true
 reranker:
@@ -153,8 +149,6 @@ chunking:
 
 # loader options
 loaders:
-  git:
-    recent_commits: 0       # index recent git commits (0 = disabled)
   ocr:
     enabled: false
     lang: eng
@@ -172,7 +166,7 @@ vector_store:
 telemetry: false
 
 # API keys — set via env vars (recommended) or here:
-# ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY
+# OPENAI_API_KEY, GEMINI_API_KEY
 `
 
 func NeyDir() string {
@@ -215,9 +209,6 @@ func Load() (*Config, error) {
 	// apply defaults
 	if cfg.Retrieval.TopK == 0 {
 		cfg.Retrieval.TopK = 8
-	}
-	if cfg.Retrieval.MaxContextChars == 0 {
-		cfg.Retrieval.MaxContextChars = 12000
 	}
 	if cfg.Chunking.Strategy == "" {
 		cfg.Chunking.Strategy = "markdown"
@@ -315,14 +306,8 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("embedder.model is required")
 		}
 	}
-	if cfg.Chat.Provider != "" && cfg.Chat.Provider != "none" {
-		validChat := map[string]bool{"claude": true, "openai": true, "gemini": true, "ollama": true, "lmstudio": true}
-		if !validChat[cfg.Chat.Provider] {
-			return fmt.Errorf("unknown chat provider %q (valid: none, claude, openai, gemini, ollama, lmstudio)", cfg.Chat.Provider)
-		}
-		if cfg.Chat.Model == "" {
-			return fmt.Errorf("chat.model is required")
-		}
+	if _, err := pathfilter.New(cfg.Index.Exclude); err != nil {
+		return fmt.Errorf("index.exclude: %w", err)
 	}
 	validChunk := map[string]bool{
 		"auto": true, "character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true, "page": true,
@@ -369,12 +354,6 @@ func (c *Config) HasEmbedder() bool {
 	return c.Embedder.Provider != "" && c.Embedder.Provider != "none"
 }
 
-// HasChat reports whether a chat provider is configured. When false, `ney
-// ask` and the REPL's ask path are unavailable until `ney init` sets one up.
-func (c *Config) HasChat() bool {
-	return c.Chat.Provider != "" && c.Chat.Provider != "none"
-}
-
 func apiKey(envVar string) string {
 	return os.Getenv(envVar)
 }
@@ -409,46 +388,6 @@ func NewEmbedder(cfg *Config) (embed.Embedder, error) {
 		return embed.NewOpenAICompatibleEmbedder(endpoint, cfg.Embedder.Model), nil
 	default:
 		return nil, fmt.Errorf("unknown embedder provider: %s", cfg.Embedder.Provider)
-	}
-}
-
-// NewChatModel builds the configured chat model. It returns (nil, nil) when
-// no chat provider is configured — commands that need it (ask, REPL ask)
-// check for nil themselves and print a friendly hint rather than failing at
-// config load time. A provider that IS configured but fails to build still
-// returns an error.
-func NewChatModel(cfg *Config) (chat.ChatModel, error) {
-	switch cfg.Chat.Provider {
-	case "", "none":
-		return nil, nil
-	case "claude":
-		key := apiKey("ANTHROPIC_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
-		}
-		return chat.NewClaudeChatModel(key, cfg.Chat.Model), nil
-	case "openai":
-		key := apiKey("OPENAI_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("OPENAI_API_KEY not set")
-		}
-		return chat.NewOpenAIChatModel(key, cfg.Chat.Model), nil
-	case "gemini":
-		key := apiKey("GEMINI_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("GEMINI_API_KEY not set")
-		}
-		return chat.NewGeminiChatModel(key, cfg.Chat.Model), nil
-	case "ollama":
-		return chat.NewOllamaChatModel(cfg.Chat.Endpoint, cfg.Chat.Model), nil
-	case "lmstudio":
-		endpoint := cfg.Chat.Endpoint
-		if endpoint == "" {
-			endpoint = "http://localhost:1234"
-		}
-		return chat.NewOpenAICompatibleChatModel(endpoint, cfg.Chat.Model), nil
-	default:
-		return nil, fmt.Errorf("unknown chat provider: %s", cfg.Chat.Provider)
 	}
 }
 

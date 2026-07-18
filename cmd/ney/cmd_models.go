@@ -32,7 +32,6 @@ func runModels(cmd *cobra.Command, args []string) error {
 
 	entries := []modelEntry{
 		{Provider: cfg.Embedder.Provider, Role: "embedder", Model: cfg.Embedder.Model, Active: true},
-		{Provider: cfg.Chat.Provider, Role: "chat", Model: cfg.Chat.Model, Active: true},
 	}
 	if cfg.Retrieval.Rerank {
 		entries = append(entries, modelEntry{
@@ -45,17 +44,13 @@ func runModels(cmd *cobra.Command, args []string) error {
 
 	// if a local server is configured, list what it has available
 	var ollamaModels []string
-	if cfg.Embedder.Provider == "ollama" || cfg.Chat.Provider == "ollama" {
+	if cfg.Embedder.Provider == "ollama" {
 		ollamaModels = listOllamaModels(cfg.Embedder.Endpoint)
 	}
 	var lmModels []string
-	lmConfigured := cfg.Embedder.Provider == "lmstudio" || cfg.Chat.Provider == "lmstudio"
+	lmConfigured := cfg.Embedder.Provider == "lmstudio"
 	if lmConfigured {
-		endpoint := cfg.Embedder.Endpoint
-		if cfg.Embedder.Provider != "lmstudio" {
-			endpoint = cfg.Chat.Endpoint
-		}
-		lmModels = listOpenAICompatModels(endpoint)
+		lmModels = listOpenAICompatModels(cfg.Embedder.Endpoint)
 	}
 
 	if flagJSON {
@@ -84,7 +79,7 @@ func runModels(cmd *cobra.Command, args []string) error {
 		for _, m := range ollamaModels {
 			fmt.Printf("  - %s\n", m)
 		}
-	} else if cfg.Embedder.Provider == "ollama" || cfg.Chat.Provider == "ollama" {
+	} else if cfg.Embedder.Provider == "ollama" {
 		fmt.Println("\n[Ollama offline or no models installed]")
 	}
 	if len(lmModels) > 0 {

@@ -26,7 +26,6 @@ const (
 
 type wizardChoice struct {
 	embedProvider, embedModel, embedEndpoint string
-	chatProvider, chatModel, chatEndpoint    string
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -39,7 +38,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("  [1] Ollama on this machine%s\n", detectedNote(len(ollamaModels)))
 	fmt.Printf("  [2] LM Studio / OpenAI-compatible server (local or remote)%s\n", detectedNote(len(lmModels)))
-	fmt.Printf("  [3] Cloud APIs (OpenAI, Gemini, Claude)\n")
+	fmt.Printf("  [3] Cloud APIs (OpenAI, Gemini)\n")
 
 	def := "3"
 	switch {
@@ -79,7 +78,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println(Bold("Next steps:"))
 	fmt.Println("  ney index ~/path/to/your/notes")
-	fmt.Println("  ney ask \"your question\"")
+	fmt.Println("  ney search \"anything\"")
+	fmt.Println("  claude mcp add ney -- ney mcp --root ~/path/to/your/notes   # plug into Claude Code")
 	fmt.Println(Dim("  (ney doctor checks everything again at any time)"))
 	return nil
 }
@@ -101,13 +101,12 @@ func wizardOllama(w *wizardChoice, models []string) error {
 		}
 	}
 
-	embedModel, chatModel, err := pickModels(models)
+	embedModel, err := pickModels(models)
 	if err != nil {
 		return err
 	}
 	w.embedProvider, w.embedModel, w.embedEndpoint = "ollama", embedModel, endpoint
-	w.chatProvider, w.chatModel, w.chatEndpoint = "ollama", chatModel, endpoint
-	return maybeCloudChat(w)
+	return nil
 }
 
 func wizardLMStudio(w *wizardChoice, localModels []string) error {
@@ -125,31 +124,27 @@ func wizardLMStudio(w *wizardChoice, localModels []string) error {
 	}
 	fmt.Printf("%s reachable, %d model(s)\n", Green("✓ "+endpoint), len(models))
 
-	embedModel, chatModel, err := pickModels(models)
+	embedModel, err := pickModels(models)
 	if err != nil {
 		return err
 	}
 	w.embedProvider, w.embedModel, w.embedEndpoint = "lmstudio", embedModel, endpoint
-	w.chatProvider, w.chatModel, w.chatEndpoint = "lmstudio", chatModel, endpoint
-	return maybeCloudChat(w)
+	return nil
 }
 
 // pickModels lists the server's models and lets the user pick an embedding
-// and a chat model, preselecting sensible defaults by name.
-func pickModels(models []string) (embedModel, chatModel string, err error) {
+// model, preselecting a sensible default by name.
+func pickModels(models []string) (embedModel string, err error) {
 	fmt.Println("\nModels on the server:")
 	for i, m := range models {
 		fmt.Printf("  [%d] %s\n", i+1, m)
 	}
 
-	embedDef, chatDef := "", ""
+	embedDef := ""
 	for _, m := range models {
 		if looksLikeEmbedder(m) {
-			if embedDef == "" {
-				embedDef = m
-			}
-		} else if chatDef == "" {
-			chatDef = m
+			embedDef = m
+			break
 		}
 	}
 
@@ -158,26 +153,9 @@ func pickModels(models []string) (embedModel, chatModel string, err error) {
 	}
 	embedModel = promptModel("Embedding model (number or name)", models, embedDef)
 	if embedModel == "" {
-		return "", "", fmt.Errorf("setup aborted: an embedding model is required")
+		return "", fmt.Errorf("setup aborted: an embedding model is required")
 	}
-	if chatDef == "" {
-		chatDef = models[0]
-	}
-	chatModel = promptModel("Chat model (number or name)", models, chatDef)
-	if chatModel == "" {
-		return "", "", fmt.Errorf("setup aborted: a chat model is required")
-	}
-	return embedModel, chatModel, nil
-}
-
-// maybeCloudChat lets local-server users route only chat to a cloud provider
-// (privacy-friendly mix: local embeddings, cloud answers).
-func maybeCloudChat(w *wizardChoice) error {
-	ans := strings.ToLower(promptDefault("Use the same server for chat answers? (y/n)", "y"))
-	if ans == "" || strings.HasPrefix(ans, "y") {
-		return nil
-	}
-	return pickCloudChat(w)
+	return embedModel, nil
 }
 
 func wizardCloud(w *wizardChoice) error {
@@ -191,25 +169,6 @@ func wizardCloud(w *wizardChoice) error {
 	default:
 		w.embedProvider, w.embedModel = "openai", "text-embedding-3-small"
 		warnMissingKey("OPENAI_API_KEY")
-	}
-	return pickCloudChat(w)
-}
-
-func pickCloudChat(w *wizardChoice) error {
-	fmt.Println("\nChat provider:")
-	fmt.Println("  [1] Claude  (claude-sonnet-4-6)")
-	fmt.Println("  [2] OpenAI  (gpt-4o)")
-	fmt.Println("  [3] Gemini  (gemini-2.0-flash)")
-	switch promptDefault("Choice", "1") {
-	case "2":
-		w.chatProvider, w.chatModel, w.chatEndpoint = "openai", "gpt-4o", ""
-		warnMissingKey("OPENAI_API_KEY")
-	case "3":
-		w.chatProvider, w.chatModel, w.chatEndpoint = "gemini", "gemini-2.0-flash", ""
-		warnMissingKey("GEMINI_API_KEY")
-	default:
-		w.chatProvider, w.chatModel, w.chatEndpoint = "claude", "claude-sonnet-4-6", ""
-		warnMissingKey("ANTHROPIC_API_KEY")
 	}
 	return nil
 }
@@ -277,17 +236,11 @@ func writeWizardConfig(w *wizardChoice) error {
 	if w.embedEndpoint != "" {
 		fmt.Fprintf(&b, "  endpoint: %s\n", w.embedEndpoint)
 	}
-	fmt.Fprintf(&b, "\n# chat: answers questions in `ney ask` (claude | openai | gemini | ollama | lmstudio)\n")
-	fmt.Fprintf(&b, "chat:\n  provider: %s\n  model: %s\n", w.chatProvider, w.chatModel)
-	if w.chatEndpoint != "" {
-		fmt.Fprintf(&b, "  endpoint: %s\n", w.chatEndpoint)
-	}
 	b.WriteString(`
 retrieval:
   top_k: 8
-  max_context_chars: 12000
   rerank: false
-  hybrid: false
+  mode: auto                # auto | semantic | keyword | hybrid
 
 chunking:
   strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer | page

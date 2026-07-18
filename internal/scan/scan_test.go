@@ -212,3 +212,37 @@ func TestScanBothFilenameAndContent(t *testing.T) {
 		t.Fatalf("expected matched_in=both, got %q", hits[0].MatchedIn)
 	}
 }
+
+func TestScanSkipsSecretFiles(t *testing.T) {
+	root := t.TempDir()
+	// Both filename-match and content-grep paths must be blind to
+	// secret-named files, even when they match the query.
+	writeFile(t, filepath.Join(root, "passwords.md"), "widget widget widget\n")
+	writeFile(t, filepath.Join(root, "widget-credentials.json"), `{"widget": true}`+"\n")
+	writeFile(t, filepath.Join(root, "prod.env"), "WIDGET_TOKEN=widget\n")
+	writeFile(t, filepath.Join(root, "widget.md"), "an ordinary widget note\n")
+
+	hits, _, err := Scan(context.Background(), root, "widget", Options{})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected only widget.md to hit, got: %+v", hits)
+	}
+	if filepath.Base(hits[0].Path) != "widget.md" {
+		t.Fatalf("expected widget.md, got %s", hits[0].Path)
+	}
+}
+
+func TestScanSkipsSecretDirs(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "secrets", "widget.md"), "widget widget\n")
+
+	hits, _, err := Scan(context.Background(), root, "widget", Options{})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected the secrets dir to be skipped entirely, got: %+v", hits)
+	}
+}

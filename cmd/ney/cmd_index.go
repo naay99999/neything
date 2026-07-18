@@ -60,7 +60,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	applyProviderOverride(cfg, true)
+	applyProviderOverride(cfg)
 
 	lock, err := lockfile.Acquire(config.NeyDir())
 	if err != nil {
@@ -68,7 +68,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	}
 	defer lock.Release()
 
-	app, err := initAppWithOptions(cfg, flagMigrateVectors, false)
+	app, err := initAppWithOptions(cfg, flagMigrateVectors)
 	if err != nil {
 		return err
 	}

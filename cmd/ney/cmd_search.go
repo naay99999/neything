@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/naay99999/neything/internal/citation"
+	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/scan"
 	"github.com/naay99999/neything/internal/search"
 	"github.com/naay99999/neything/internal/store"
@@ -27,8 +28,8 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	applyProviderOverride(cfg, true)
-	app, err := initAppFromConfig(cfg, false)
+	applyProviderOverride(cfg)
+	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}
@@ -64,7 +65,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	groups := search.GroupByFile(results)
-	groups = appendLiveScan(cmd.Context(), app.DB, groups, query)
+	groups = appendLiveScan(cmd.Context(), app.DB, groups, query, newPathFilter(cfg))
 
 	if flagJSON {
 		PrintJSON(search.GroupedResults{Files: groups, Meta: &meta})
@@ -104,6 +105,18 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// mixedWorkspaces reports whether results span more than one distinct
+// workspace — true when --all was used or a fallback jumped scope.
+func mixedWorkspaces(results []search.EnrichedResult) bool {
+	seen := make(map[string]bool)
+	for _, r := range results {
+		if r.Workspace != "" {
+			seen[r.Workspace] = true
+		}
+	}
+	return len(seen) > 1
+}
+
 // appendLiveScan runs a tier-0 filesystem scan (internal/scan) and appends
 // its hits, deduped by path, when the CLI heuristic (design §6.1) decides
 // the search scope isn't backed by an indexed workspace yet — e.g. a brand
@@ -114,12 +127,12 @@ func runSearch(cmd *cobra.Command, args []string) error {
 // Best-effort and non-fatal: scan errors are swallowed since keyword/
 // semantic search already ran and this is purely additive. Included in
 // --json output too (tagged source: "live-scan"), not just interactive text.
-func appendLiveScan(ctx context.Context, db *store.DB, groups []search.FileGroup, query string) []search.FileGroup {
+func appendLiveScan(ctx context.Context, db *store.DB, groups []search.FileGroup, query string, flt *pathfilter.Filter) []search.FileGroup {
 	root := liveScanRoot(db, flagPath)
 	if root == "" {
 		return groups
 	}
-	hits, _, err := scan.Scan(ctx, root, query, scan.Options{})
+	hits, _, err := scan.Scan(ctx, root, query, scan.Options{Exclude: flt})
 	if err != nil || len(hits) == 0 {
 		return groups
 	}

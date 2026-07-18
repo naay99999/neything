@@ -13,6 +13,7 @@ import (
 	"github.com/naay99999/neything/internal/chunk"
 	"github.com/naay99999/neything/internal/embed"
 	"github.com/naay99999/neything/internal/loader"
+	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/naay99999/neything/internal/vectorstore"
 )
@@ -37,11 +38,14 @@ type Stats struct {
 const flushEveryDocs = 100
 
 type Indexer struct {
-	DB            *store.DB
-	Vectors       vectorstore.VectorStore
-	Embedder      embed.Embedder
-	Loaders       loader.Registry
-	GitHistory    *loader.GitHistoryLoader
+	DB      *store.DB
+	Vectors vectorstore.VectorStore
+	Embedder embed.Embedder
+	Loaders  loader.Registry
+	// Filter decides which files/dirs are excluded (dotfiles + secret-file
+	// patterns + user config). nil is valid and applies the built-in rules
+	// only — see pathfilter.
+	Filter        *pathfilter.Filter
 	ChunkResolver *chunk.Resolver
 	BatchSize     int
 	OnProgress    func(file string, chunks int)
@@ -56,6 +60,34 @@ var supportedExts = map[string]bool{
 	".htm":      true,
 	".json":     true,
 	".xml":      true,
+}
+
+// walkIndexable walks root, applying dir/file exclusion (ix.Filter, nil-safe:
+// dotfiles + built-in secret patterns always apply) and the supported-
+// extension check, calling fn for each indexable file. Shared by Index and
+// PruneMissing so their views of "what exists" can never diverge — a file the
+// walk excludes here is also invisible to prune's seen-set, which means
+// previously indexed files that later match a deny pattern get pruned
+// automatically on the next run.
+func (ix *Indexer) walkIndexable(root string, fn func(path string, d fs.DirEntry) error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root && ix.Filter.ExcludedDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ix.Filter.ExcludedFile(d.Name()) {
+			return nil
+		}
+		if !supportedExts[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+		return fn(path, d)
+	})
 }
 
 // Index walks rootPath and performs Phase A only: parse → chunk → write
@@ -94,20 +126,7 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 	pathToHash := make(map[string]string)
 	docsSinceFlush := 0
 
-	err = filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !supportedExts[ext] {
-			return nil
-		}
+	err = ix.walkIndexable(rootPath, func(path string, d fs.DirEntry) error {
 		stats.FilesScanned++
 		seenPaths[path] = true
 
@@ -139,10 +158,6 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		return nil, err
 	}
 
-	if err := ix.indexGitHistory(ctx, rootPath, workspaceID, seenPaths, pathToHash, stats); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: git history: %v\n", err)
-	}
-
 	hashFor := func(path string) string { return pathToHash[path] }
 	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, hashFor, stats); err != nil {
 		return nil, err
@@ -161,6 +176,12 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 	ext := strings.ToLower(filepath.Ext(path))
 	if !supportedExts[ext] {
 		return nil, fmt.Errorf("unsupported file type: %s", ext)
+	}
+	// Excluded files (dotfiles, secret patterns, user config) are a silent
+	// skip, not an error — the watcher fires on every save of e.g. prod.env
+	// and shouldn't warn each time.
+	if ix.Filter.ExcludedFile(filepath.Base(path)) {
+		return &Stats{FilesScanned: 1, FilesSkipped: 1}, nil
 	}
 
 	fileData, err := os.ReadFile(path)
@@ -218,20 +239,7 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
 
-	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !supportedExts[ext] {
-			return nil
-		}
+	err := ix.walkIndexable(rootPath, func(path string, d fs.DirEntry) error {
 		seenPaths[path] = true
 		return nil
 	})
@@ -262,33 +270,6 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 	}
 	return stats, nil
-}
-
-func (ix *Indexer) indexGitHistory(ctx context.Context, rootPath string, workspaceID int64, seenPaths map[string]bool, pathToHash map[string]string, stats *Stats) error {
-	if ix.GitHistory == nil || ix.GitHistory.RecentCommits <= 0 {
-		return nil
-	}
-	docs, err := ix.GitHistory.LoadRepo(ctx, rootPath)
-	if err != nil {
-		return err
-	}
-	for _, doc := range docs {
-		seenPaths[doc.Path] = true
-		pathToHash[doc.Path] = doc.Hash
-
-		existing, err := ix.DB.GetDocumentByPath(doc.Path)
-		if err != nil {
-			return err
-		}
-		if existing != nil && existing.Hash == doc.Hash {
-			stats.FilesSkipped++
-			continue
-		}
-		if err := ix.indexDocument(ctx, doc, workspaceID, doc.Hash, len(doc.Content), stats); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspaceID int64, hash string, sizeBytes int, stats *Stats) error {

@@ -52,34 +52,28 @@ type mcpRoot struct {
 // STDOUT HYGIENE: stdout is reserved for the MCP protocol end to end. This
 // function and everything it calls (loadConfig, initAppWithOptions,
 // newIndexer, the watcher, the embed worker) only ever write diagnostics to
-// os.Stderr — never fmt.Println/PrintJSON/the banner/spinner helpers, all of
-// which write to os.Stdout. Because `ney mcp` always has an arg (main.go only
-// calls runREPL for a bare `ney` with zero args), the interactive
-// banner/onboarding path in banner.go is never reached here either.
+// os.Stderr — never fmt.Println/PrintJSON/the spinner helpers, all of which
+// write to os.Stdout.
 func runMCP(cmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
 
-	lock, err := lockfile.Acquire(config.NeyDir())
+	lock, readOnly, err := acquireWriterLock(config.NeyDir())
 	if err != nil {
-		// lockfile.ErrLocked's message ("another ney process (pid X, ney mcp)
-		// is writing — stop it first") is already friendly and specific;
-		// main() routes returned errors to printCLIError, which writes to
-		// stderr and exits non-zero.
 		return err
 	}
-	defer lock.Release()
+	defer lock.Release() // nil-safe in read-only mode
 
-	app, err := initAppWithOptions(cfg, false, false)
+	app, err := initAppWithOptions(cfg, false)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
 	defer app.Vectors.Close()
 
-	roots, err := resolveMCPRoots(app.DB, flagMCPRoots)
+	roots, err := resolveMCPRoots(app.DB, flagMCPRoots, readOnly)
 	if err != nil {
 		return err
 	}
@@ -87,19 +81,14 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "ney mcp: no workspaces to serve yet — pass --root <path>, or run `ney index` first")
 	}
 
-	ix, err := newIndexer(app, cfg)
-	if err != nil {
-		return err
-	}
-
-	state := newServerState(rootNames(roots))
+	state := newServerState(rootNames(roots), readOnly)
 
 	var worker *index.EmbedWorker
-	if app.Embedder != nil {
+	if app.Embedder != nil && !readOnly {
 		worker = &index.EmbedWorker{DB: app.DB, Vectors: app.Vectors, Embedder: app.Embedder}
 	}
 
-	server := newMCPServer(app, cfg, state, roots, worker)
+	server := newMCPServer(app, cfg, state, roots, worker, newPathFilter(cfg))
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -110,85 +99,121 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	var indexMu sync.Mutex
 	var wg sync.WaitGroup
 
-	// (a) Phase A of each root, sequentially, so a big corpus doesn't starve
-	// the others — each root's tool calls are already served (FTS/tier-0-ish
-	// partial results) while later roots are still being scanned.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	if readOnly {
+		// Serving without the writer lock: search/read work off the existing
+		// index (loaded once at startup — the concurrent writer's later
+		// updates aren't visible until restart). For roots the index doesn't
+		// cover yet, mark Phase A permanently "running" so search_documents
+		// supplements with a live scan and flags results as partial — this
+		// process can never index them itself.
 		for _, r := range roots {
-			if ctx.Err() != nil {
-				return
+			ws, werr := app.DB.GetWorkspaceByName(r.Name)
+			if werr != nil {
+				continue
 			}
-			state.setPhaseA(r.Name, true)
-			indexMu.Lock()
-			_, ierr := ix.Index(ctx, r.Path, r.Name)
-			indexMu.Unlock()
-			state.setPhaseA(r.Name, false)
-			if ierr != nil && ctx.Err() == nil {
-				fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", r.Name, ierr)
+			covered := false
+			if ws != nil {
+				if docs, derr := app.DB.GetDocumentsByWorkspace(ws.ID); derr == nil && len(docs) > 0 {
+					covered = true
+				}
 			}
-			if worker != nil {
-				worker.Notify()
+			if !covered {
+				state.setPhaseA(r.Name, true)
 			}
 		}
-	}()
+	} else {
+		ix, ierr := newIndexer(app, cfg)
+		if ierr != nil {
+			return ierr
+		}
 
-	// (b) EmbedWorker.RunLoop — global scope (every workspace), notified
-	// after each Phase A root completes and after every watcher flush.
-	if worker != nil {
+		// (a) Phase A of each root, sequentially, so a big corpus doesn't
+		// starve the others — each root's tool calls are already served
+		// (FTS/tier-0-ish partial results) while later roots are still being
+		// scanned.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = worker.RunLoop(ctx)
-		}()
-	}
-
-	// (c) one watcher per root. Prune is centralized on the first watcher
-	// only (DisablePrune on the rest) per §7.4 — an external owner (this
-	// server) is expected to centralize pruning rather than each Watcher
-	// running its own ticker.
-	for i, r := range roots {
-		wsID, werr := app.DB.UpsertWorkspace(r.Name, r.Path)
-		if werr != nil {
-			fmt.Fprintf(os.Stderr, "warning: watch %s: %v\n", r.Name, werr)
-			continue
-		}
-		w := &watch.Watcher{
-			Indexer:      ix,
-			RootPath:     r.Path,
-			WorkspaceID:  wsID,
-			DisablePrune: i != 0,
-			Serialize: func(run func()) {
+			for _, r := range roots {
+				if ctx.Err() != nil {
+					return
+				}
+				state.setPhaseA(r.Name, true)
 				indexMu.Lock()
-				defer indexMu.Unlock()
-				run()
-			},
-		}
-		if worker != nil {
-			w.OnFlush = worker.Notify
-		}
-		wg.Add(1)
-		go func(w *watch.Watcher) {
-			defer wg.Done()
-			if _, werr := w.Run(ctx); werr != nil && ctx.Err() == nil {
-				fmt.Fprintf(os.Stderr, "warning: watcher %s: %v\n", w.RootPath, werr)
+				_, ierr := ix.Index(ctx, r.Path, r.Name)
+				indexMu.Unlock()
+				state.setPhaseA(r.Name, false)
+				if ierr != nil && ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", r.Name, ierr)
+				}
+				if worker != nil {
+					worker.Notify()
+				}
 			}
-		}(w)
-	}
-	if len(roots) > 0 {
-		state.setWatching(true)
+		}()
+
+		// (b) EmbedWorker.RunLoop — global scope (every workspace), notified
+		// after each Phase A root completes and after every watcher flush.
+		if worker != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = worker.RunLoop(ctx)
+			}()
+		}
+
+		// (c) one watcher per root. Prune is centralized on the first watcher
+		// only (DisablePrune on the rest) per §7.4 — an external owner (this
+		// server) is expected to centralize pruning rather than each Watcher
+		// running its own ticker.
+		for i, r := range roots {
+			wsID, werr := app.DB.UpsertWorkspace(r.Name, r.Path)
+			if werr != nil {
+				fmt.Fprintf(os.Stderr, "warning: watch %s: %v\n", r.Name, werr)
+				continue
+			}
+			w := &watch.Watcher{
+				Indexer:      ix,
+				RootPath:     r.Path,
+				WorkspaceID:  wsID,
+				DisablePrune: i != 0,
+				Serialize: func(run func()) {
+					indexMu.Lock()
+					defer indexMu.Unlock()
+					run()
+				},
+			}
+			if worker != nil {
+				w.OnFlush = worker.Notify
+			}
+			wg.Add(1)
+			go func(w *watch.Watcher) {
+				defer wg.Done()
+				if _, werr := w.Run(ctx); werr != nil && ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "warning: watcher %s: %v\n", w.RootPath, werr)
+				}
+			}(w)
+		}
+		if len(roots) > 0 {
+			state.setWatching(true)
+		}
 	}
 
-	fmt.Fprintf(os.Stderr, "ney mcp: serving %d workspace(s) over stdio (Ctrl+C or close stdin to stop)\n", len(roots))
+	mode := "read-write"
+	if readOnly {
+		mode = "read-only"
+	}
+	fmt.Fprintf(os.Stderr, "ney mcp: serving %d workspace(s) over stdio, %s (Ctrl+C or close stdin to stop)\n", len(roots), mode)
 
 	runErr := server.Run(ctx, &mcp.StdioTransport{})
 
 	// Shutdown: stop background goroutines, then flush + release the lock.
 	stop()
 	wg.Wait()
-	if ferr := app.Vectors.Flush(); ferr != nil {
-		fmt.Fprintf(os.Stderr, "warning: flush vectors: %v\n", ferr)
+	if !readOnly {
+		if ferr := app.Vectors.Flush(); ferr != nil {
+			fmt.Fprintf(os.Stderr, "warning: flush vectors: %v\n", ferr)
+		}
 	}
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
@@ -197,13 +222,37 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// acquireWriterLock tries to take the single-writer lock. When another live
+// ney process already holds it (a second MCP client spawning its own `ney
+// mcp` is the common case — e.g. Claude Desktop and Claude Code at once),
+// it returns readOnly=true with a nil lock instead of failing: the server
+// then serves search/read from the existing index and skips everything that
+// writes (indexing, embedding, watching). Any other Acquire error is fatal.
+func acquireWriterLock(dir string) (lock *lockfile.Lock, readOnly bool, err error) {
+	lock, err = lockfile.Acquire(dir)
+	if err == nil {
+		return lock, false, nil
+	}
+	var le *lockfile.LockedError
+	if errors.As(err, &le) {
+		fmt.Fprintf(os.Stderr,
+			"ney mcp: writer lock held by pid %d (%s) — serving read-only: search/read work; no indexing, embedding, or watching. Index snapshot loaded at startup.\n",
+			le.PID, le.Command)
+		return nil, true, nil
+	}
+	return nil, false, err
+}
+
 // resolveMCPRoots turns --root flags (or, if none were given, every
 // workspace already in the DB) into a resolved root list. A --root whose
 // basename collides with an existing workspace bound to a *different*
 // root_path is a hard error — UpsertWorkspace's ON CONFLICT(name) DO UPDATE
 // would otherwise silently re-point that workspace's root_path (CLAUDE.md;
 // design §7.2), which would orphan its already-indexed documents.
-func resolveMCPRoots(db *store.DB, rawRoots []string) ([]mcpRoot, error) {
+// In read-only mode nothing may be written, so the workspace upsert for
+// --root paths is skipped — an unindexed --root is still served via live
+// scan and read_document, it just has no persisted workspace row.
+func resolveMCPRoots(db *store.DB, rawRoots []string, readOnly bool) ([]mcpRoot, error) {
 	if len(rawRoots) == 0 {
 		wss, err := db.ListWorkspaces()
 		if err != nil {
@@ -242,8 +291,10 @@ func resolveMCPRoots(db *store.DB, rawRoots []string) ([]mcpRoot, error) {
 				name, existing.RootPath, raw,
 			)
 		}
-		if _, err := db.UpsertWorkspace(name, resolved); err != nil {
-			return nil, err
+		if !readOnly {
+			if _, err := db.UpsertWorkspace(name, resolved); err != nil {
+				return nil, err
+			}
 		}
 		roots = append(roots, mcpRoot{Name: name, Path: resolved})
 	}
@@ -278,15 +329,43 @@ type serverState struct {
 	mu       sync.Mutex
 	phaseA   map[string]bool
 	watching bool
+	// readOnly is set once at construction (never mutated), when the writer
+	// lock was held by another process — index_status reports it so clients
+	// can tell this server will never index/embed/watch.
+	readOnly bool
+	// discovered is the session allowlist for read_document: resolved paths
+	// that a user-directed search_folder call surfaced. Files outside the
+	// served roots are readable ONLY if they were discovered this way first
+	// (and never if pathfilter denies them) — so the AI can follow up on a
+	// search the user asked for, but can't cold-read arbitrary home files.
+	discovered map[string]bool
 }
 
-func newServerState(names []string) *serverState {
-	s := &serverState{phaseA: make(map[string]bool, len(names))}
+func newServerState(names []string, readOnly bool) *serverState {
+	s := &serverState{
+		phaseA:     make(map[string]bool, len(names)),
+		readOnly:   readOnly,
+		discovered: make(map[string]bool),
+	}
 	for _, n := range names {
 		s.phaseA[n] = false
 	}
 	return s
 }
+
+func (s *serverState) addDiscovered(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discovered[path] = true
+}
+
+func (s *serverState) isDiscovered(path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.discovered[path]
+}
+
+func (s *serverState) isReadOnly() bool { return s.readOnly }
 
 func (s *serverState) setPhaseA(name string, running bool) {
 	s.mu.Lock()

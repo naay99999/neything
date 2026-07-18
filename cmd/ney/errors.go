@@ -7,7 +7,7 @@ import (
 )
 
 // printCLIError renders an error with an actionable hint instead of cobra's
-// raw error + usage dump. Used by both one-shot mode and the REPL.
+// raw error + usage dump.
 func printCLIError(err error) {
 	if err == nil {
 		return
@@ -37,11 +37,6 @@ func friendlyHints(err error) []string {
 			"Check the endpoint in ~/.ney/config.yaml (ney config edit), or run: ney init",
 			"Diagnose with: ney doctor",
 		}
-	case has("ANTHROPIC_API_KEY not set"):
-		return []string{
-			"Set the key: export ANTHROPIC_API_KEY=<your-key>",
-			"Or switch chat.provider to a local server: ney init",
-		}
 	case has("OPENAI_API_KEY not set", "GEMINI_API_KEY not set", "COHERE_API_KEY not set", "JINA_API_KEY not set"):
 		return []string{
 			"Set the key shown above as an environment variable",
@@ -49,7 +44,7 @@ func friendlyHints(err error) []string {
 		}
 	case has("embedder mismatch", "backend mismatch"):
 		return []string{"Rebuild the index: ney reset && ney index <path>"}
-	case has("unknown embedder provider", "unknown chat provider"):
+	case has("unknown embedder provider"):
 		return []string{"Fix ~/.ney/config.yaml (ney config edit) or rerun setup: ney init"}
 	case has("No models loaded"):
 		return []string{

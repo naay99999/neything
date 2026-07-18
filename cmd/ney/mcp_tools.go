@@ -13,6 +13,7 @@ import (
 	"github.com/naay99999/neything/internal/citation"
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/index"
+	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/scan"
 	"github.com/naay99999/neything/internal/search"
 )
@@ -39,7 +40,7 @@ const (
 // of runMCP so tests can construct one against an in-memory transport
 // (mcp.NewInMemoryTransports) without going through stdio or the CLI's
 // lockfile/signal-handling — see mcp_test.go.
-func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots []mcpRoot, worker *index.EmbedWorker) *mcp.Server {
+func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots []mcpRoot, worker *index.EmbedWorker, flt *pathfilter.Filter) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "ney", Version: Version}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -48,8 +49,20 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 			"Results may be partial while background indexing/embedding is still in progress — check the " +
 			"returned index_status (phase_a_running, embedding_state) before concluding something isn't indexed. " +
 			"While a root's initial scan is still running, results are supplemented with a live filesystem scan " +
-			"(source: \"live-scan\") so filename/content matches show up even before that root finishes indexing.",
-	}, searchDocumentsHandler(app, cfg, state, worker, roots))
+			"(source: \"live-scan\") so filename/content matches show up even before that root finishes indexing. " +
+			"If nothing relevant is found here, do not give up: ask the user WHERE the file might live " +
+			"(Downloads? Desktop? Documents? a specific project folder?) and then call search_folder on that folder.",
+	}, searchDocumentsHandler(app, cfg, state, worker, roots, flt))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "search_folder",
+		Description: "Live-scan ONE folder anywhere under the user's home directory for filename/content matches — " +
+			"no indexing needed, bounded (~10k files / 2s), secret and hidden files are never returned. " +
+			"Use this as the fallback when search_documents finds nothing: first ASK THE USER where the file " +
+			"might be (e.g. ~/Downloads, ~/Desktop, ~/Documents, or a project folder they name), then call this " +
+			"with that folder — do not guess-scan many folders unprompted. Files found here become readable " +
+			"via read_document for the rest of this session.",
+	}, searchFolderHandler(state, flt))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_document",
@@ -58,8 +71,10 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 			"reassembled from indexed chunk rows in order when available (approximate: chunk overlap can " +
 			"duplicate ~150 chars at each join, and start/end positions are pages/paragraphs, not exact " +
 			"char offsets) — or parsed fresh (size-capped, OCR time-boxed) if the file exists under an " +
-			"indexed root but hasn't been indexed yet. Only paths inside a known workspace root are allowed.",
-	}, readDocumentHandler(app, roots))
+			"indexed root but hasn't been indexed yet. Allowed paths: inside a known workspace root, or " +
+			"files previously surfaced by a search_folder call this session; hidden files and secret-looking " +
+			"files (.env, keys, credentials, ...) are never served.",
+	}, readDocumentHandler(app, roots, flt, state))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_workspaces",
@@ -107,7 +122,7 @@ type searchDocumentsOutput struct {
 	IndexStatus indexStatusBrief   `json:"index_status"`
 }
 
-func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, roots []mcpRoot) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
+func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, roots []mcpRoot, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchDocumentsInput) (*mcp.CallToolResult, searchDocumentsOutput, error) {
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, searchDocumentsOutput{}, fmt.Errorf("query is required")
@@ -145,7 +160,7 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 				Source:    "index",
 			}
 		}
-		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state)
+		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state, flt)
 
 		chunkCount, _ := app.DB.CountChunks()
 		out := searchDocumentsOutput{
@@ -195,7 +210,7 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 // has no server state and falls back to a path/document-count heuristic —
 // see cmd_search.go's liveScanRoot), `ney mcp` knows exactly which roots
 // haven't finished their initial scan yet.
-func appendLiveScanHits(ctx context.Context, items []searchResultItem, query, workspace string, roots []mcpRoot, state *serverState) []searchResultItem {
+func appendLiveScanHits(ctx context.Context, items []searchResultItem, query, workspace string, roots []mcpRoot, state *serverState, flt *pathfilter.Filter) []searchResultItem {
 	targets := relevantScanRoots(workspace, roots, state)
 	if len(targets) == 0 {
 		return items
@@ -205,7 +220,7 @@ func appendLiveScanHits(ctx context.Context, items []searchResultItem, query, wo
 		seen[it.Path] = true
 	}
 	for _, r := range targets {
-		hits, _, err := scan.Scan(ctx, r.Path, query, scan.Options{})
+		hits, _, err := scan.Scan(ctx, r.Path, query, scan.Options{Exclude: flt})
 		if err != nil {
 			continue
 		}
@@ -259,6 +274,112 @@ func relevantScanRoots(workspace string, roots []mcpRoot, state *serverState) []
 	return targets
 }
 
+// --- search_folder -------------------------------------------------------------
+
+type searchFolderInput struct {
+	Path  string `json:"path" jsonschema:"folder to scan (absolute or ~-relative; must be under the user's home directory)"`
+	Query string `json:"query" jsonschema:"the search query (filename tokens + content grep for small plain-text files)"`
+}
+
+type searchFolderOutput struct {
+	Results   []searchResultItem `json:"results"`
+	Truncated bool               `json:"truncated"` // scan hit a file/time cap — there may be more
+}
+
+// searchFolderHandler is the user-directed whole-machine fallback: scan any
+// folder under $HOME with the same bounded, secret-blind tier-0 scanner the
+// server already uses for still-indexing roots. Hits are recorded in the
+// session's discovered set so read_document can serve them afterwards.
+func searchFolderHandler(state *serverState, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchFolderInput, searchFolderOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchFolderInput) (*mcp.CallToolResult, searchFolderOutput, error) {
+		if strings.TrimSpace(in.Query) == "" {
+			return nil, searchFolderOutput{}, fmt.Errorf("query is required")
+		}
+		if strings.TrimSpace(in.Path) == "" {
+			return nil, searchFolderOutput{}, fmt.Errorf("path is required")
+		}
+
+		dir, err := resolveHomeBoundDir(in.Path)
+		if err != nil {
+			return nil, searchFolderOutput{}, err
+		}
+
+		hits, truncated, err := scan.Scan(ctx, dir, in.Query, scan.Options{Exclude: flt})
+		if err != nil {
+			return nil, searchFolderOutput{}, err
+		}
+
+		items := make([]searchResultItem, 0, len(hits))
+		for _, h := range hits {
+			state.addDiscovered(filepath.Clean(h.Path))
+			snippet := h.Snippet
+			if snippet == "" {
+				snippet = "(filename match)"
+			}
+			items = append(items, searchResultItem{
+				Path:    h.Path,
+				Score:   float32(h.Score),
+				Snippet: snippet,
+				Source:  "live-scan",
+			})
+		}
+
+		out := searchFolderOutput{Results: items, Truncated: truncated}
+		var b strings.Builder
+		if len(items) == 0 {
+			fmt.Fprintf(&b, "No matches in %s.", dir)
+		} else {
+			fmt.Fprintf(&b, "%d match(es) in %s:\n", len(items), dir)
+			for i, it := range items {
+				fmt.Fprintf(&b, "%d. %s score=%.2f\n   %s\n", i+1, it.Path, it.Score, it.Snippet)
+			}
+			b.WriteString("\nThese files are now readable via read_document.\n")
+		}
+		if truncated {
+			b.WriteString("note: scan was truncated (folder too large) — results may be incomplete; try a more specific subfolder.\n")
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, out, nil
+	}
+}
+
+// resolveHomeBoundDir resolves a client-supplied folder and requires it to be
+// the user's home directory or inside it — search_folder may roam the user's
+// files when the user directs it there, but never system paths, other users'
+// homes, or mounted volumes.
+func resolveHomeBoundDir(raw string) (string, error) {
+	p := expandTilde(raw)
+	if !filepath.IsAbs(p) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return "", fmt.Errorf("resolve path: %w", err)
+		}
+		p = abs
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", fmt.Errorf("folder not found: %s", raw)
+	}
+	resolved = filepath.Clean(resolved)
+
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("folder not found: %s", raw)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("not a folder: %s", raw)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	home = resolveRootBestEffort(home)
+	if resolved != home && !strings.HasPrefix(resolved, home+string(filepath.Separator)) {
+		return "", fmt.Errorf("folder outside the home directory is not allowed: %s", raw)
+	}
+	return resolved, nil
+}
+
 // --- read_document ------------------------------------------------------------
 
 type readDocumentInput struct {
@@ -275,14 +396,29 @@ type readDocumentOutput struct {
 	Source     string `json:"source"` // file | chunks | fresh-parse
 }
 
-func readDocumentHandler(app *AppState, roots []mcpRoot) mcp.ToolHandlerFor[readDocumentInput, readDocumentOutput] {
+func readDocumentHandler(app *AppState, roots []mcpRoot, flt *pathfilter.Filter, state *serverState) mcp.ToolHandlerFor[readDocumentInput, readDocumentOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in readDocumentInput) (*mcp.CallToolResult, readDocumentOutput, error) {
 		if strings.TrimSpace(in.Path) == "" {
 			return nil, readDocumentOutput{}, fmt.Errorf("path is required")
 		}
-		resolved, err := resolveAllowedPath(in.Path, roots)
+		resolved, root, err := resolveAllowedPath(in.Path, roots)
 		if err != nil {
-			return nil, readDocumentOutput{}, err
+			// Outside every served root — still allowed IF a user-directed
+			// search_folder call surfaced this exact file earlier in the
+			// session (checked against home so the secret deny still applies
+			// to every path component below it).
+			var derr error
+			if resolved, derr = resolveDiscoveredPath(in.Path, state); derr != nil {
+				return nil, readDocumentOutput{}, err
+			}
+			home, herr := os.UserHomeDir()
+			if herr != nil {
+				return nil, readDocumentOutput{}, err
+			}
+			root = mcpRoot{Name: "home", Path: resolveRootBestEffort(home)}
+		}
+		if flt.ExcludedPath(root.Path, resolved) {
+			return nil, readDocumentOutput{}, fmt.Errorf("path is excluded by security policy (hidden or secret file): %s", in.Path)
 		}
 
 		maxChars := in.MaxChars
@@ -390,17 +526,17 @@ func readPlainTextFile(resolved string) (content, source string, err error) {
 	return string(data), "file", nil
 }
 
-// resolveAllowedPath expands ~, makes rawPath absolute, resolves symlinks on
-// both it and every known root, and only allows it through if it falls
-// inside one of those resolved roots. Symlink resolution is required on both
-// sides of the comparison: a symlink planted inside an allowed root could
-// otherwise point anywhere on disk and slip past a plain prefix check.
-func resolveAllowedPath(rawPath string, roots []mcpRoot) (string, error) {
+// resolveDiscoveredPath resolves rawPath and returns it only if it is in the
+// session's discovered set (surfaced by a prior user-directed search_folder
+// call). Symlink resolution matches how search_folder recorded the hit, so a
+// symlink planted at a discovered path can't be swapped to point elsewhere —
+// the post-resolution string must still be the recorded one.
+func resolveDiscoveredPath(rawPath string, state *serverState) (string, error) {
 	p := expandTilde(rawPath)
 	if !filepath.IsAbs(p) {
 		abs, err := filepath.Abs(p)
 		if err != nil {
-			return "", fmt.Errorf("resolve path: %w", err)
+			return "", err
 		}
 		p = abs
 	}
@@ -409,13 +545,40 @@ func resolveAllowedPath(rawPath string, roots []mcpRoot) (string, error) {
 		return "", fmt.Errorf("path not found: %s", rawPath)
 	}
 	resolved = filepath.Clean(resolved)
+	if !state.isDiscovered(resolved) {
+		return "", fmt.Errorf("not a discovered path: %s", rawPath)
+	}
+	return resolved, nil
+}
+
+// resolveAllowedPath expands ~, makes rawPath absolute, resolves symlinks on
+// both it and every known root, and only allows it through if it falls
+// inside one of those resolved roots (also returning which root matched, so
+// the caller can apply per-root policy like the pathfilter deny). Symlink
+// resolution is required on both sides of the comparison: a symlink planted
+// inside an allowed root could otherwise point anywhere on disk and slip
+// past a plain prefix check.
+func resolveAllowedPath(rawPath string, roots []mcpRoot) (string, mcpRoot, error) {
+	p := expandTilde(rawPath)
+	if !filepath.IsAbs(p) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return "", mcpRoot{}, fmt.Errorf("resolve path: %w", err)
+		}
+		p = abs
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", mcpRoot{}, fmt.Errorf("path not found: %s", rawPath)
+	}
+	resolved = filepath.Clean(resolved)
 
 	for _, r := range roots {
 		if resolved == r.Path || strings.HasPrefix(resolved, r.Path+string(filepath.Separator)) {
-			return resolved, nil
+			return resolved, r, nil
 		}
 	}
-	return "", fmt.Errorf("path outside indexed workspaces: %s", rawPath)
+	return "", mcpRoot{}, fmt.Errorf("path outside indexed workspaces: %s", rawPath)
 }
 
 // windowContent slices full (by rune, i.e. by character, matching the
@@ -539,6 +702,10 @@ type embeddingStatus struct {
 }
 
 type indexStatusOutput struct {
+	// Mode is "read-write" normally, or "read-only" when another ney process
+	// held the writer lock at startup — in read-only mode this server never
+	// indexes, embeds, or watches, and serves the index as of startup.
+	Mode          string          `json:"mode"`
 	Workspaces    []workspaceInfo `json:"workspaces"`
 	Embedder      embedderStatus  `json:"embedder"`
 	Embedding     embeddingStatus `json:"embedding"`
@@ -558,7 +725,12 @@ func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, r
 			embed.Model = cfg.Embedder.Model
 		}
 
+		mode := "read-write"
+		if state.isReadOnly() {
+			mode = "read-only"
+		}
 		out := indexStatusOutput{
+			Mode:          mode,
 			Workspaces:    infos,
 			Embedder:      embed,
 			Embedding:     embeddingStatusFor(cfg, worker),
@@ -567,6 +739,7 @@ func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, r
 		}
 
 		var b strings.Builder
+		fmt.Fprintf(&b, "mode: %s\n", mode)
 		fmt.Fprintf(&b, "embedder: configured=%v", embed.Configured)
 		if embed.Model != "" {
 			fmt.Fprintf(&b, " model=%s", embed.Model)

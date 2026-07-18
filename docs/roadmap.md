@@ -7,7 +7,27 @@
 |---|---|
 | Current version | 0.1 (MVP) |
 | Status | Active |
-| Last updated | 2026-07-01 |
+| Last updated | 2026-07-19 |
+
+---
+
+## 2026-07-19 — MCP-first refocus (breaking)
+
+หลัง product review สรุปว่า differentiator จริงของ ney คือ **MCP server แบบ single-binary zero-config ที่ให้ AI client ค้น/อ่านเอกสาร local ได้อย่างปลอดภัย** จึงตัดฟีเจอร์ที่ซ้ำกับเครื่องมือที่ดีกว่าออก และเพิ่ม security:
+
+**ถอดออก:**
+- `ney ask` + chat providers ทั้งหมด (`internal/chat/`) — Claude ผ่าน MCP ตอบได้ดีกว่า local RAG chat; คนต้องการ RAG แบบ standalone ใช้ MCP client ใดก็ได้แทน
+- REPL / interactive mode + startup banner — ซ้ำกับ AI client ที่ต่อผ่าน MCP; `ney` เปล่าๆ แสดง help ปกติ
+- Git history loader (`loaders.git.recent_commits`) — `git log -S` และ agent ทำได้อยู่แล้ว
+
+**เพิ่ม:**
+- `internal/pathfilter` — deny list ในตัว (dotfiles + `*secret*`, `*credential*`, `*password*`, `*.key`, `*.pem`, `id_rsa*`, ...) บังคับใช้ทั้ง indexer, live scan, และ `read_document`; ผู้ใช้เพิ่ม pattern เองได้ผ่าน `index.exclude`
+- Read-only fallback — `ney mcp` ตัวที่สอง (เช่น Claude Desktop + Claude Code พร้อมกัน) เสิร์ฟ search/read จาก index เดิมแทนที่จะตายเพราะ writer lock; `index_status` รายงาน `mode: "read-only"`
+- `PRAGMA busy_timeout=5000` กัน SQLITE_BUSY ตอนสอง process เปิด DB พร้อมกัน
+
+**ตัดจากแผน:** REST API (`ney serve`) และ Web UI — พาไปแข่งในตลาดที่แออัด (AnythingLLM, Open WebUI) โดยไม่หนุน positioning หลัก; VS Code extension ยังอยู่ในแผน
+
+config เก่าที่ยังมี key `chat:`, `retrieval.max_context_chars`, `loaders.git` ยังโหลดได้ปกติ (viper ข้าม key ที่ไม่รู้จัก)
 
 ---
 

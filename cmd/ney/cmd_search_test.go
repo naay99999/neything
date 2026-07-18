@@ -141,7 +141,7 @@ func TestAppendLiveScanDedupesAndTagsSource(t *testing.T) {
 
 	// No workspace registered at all -> liveScanRoot falls back to scanning
 	// resolvedRoot directly (the "no covering workspace" branch).
-	got := appendLiveScan(context.Background(), db, existingGroups, "widget")
+	got := appendLiveScan(context.Background(), db, existingGroups, "widget", nil)
 
 	if len(got) != 2 {
 		t.Fatalf("expected 2 groups (1 index + 1 new live-scan hit), got %d: %+v", len(got), got)

@@ -8,6 +8,7 @@ import (
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/loader"
+	"github.com/naay99999/neything/internal/pathfilter"
 )
 
 // newLoaderRegistry builds the same loader set every indexing path uses
@@ -48,21 +49,27 @@ func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 		return nil, err
 	}
 
-	var gitHistory *loader.GitHistoryLoader
-	if cfg.Loaders.Git.RecentCommits > 0 {
-		gitHistory = loader.NewGitHistoryLoader(cfg.Loaders.Git.RecentCommits)
-	}
-
 	return &index.Indexer{
 		DB:            app.DB,
 		Vectors:       app.Vectors,
 		Embedder:      app.Embedder,
 		Loaders:       newLoaderRegistry(cfg),
-		GitHistory:    gitHistory,
+		Filter:        newPathFilter(cfg),
 		ChunkResolver: chunkResolver,
 		BatchSize:     32,
 		OnProgress: func(file string, chunks int) {
 			fmt.Fprintf(os.Stderr, "  indexed %s (%d chunks)\n", displayPath(file), chunks)
 		},
 	}, nil
+}
+
+// newPathFilter builds the shared secret/exclude filter from config. Config
+// validation already rejected malformed globs, so an error here (only
+// possible if cfg bypassed Validate) falls back to built-in rules via nil.
+func newPathFilter(cfg *config.Config) *pathfilter.Filter {
+	flt, err := pathfilter.New(cfg.Index.Exclude)
+	if err != nil {
+		return nil
+	}
+	return flt
 }

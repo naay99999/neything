@@ -45,7 +45,7 @@ func newMCPTestEnv(t *testing.T) *mcpTestEnv {
 		t.Fatal(err)
 	}
 
-	app, err := initAppWithOptions(cfg, false, false)
+	app, err := initAppWithOptions(cfg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +67,8 @@ func newMCPTestEnv(t *testing.T) *mcpTestEnv {
 	}
 
 	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
-	state := newServerState(rootNames(roots))
-	server := newMCPServer(app, cfg, state, roots, nil)
+	state := newServerState(rootNames(roots), false)
+	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
 
 	t1, t2 := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -211,7 +211,7 @@ func TestMCPSearchDocumentsLiveScanDuringPhaseA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false, false)
+	app, err := initAppWithOptions(cfg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,10 +226,10 @@ func TestMCPSearchDocumentsLiveScanDuringPhaseA(t *testing.T) {
 	// query that arrives while Phase A (marked below) is still in flight.
 
 	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
-	state := newServerState(rootNames(roots))
+	state := newServerState(rootNames(roots), false)
 	state.setPhaseA("corpus", true)
 
-	server := newMCPServer(app, cfg, state, roots, nil)
+	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
 	t1, t2 := mcp.NewInMemoryTransports()
 	ctx := context.Background()
 	if _, err := server.Connect(ctx, t1, nil); err != nil {
@@ -466,5 +466,160 @@ func TestMCPStdoutHygiene(t *testing.T) {
 	n, _ := r.Read(buf)
 	if n > 0 {
 		t.Fatalf("expected zero bytes on stdout, got %d: %q", n, buf[:n])
+	}
+}
+
+// --- read_document: secret-file deny --------------------------------------------
+
+func TestMCPReadDocumentDeniesSecretFiles(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	denied := []string{
+		filepath.Join(env.root, ".env"),
+		filepath.Join(env.root, "id_rsa"),
+		filepath.Join(env.root, "sub", "passwords.md"),
+		filepath.Join(env.root, ".ssh", "id_rsa"),
+	}
+	for _, p := range denied {
+		writeTestFile(t, p, "SECRET=verysecret")
+		msg := callToolExpectError(t, env, "read_document", readDocumentInput{Path: p})
+		if !strings.Contains(msg, "excluded by security policy") {
+			t.Errorf("expected security-policy rejection for %s, got: %s", p, msg)
+		}
+	}
+
+	// A normal file under the same root still reads fine.
+	out := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: filepath.Join(env.root, "notes.md")})
+	if !strings.Contains(out.Content, "order-1233") {
+		t.Fatalf("normal file should still be readable, got: %q", out.Content)
+	}
+}
+
+// --- read-only mode -------------------------------------------------------------
+
+func TestMCPReadOnlyModeIndexStatus(t *testing.T) {
+	env := newMCPTestEnvReadOnly(t)
+	out := callTool[indexStatusOutput](t, env, "index_status", indexStatusInput{})
+	if out.Mode != "read-only" {
+		t.Fatalf("expected mode=read-only, got %q", out.Mode)
+	}
+}
+
+func TestMCPReadWriteModeIndexStatus(t *testing.T) {
+	env := newMCPTestEnv(t)
+	out := callTool[indexStatusOutput](t, env, "index_status", indexStatusInput{})
+	if out.Mode != "read-write" {
+		t.Fatalf("expected mode=read-write, got %q", out.Mode)
+	}
+}
+
+// newMCPTestEnvReadOnly mirrors newMCPTestEnv but constructs the server the
+// way runMCP does when the writer lock was held: readOnly server state, no
+// indexer, no worker.
+func newMCPTestEnvReadOnly(t *testing.T) *mcpTestEnv {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "notes.md"), "read-only corpus note\n")
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := initAppWithOptions(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		app.DB.Close()
+		app.Vectors.Close()
+	})
+
+	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
+	state := newServerState(rootNames(roots), true)
+	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := server.Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	return &mcpTestEnv{cs: cs, app: app, state: state, root: resolvedRoot}
+}
+
+// --- search_folder: user-directed whole-home fallback ----------------------------
+
+func TestMCPSearchFolderFindsAndAllowsRead(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	// A folder OUTSIDE the served root but under $HOME (HOME is a temp dir in
+	// this env), simulating ~/Downloads.
+	home, _ := os.UserHomeDir()
+	downloads := filepath.Join(home, "Downloads")
+	target := filepath.Join(downloads, "thaibulk-submission.md")
+	writeTestFile(t, target, "thaibulk submission steps: register, verify sender, submit.\n")
+	writeTestFile(t, filepath.Join(downloads, "passwords.md"), "thaibulk password hunter2\n")
+
+	// Before discovery: read must be denied (outside every root).
+	msg := callToolExpectError(t, env, "read_document", readDocumentInput{Path: target})
+	if !strings.Contains(msg, "path outside indexed workspaces") {
+		t.Fatalf("expected outside-workspace rejection before discovery, got: %s", msg)
+	}
+
+	// User says "look in Downloads" -> search_folder.
+	out := callTool[searchFolderOutput](t, env, "search_folder", searchFolderInput{Path: downloads, Query: "thaibulk"})
+	if len(out.Results) != 1 {
+		t.Fatalf("expected exactly 1 hit (secret passwords.md must be hidden), got: %+v", out.Results)
+	}
+	if filepath.Base(out.Results[0].Path) != "thaibulk-submission.md" {
+		t.Fatalf("expected thaibulk-submission.md, got %s", out.Results[0].Path)
+	}
+
+	// After discovery: the surfaced file is readable.
+	read := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: target})
+	if !strings.Contains(read.Content, "verify sender") {
+		t.Fatalf("expected discovered file to be readable, got: %q", read.Content)
+	}
+
+	// But a sibling that was NOT surfaced still isn't.
+	other := filepath.Join(downloads, "unrelated.md")
+	writeTestFile(t, other, "nothing to do with the query")
+	msg = callToolExpectError(t, env, "read_document", readDocumentInput{Path: other})
+	if !strings.Contains(msg, "path outside indexed workspaces") {
+		t.Fatalf("expected undiscovered sibling to stay unreadable, got: %s", msg)
+	}
+}
+
+func TestMCPSearchFolderRejectsOutsideHome(t *testing.T) {
+	env := newMCPTestEnv(t)
+	msg := callToolExpectError(t, env, "search_folder", searchFolderInput{Path: "/etc", Query: "passwd"})
+	if !strings.Contains(msg, "outside the home directory") {
+		t.Fatalf("expected outside-home rejection for /etc, got: %s", msg)
+	}
+}
+
+func TestMCPSearchFolderNeverSurfacesSecrets(t *testing.T) {
+	env := newMCPTestEnv(t)
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, "stuff")
+	writeTestFile(t, filepath.Join(dir, ".env"), "TOKEN=widget\n")
+	writeTestFile(t, filepath.Join(dir, "widget-credentials.json"), `{"widget":1}`)
+	writeTestFile(t, filepath.Join(dir, ".ssh", "id_rsa"), "widget key\n")
+
+	out := callTool[searchFolderOutput](t, env, "search_folder", searchFolderInput{Path: dir, Query: "widget"})
+	if len(out.Results) != 0 {
+		t.Fatalf("secret files must never be surfaced, got: %+v", out.Results)
 	}
 }

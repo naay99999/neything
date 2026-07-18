@@ -3,7 +3,6 @@ module github.com/naay99999/neything
 go 1.26.4
 
 require (
-	github.com/chzyer/readline v1.5.1
 	github.com/coder/hnsw v0.6.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728

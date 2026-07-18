@@ -67,7 +67,10 @@ func Open(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	sqldb.SetMaxOpenConns(1)
-	if _, err := sqldb.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"); err != nil {
+	// busy_timeout: with WAL, a second process can open/read while a writer
+	// holds a write transaction (e.g. read-only `ney mcp` starting up while a
+	// read-write one is indexing) — wait briefly instead of failing SQLITE_BUSY.
+	if _, err := sqldb.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
 		sqldb.Close()
 		return nil, fmt.Errorf("set pragmas: %w", err)
 	}
