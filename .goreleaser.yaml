@@ -41,7 +41,7 @@ homebrew_casks:
     skip_upload: auto   # don't overwrite the cask from prerelease tags
     commit_msg_template: "ney {{ .Tag }}"
     homepage: "https://github.com/naay99999/neything"
-    description: "Local-first CLI knowledge engine — index files, search by meaning, ask questions with source citations"
+    description: "Local-first MCP server + CLI that gives AI clients search and read access to your local documents"
     hooks:
       post:
         # Go binaries are not notarized; strip the quarantine bit so

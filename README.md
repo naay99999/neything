@@ -139,7 +139,7 @@ ney doctor
 
 | Command | Description |
 |---|---|
-| `ney mcp` | Serve `search_documents`/`read_document`/`list_workspaces`/`index_status` over MCP (stdio) — see [MCP](#mcp--connect-your-ai) above |
+| `ney mcp` | Serve the six MCP tools (`search_documents`, `search_folder`, `index_folder`, `read_document`, `list_workspaces`, `index_status`) over stdio — see [MCP](#mcp--connect-your-ai) above |
 | `ney init` | Guided setup wizard — discover documents, OCR, AI clients, optional embedder |
 | `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`, ...); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
 | `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
