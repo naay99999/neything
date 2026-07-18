@@ -36,11 +36,26 @@ const (
 	maxReadChars      = 200000
 )
 
-// newMCPServer builds the MCP server and registers all 4 tools. Factored out
+// mcpDeps bundles everything the tool handlers need. ix/serialize/
+// startWatcher are nil in read-only mode (index_folder then always errors).
+type mcpDeps struct {
+	app          *AppState
+	cfg          *config.Config
+	state        *serverState
+	rs           *rootSet
+	worker       *index.EmbedWorker
+	flt          *pathfilter.Filter
+	ix           *index.Indexer
+	serialize    func(func())
+	startWatcher func(r mcpRoot, wsID int64, disablePrune bool)
+}
+
+// newMCPServer builds the MCP server and registers all 6 tools. Factored out
 // of runMCP so tests can construct one against an in-memory transport
 // (mcp.NewInMemoryTransports) without going through stdio or the CLI's
 // lockfile/signal-handling — see mcp_test.go.
-func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots []mcpRoot, worker *index.EmbedWorker, flt *pathfilter.Filter) *mcp.Server {
+func newMCPServer(deps mcpDeps) *mcp.Server {
+	app, cfg, state, worker, flt := deps.app, deps.cfg, deps.state, deps.worker, deps.flt
 	server := mcp.NewServer(&mcp.Implementation{Name: "ney", Version: Version}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -52,7 +67,16 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 			"(source: \"live-scan\") so filename/content matches show up even before that root finishes indexing. " +
 			"If nothing relevant is found here, do not give up: ask the user WHERE the file might live " +
 			"(Downloads? Desktop? Documents? a specific project folder?) and then call search_folder on that folder.",
-	}, searchDocumentsHandler(app, cfg, state, worker, roots, flt))
+	}, searchDocumentsHandler(app, cfg, state, worker, deps.rs, flt))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "index_folder",
+		Description: "Permanently index ONE folder (under the user's home or iCloud Drive) so its contents — " +
+			"including PDF/DOCX text — become fully searchable from now on, for every connected AI client. " +
+			"Use when the user wants a folder searchable long-term (\"index โฟลเดอร์นี้\", deep/recurring " +
+			"search needs); for a quick one-off lookup use search_folder instead. Indexing runs synchronously " +
+			"and may take a while on large folders. Unavailable while another ney process holds the writer lock.",
+	}, indexFolderHandler(deps))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search_folder",
@@ -74,7 +98,7 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 			"indexed root but hasn't been indexed yet. Allowed paths: inside a known workspace root, or " +
 			"files previously surfaced by a search_folder call this session; hidden files and secret-looking " +
 			"files (.env, keys, credentials, ...) are never served.",
-	}, readDocumentHandler(app, roots, flt, state))
+	}, readDocumentHandler(app, deps.rs, flt, state))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_workspaces",
@@ -86,7 +110,7 @@ func newMCPServer(app *AppState, cfg *config.Config, state *serverState, roots [
 		Description: "Report global indexing/embedding status: per-workspace counts, whether the embedder is " +
 			"configured, embedding progress/state, which roots are still on their initial scan, and whether " +
 			"filesystem watching is active. Cheap to poll instead of waiting for progress notifications.",
-	}, indexStatusHandler(app, cfg, state, roots, worker))
+	}, indexStatusHandler(app, cfg, state, worker))
 
 	return server
 }
@@ -122,7 +146,7 @@ type searchDocumentsOutput struct {
 	IndexStatus indexStatusBrief   `json:"index_status"`
 }
 
-func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, roots []mcpRoot, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
+func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, rs *rootSet, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchDocumentsInput) (*mcp.CallToolResult, searchDocumentsOutput, error) {
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, searchDocumentsOutput{}, fmt.Errorf("query is required")
@@ -160,7 +184,7 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 				Source:    "index",
 			}
 		}
-		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state, flt)
+		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, rs.snapshot(), state, flt)
 
 		chunkCount, _ := app.DB.CountChunks()
 		out := searchDocumentsOutput{
@@ -299,7 +323,7 @@ func searchFolderHandler(state *serverState, flt *pathfilter.Filter) mcp.ToolHan
 			return nil, searchFolderOutput{}, fmt.Errorf("path is required")
 		}
 
-		dir, err := resolveHomeBoundDir(in.Path)
+		dir, err := resolveAllowedScanDir(in.Path)
 		if err != nil {
 			return nil, searchFolderOutput{}, err
 		}
@@ -342,11 +366,93 @@ func searchFolderHandler(state *serverState, flt *pathfilter.Filter) mcp.ToolHan
 	}
 }
 
-// resolveHomeBoundDir resolves a client-supplied folder and requires it to be
-// the user's home directory or inside it — search_folder may roam the user's
-// files when the user directs it there, but never system paths, other users'
-// homes, or mounted volumes.
-func resolveHomeBoundDir(raw string) (string, error) {
+// --- index_folder --------------------------------------------------------------
+
+type indexFolderInput struct {
+	Path string `json:"path" jsonschema:"folder to index permanently (absolute or ~-relative; must be under the user's home directory or iCloud Drive)"`
+}
+
+type indexFolderOutput struct {
+	Workspace    string `json:"workspace"`
+	FilesScanned int    `json:"files_scanned"`
+	Chunks       int    `json:"chunks"`
+	DurationMS   int64  `json:"duration_ms"`
+}
+
+// indexFolderHandler indexes a folder into a permanent workspace
+// mid-session: served to every AI client from now on (the workspace table is
+// the source of truth), readable immediately (dynamic root set), watched for
+// changes for the rest of this session.
+func indexFolderHandler(deps mcpDeps) mcp.ToolHandlerFor[indexFolderInput, indexFolderOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in indexFolderInput) (*mcp.CallToolResult, indexFolderOutput, error) {
+		if strings.TrimSpace(in.Path) == "" {
+			return nil, indexFolderOutput{}, fmt.Errorf("path is required")
+		}
+		if deps.state.isReadOnly() || deps.ix == nil {
+			return nil, indexFolderOutput{}, fmt.Errorf(
+				"this server is read-only (another ney process holds the writer lock) — close it and retry, or use search_folder for a one-off scan")
+		}
+
+		dir, err := resolveAllowedScanDir(in.Path)
+		if err != nil {
+			return nil, indexFolderOutput{}, err
+		}
+
+		name := filepath.Base(dir)
+		existing, err := deps.app.DB.GetWorkspaceByName(name)
+		if err != nil {
+			return nil, indexFolderOutput{}, err
+		}
+		if existing != nil && resolveRootBestEffort(existing.RootPath) != dir {
+			return nil, indexFolderOutput{}, fmt.Errorf(
+				"workspace %q is already bound to %s — index it from the CLI with `ney index %s --workspace <other-name>` instead",
+				name, existing.RootPath, in.Path)
+		}
+
+		wsID, err := deps.app.DB.UpsertWorkspace(name, dir)
+		if err != nil {
+			return nil, indexFolderOutput{}, err
+		}
+
+		deps.state.setPhaseA(name, true)
+		var stats *index.Stats
+		var ierr error
+		deps.serialize(func() {
+			stats, ierr = deps.ix.Index(ctx, dir, name)
+		})
+		deps.state.setPhaseA(name, false)
+		if ierr != nil {
+			return nil, indexFolderOutput{}, fmt.Errorf("index %s: %w", dir, ierr)
+		}
+		if deps.worker != nil {
+			deps.worker.Notify()
+		}
+
+		root := mcpRoot{Name: name, Path: dir}
+		deps.rs.add(root)
+		if deps.startWatcher != nil {
+			deps.startWatcher(root, wsID, true)
+		}
+
+		out := indexFolderOutput{
+			Workspace:    name,
+			FilesScanned: stats.FilesScanned,
+			Chunks:       stats.ChunksCreated,
+			DurationMS:   stats.Duration.Milliseconds(),
+		}
+		text := fmt.Sprintf("Indexed %s as workspace %q: %d files, %d chunks (%.1fs). "+
+			"Its contents are now searchable via search_documents and readable via read_document — for every connected client, permanently.",
+			dir, name, out.FilesScanned, out.Chunks, stats.Duration.Seconds())
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// resolveAllowedScanDir resolves a client-supplied folder and requires it to
+// be inside the user's home directory (which on macOS includes iCloud Drive,
+// under ~/Library/Mobile Documents) — search_folder/index_folder may roam
+// the user's files when the user directs them there, but never system paths,
+// other users' homes, or mounted volumes.
+func resolveAllowedScanDir(raw string) (string, error) {
 	p := expandTilde(raw)
 	if !filepath.IsAbs(p) {
 		abs, err := filepath.Abs(p)
@@ -396,12 +502,12 @@ type readDocumentOutput struct {
 	Source     string `json:"source"` // file | chunks | fresh-parse
 }
 
-func readDocumentHandler(app *AppState, roots []mcpRoot, flt *pathfilter.Filter, state *serverState) mcp.ToolHandlerFor[readDocumentInput, readDocumentOutput] {
+func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, state *serverState) mcp.ToolHandlerFor[readDocumentInput, readDocumentOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in readDocumentInput) (*mcp.CallToolResult, readDocumentOutput, error) {
 		if strings.TrimSpace(in.Path) == "" {
 			return nil, readDocumentOutput{}, fmt.Errorf("path is required")
 		}
-		resolved, root, err := resolveAllowedPath(in.Path, roots)
+		resolved, root, err := resolveAllowedPath(in.Path, rs.snapshot())
 		if err != nil {
 			// Outside every served root — still allowed IF a user-directed
 			// search_folder call surfaced this exact file earlier in the
@@ -713,7 +819,7 @@ type indexStatusOutput struct {
 	Watching      bool            `json:"watching"`
 }
 
-func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, roots []mcpRoot, worker *index.EmbedWorker) mcp.ToolHandlerFor[indexStatusInput, indexStatusOutput] {
+func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker) mcp.ToolHandlerFor[indexStatusInput, indexStatusOutput] {
 	return func(_ context.Context, _ *mcp.CallToolRequest, _ indexStatusInput) (*mcp.CallToolResult, indexStatusOutput, error) {
 		infos, err := computeWorkspaceInfo(app)
 		if err != nil {

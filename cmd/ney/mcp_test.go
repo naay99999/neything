@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -68,7 +69,7 @@ func newMCPTestEnv(t *testing.T) *mcpTestEnv {
 
 	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
 	state := newServerState(rootNames(roots), false)
-	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
+	server := newMCPServer(mcpDeps{app: app, cfg: cfg, state: state, rs: newRootSet(roots), flt: newPathFilter(cfg)})
 
 	t1, t2 := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -229,7 +230,7 @@ func TestMCPSearchDocumentsLiveScanDuringPhaseA(t *testing.T) {
 	state := newServerState(rootNames(roots), false)
 	state.setPhaseA("corpus", true)
 
-	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
+	server := newMCPServer(mcpDeps{app: app, cfg: cfg, state: state, rs: newRootSet(roots), flt: newPathFilter(cfg)})
 	t1, t2 := mcp.NewInMemoryTransports()
 	ctx := context.Background()
 	if _, err := server.Connect(ctx, t1, nil); err != nil {
@@ -542,7 +543,7 @@ func newMCPTestEnvReadOnly(t *testing.T) *mcpTestEnv {
 
 	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
 	state := newServerState(rootNames(roots), true)
-	server := newMCPServer(app, cfg, state, roots, nil, newPathFilter(cfg))
+	server := newMCPServer(mcpDeps{app: app, cfg: cfg, state: state, rs: newRootSet(roots), flt: newPathFilter(cfg)})
 
 	t1, t2 := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -621,5 +622,132 @@ func TestMCPSearchFolderNeverSurfacesSecrets(t *testing.T) {
 	out := callTool[searchFolderOutput](t, env, "search_folder", searchFolderInput{Path: dir, Query: "widget"})
 	if len(out.Results) != 0 {
 		t.Fatalf("secret files must never be surfaced, got: %+v", out.Results)
+	}
+}
+
+// --- index_folder ----------------------------------------------------------------
+
+// newMCPTestEnvIndexable builds an env whose deps include a live indexer +
+// serialize, as runMCP wires in read-write mode — required by index_folder.
+func newMCPTestEnvIndexable(t *testing.T) *mcpTestEnv {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := initAppWithOptions(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		app.DB.Close()
+		app.Vectors.Close()
+	})
+
+	ix, err := newIndexer(app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	state := newServerState(nil, false)
+	server := newMCPServer(mcpDeps{
+		app: app, cfg: cfg, state: state, rs: newRootSet(nil),
+		flt: newPathFilter(cfg), ix: ix,
+		serialize: func(run func()) { mu.Lock(); defer mu.Unlock(); run() },
+	})
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := server.Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	home, _ := os.UserHomeDir()
+	return &mcpTestEnv{cs: cs, app: app, state: state, root: home}
+}
+
+func TestMCPIndexFolderMakesFolderSearchableAndReadable(t *testing.T) {
+	env := newMCPTestEnvIndexable(t)
+
+	home, _ := os.UserHomeDir()
+	folder := filepath.Join(home, "reports")
+	target := filepath.Join(folder, "q3-summary.md")
+	writeTestFile(t, target, "Quarterly zebra-metrics grew 42 percent.\n")
+	writeTestFile(t, filepath.Join(folder, "secrets.md"), "zebra password\n")
+
+	out := callTool[indexFolderOutput](t, env, "index_folder", indexFolderInput{Path: folder})
+	if out.Workspace != "reports" || out.FilesScanned != 1 || out.Chunks == 0 {
+		t.Fatalf("unexpected index result: %+v", out)
+	}
+
+	// Content searchable via the normal index path.
+	res := callTool[searchDocumentsOutput](t, env, "search_documents", searchDocumentsInput{Query: "zebra-metrics"})
+	found := false
+	for _, r := range res.Results {
+		if strings.Contains(r.Path, "q3-summary.md") && r.Source == "index" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected indexed hit for q3-summary.md, got %+v", res.Results)
+	}
+
+	// Readable immediately — the dynamic root set admitted the new root.
+	read := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: target})
+	if !strings.Contains(read.Content, "42 percent") {
+		t.Fatalf("expected file content, got %q", read.Content)
+	}
+
+	// Secret file under the new root: indexed never, read denied.
+	msg := callToolExpectError(t, env, "read_document", readDocumentInput{Path: filepath.Join(folder, "secrets.md")})
+	if !strings.Contains(msg, "excluded by security policy") {
+		t.Fatalf("expected security rejection, got: %s", msg)
+	}
+
+	// Idempotent re-index: second call succeeds with skips, no error.
+	again := callTool[indexFolderOutput](t, env, "index_folder", indexFolderInput{Path: folder})
+	if again.Workspace != "reports" {
+		t.Fatalf("re-index should reuse the workspace, got %+v", again)
+	}
+}
+
+func TestMCPIndexFolderRejectsReadOnly(t *testing.T) {
+	env := newMCPTestEnvReadOnly(t)
+	home, _ := os.UserHomeDir()
+	msg := callToolExpectError(t, env, "index_folder", indexFolderInput{Path: home})
+	if !strings.Contains(msg, "read-only") {
+		t.Fatalf("expected read-only rejection, got: %s", msg)
+	}
+}
+
+func TestMCPIndexFolderRejectsOutsideHome(t *testing.T) {
+	env := newMCPTestEnvIndexable(t)
+	msg := callToolExpectError(t, env, "index_folder", indexFolderInput{Path: "/etc"})
+	if !strings.Contains(msg, "outside the home directory") {
+		t.Fatalf("expected outside-home rejection, got: %s", msg)
+	}
+}
+
+func TestMCPIndexFolderRejectsNameCollision(t *testing.T) {
+	env := newMCPTestEnvIndexable(t)
+	home, _ := os.UserHomeDir()
+	folder := filepath.Join(home, "sub", "notes")
+	writeTestFile(t, filepath.Join(folder, "a.md"), "hello\n")
+	// Same basename already bound to a different path.
+	if _, err := env.app.DB.UpsertWorkspace("notes", "/somewhere/else/notes"); err != nil {
+		t.Fatal(err)
+	}
+	msg := callToolExpectError(t, env, "index_folder", indexFolderInput{Path: folder})
+	if !strings.Contains(msg, "already bound") {
+		t.Fatalf("expected collision rejection, got: %s", msg)
 	}
 }

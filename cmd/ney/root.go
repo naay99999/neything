@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/naay99999/neything/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -62,6 +65,19 @@ func Execute() error {
 }
 
 func main() {
+	// Bare `ney` on a machine that has never completed setup offers the
+	// wizard (interactive terminals only); everywhere else it falls through
+	// to cobra's help.
+	if len(os.Args) == 1 && !setupCompleted() && isatty.IsTerminal(os.Stdin.Fd()) {
+		ans := strings.ToLower(promptLine("Ney ยังไม่ได้ตั้งค่าบนเครื่องนี้ — เริ่ม setup เลยไหม? [Y/n] "))
+		if ans == "" || strings.HasPrefix(ans, "y") {
+			if err := runSetupWizard(context.Background()); err != nil {
+				printCLIError(err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
 	if err := Execute(); err != nil {
 		printCLIError(err)
 		os.Exit(1)

@@ -6,7 +6,7 @@
 claude mcp add ney -- ney mcp --root ~/docs
 ```
 
-That's it — your AI can now search and read everything under `~/docs`. Works out of the box with **zero configuration**: no model server, no API key. Keyword search is available the moment the server starts; add a local embedder later (`ney init`) for semantic search.
+Or better: just install and type `ney` — the **setup wizard** scans your machine for documents (Home + iCloud Drive), lets you pick what to index, sets up OCR for scanned PDFs, and registers ney with your AI clients (Claude Desktop, Claude Code, Codex) automatically. Zero configuration required: no model server, no API key. Keyword search works the moment the server starts; add a local embedder later (`ney init`) for semantic search.
 
 ---
 
@@ -79,7 +79,7 @@ claude mcp add ney -- ney mcp --root ~/docs
 }
 ```
 
-`ney mcp` serves five tools over stdio: `search_documents`, `search_folder`, `read_document`, `list_workspaces`, `index_status`. `search_folder` is the whole-machine fallback: when the index has no match, the AI asks you where the file might be (Downloads? Desktop?) and live-scans that folder on demand — bounded, home-directory-only, and secret-blind like everything else; files it surfaces become readable via `read_document` for the session. Omit `--root` to serve whatever workspaces are already in `~/.ney/index.db` from prior `ney index` runs; pass one or more `--root <path>` to index+serve fresh folders.
+`ney mcp` serves six tools over stdio: `search_documents`, `search_folder`, `index_folder`, `read_document`, `list_workspaces`, `index_status`. `search_folder` is the whole-machine fallback: when the index has no match, the AI asks you where the file might be (Downloads? Desktop?) and live-scans that folder on demand — bounded, home-directory-only, and secret-blind like everything else; files it surfaces become readable via `read_document` for the session. `index_folder` goes further: ask your AI to "index this folder" and it becomes a permanent workspace — fully content-searchable (including PDF/DOCX) and served to every connected client from then on, no config edits or restarts. Omit `--root` to serve whatever workspaces are already in `~/.ney/index.db` from prior `ney index` runs; pass one or more `--root <path>` to index+serve fresh folders.
 
 ### Security
 
@@ -92,13 +92,21 @@ Ney is built to hand an AI *your documents* — not your secrets, and not the re
 
 ### Concurrent access
 
-Only one writer process (`index`, `watch`, `mcp`, `reset`) holds `~/.ney/writer.lock` at a time. If a second `ney mcp` starts while one is already running — say Claude Desktop and Claude Code both spawn one — the second **serves read-only** instead of failing: search and read work off the existing index (as of its startup), while indexing/embedding/watching stay with the first process. `index_status` reports `mode: "read-only"` so clients can tell. `ney index`/`ney reset` from another terminal still fail fast with the holder's pid rather than racing a vector-file write. Read-only commands (`search`, `status`) never need the lock.
+Only one writer process (`index`, `watch`, `mcp`, `reset`) holds `~/.ney/writer.lock` at a time. If a second `ney mcp` starts while one is already running — say Claude Desktop and Claude Code both spawn one — the second **serves read-only** instead of failing: search and read work off the existing index (as of its startup), while indexing/embedding/watching stay with the first process. `index_status` reports `mode: "read-only"` so clients can tell, and `index_folder` is declined in that mode (search/read still work). `ney index`/`ney reset` from another terminal still fail fast with the holder's pid rather than racing a vector-file write. Read-only commands (`search`, `status`) never need the lock.
 
 ---
 
 ## CLI
 
-The same engine is usable directly from the terminal:
+The same engine is usable directly from the terminal. First run:
+
+```bash
+ney            # no arguments — offers the guided setup wizard
+```
+
+The wizard scans Home + iCloud Drive for document clusters, indexes the folders you pick, offers to install OCR tools (`brew install tesseract poppler tesseract-lang`, Thai+English enabled by default), and registers ney with the AI clients found on your machine. Rerun it anytime with `ney init`.
+
+Manual usage:
 
 ```bash
 ney index ~/my-notes
@@ -132,7 +140,7 @@ ney doctor
 | Command | Description |
 |---|---|
 | `ney mcp` | Serve `search_documents`/`read_document`/`list_workspaces`/`index_status` over MCP (stdio) — see [MCP](#mcp--connect-your-ai) above |
-| `ney init` | Interactive setup — detects Ollama/LM Studio, picks an embedding model, writes the config |
+| `ney init` | Guided setup wizard — discover documents, OCR, AI clients, optional embedder |
 | `ney index <path>` | Index files recursively (`.md`, `.pdf`, `.docx`, ...); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
 | `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
 | `ney search "<query>"` | Search — semantic + keyword combined (`retrieval.mode: auto`), grouped by file with snippets; live-scans folders that aren't indexed yet |

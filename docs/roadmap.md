@@ -29,6 +29,13 @@
 
 config เก่าที่ยังมี key `chat:`, `retrieval.max_context_chars`, `loaders.git` ยังโหลดได้ปกติ (viper ข้าม key ที่ไม่รู้จัก)
 
+## 2026-07-19 (ภาค 2) — First-run setup wizard + index_folder
+
+- **Setup wizard**: `ney` เปล่าๆ บนเครื่องใหม่ (หรือ `ney init`) → สแกน Home + iCloud Drive หาจุดที่เอกสารกระจุก (`internal/discover`, concentration heuristic) → เลือกโฟลเดอร์ → เสนอติดตั้ง OCR ผ่าน brew (tha+eng) → ลงทะเบียน Claude Desktop / Claude Code / Codex อัตโนมัติแบบถามรายตัว (backup .bak เสมอ, ไม่ทับไฟล์ที่ parse ไม่ได้) → embedder เป็น optional
+- **Source of truth = ตาราง workspaces**: client ทุกตัวลงทะเบียนแบบไม่มี args (`ney mcp`) จึงเห็นชุดเดียวกันเสมอ
+- **Tool ที่ 6 `index_folder`**: สั่ง AI ให้ index โฟลเดอร์เพิ่มได้กลาง session — เป็น workspace ถาวร, อ่านได้ทันที (dynamic rootSet), เปิด watcher ให้, จำกัด home+iCloud + secret deny เหมือนเดิม
+- Spec: `docs/superpowers/specs/2026-07-19-first-run-setup-design.md`
+
 ---
 
 ## MVP v0.1 — Done ✓

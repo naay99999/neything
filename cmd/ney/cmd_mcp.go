@@ -82,22 +82,71 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 
 	state := newServerState(rootNames(roots), readOnly)
+	rs := newRootSet(roots)
 
 	var worker *index.EmbedWorker
 	if app.Embedder != nil && !readOnly {
 		worker = &index.EmbedWorker{DB: app.DB, Vectors: app.Vectors, Embedder: app.Embedder}
 	}
 
-	server := newMCPServer(app, cfg, state, roots, worker, newPathFilter(cfg))
-
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// indexMu serializes every Indexer invocation across Phase A and every
-	// root's watcher — Watcher.Serialize routes through it too, matching the
-	// single shared mutex the design calls for (§7.4).
+	// indexMu serializes every Indexer invocation across Phase A, every
+	// root's watcher, and mid-session index_folder calls — Watcher.Serialize
+	// routes through it too, matching the single shared mutex the design
+	// calls for (§7.4).
 	var indexMu sync.Mutex
 	var wg sync.WaitGroup
+	serialize := func(run func()) {
+		indexMu.Lock()
+		defer indexMu.Unlock()
+		run()
+	}
+
+	var ix *index.Indexer
+	if !readOnly {
+		ix, err = newIndexer(app, cfg)
+		if err != nil {
+			return err
+		}
+	}
+
+	// startWatcher spawns one debounced re-index watcher for a root. Used
+	// for every startup root and for roots added mid-session by
+	// index_folder. Prune is centralized on the first startup watcher only
+	// (disablePrune elsewhere) per §7.4.
+	startWatcher := func(r mcpRoot, wsID int64, disablePrune bool) {
+		w := &watch.Watcher{
+			Indexer:      ix,
+			RootPath:     r.Path,
+			WorkspaceID:  wsID,
+			DisablePrune: disablePrune,
+			Serialize:    serialize,
+		}
+		if worker != nil {
+			w.OnFlush = worker.Notify
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, werr := w.Run(ctx); werr != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "warning: watcher %s: %v\n", w.RootPath, werr)
+			}
+		}()
+	}
+
+	server := newMCPServer(mcpDeps{
+		app:          app,
+		cfg:          cfg,
+		state:        state,
+		rs:           rs,
+		worker:       worker,
+		flt:          newPathFilter(cfg),
+		ix:           ix,
+		serialize:    serialize,
+		startWatcher: startWatcher,
+	})
 
 	if readOnly {
 		// Serving without the writer lock: search/read work off the existing
@@ -122,11 +171,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		ix, ierr := newIndexer(app, cfg)
-		if ierr != nil {
-			return ierr
-		}
-
 		// (a) Phase A of each root, sequentially, so a big corpus doesn't
 		// starve the others — each root's tool calls are already served
 		// (FTS/tier-0-ish partial results) while later roots are still being
@@ -162,37 +206,14 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			}()
 		}
 
-		// (c) one watcher per root. Prune is centralized on the first watcher
-		// only (DisablePrune on the rest) per §7.4 — an external owner (this
-		// server) is expected to centralize pruning rather than each Watcher
-		// running its own ticker.
+		// (c) one watcher per root.
 		for i, r := range roots {
 			wsID, werr := app.DB.UpsertWorkspace(r.Name, r.Path)
 			if werr != nil {
 				fmt.Fprintf(os.Stderr, "warning: watch %s: %v\n", r.Name, werr)
 				continue
 			}
-			w := &watch.Watcher{
-				Indexer:      ix,
-				RootPath:     r.Path,
-				WorkspaceID:  wsID,
-				DisablePrune: i != 0,
-				Serialize: func(run func()) {
-					indexMu.Lock()
-					defer indexMu.Unlock()
-					run()
-				},
-			}
-			if worker != nil {
-				w.OnFlush = worker.Notify
-			}
-			wg.Add(1)
-			go func(w *watch.Watcher) {
-				defer wg.Done()
-				if _, werr := w.Run(ctx); werr != nil && ctx.Err() == nil {
-					fmt.Fprintf(os.Stderr, "warning: watcher %s: %v\n", w.RootPath, werr)
-				}
-			}(w)
+			startWatcher(r, wsID, i != 0)
 		}
 		if len(roots) > 0 {
 			state.setWatching(true)
@@ -318,6 +339,37 @@ func rootNames(roots []mcpRoot) []string {
 		names[i] = r.Name
 	}
 	return names
+}
+
+// rootSet is the live set of served roots. It starts as the startup roots
+// and grows when index_folder adds a workspace mid-session — read_document
+// containment and live-scan targeting consult snapshots of it, so a newly
+// indexed folder becomes readable without a server restart.
+type rootSet struct {
+	mu    sync.Mutex
+	roots []mcpRoot
+}
+
+func newRootSet(roots []mcpRoot) *rootSet {
+	return &rootSet{roots: append([]mcpRoot(nil), roots...)}
+}
+
+func (rs *rootSet) snapshot() []mcpRoot {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return append([]mcpRoot(nil), rs.roots...)
+}
+
+// add appends r unless a root with the same name is already present.
+func (rs *rootSet) add(r mcpRoot) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, existing := range rs.roots {
+		if existing.Name == r.Name {
+			return
+		}
+	}
+	rs.roots = append(rs.roots, r)
 }
 
 // serverState tracks the parts of `ney mcp`'s background work that
