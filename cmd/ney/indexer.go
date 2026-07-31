@@ -15,24 +15,12 @@ import (
 // (order matters for .md sniffing — see CLAUDE.md). Factored out of
 // newIndexer so `ney mcp`'s read_document tool can reuse it for fresh-parse
 // of not-yet-indexed files without duplicating the loader list.
-func newLoaderRegistry(cfg *config.Config) loader.Registry {
-	ocrCfg := loader.OCRConfig{
-		Enabled:      cfg.Loaders.OCR.Enabled,
-		Lang:         cfg.Loaders.OCR.Lang,
-		TesseractCmd: cfg.Loaders.OCR.TesseractCmd,
-		PdftoppmCmd:  cfg.Loaders.OCR.PdftoppmCmd,
-		MinChars:     cfg.Loaders.OCR.MinChars,
-	}
-
+func newLoaderRegistry(_ *config.Config) loader.Registry {
 	return loader.NewRegistry(
 		&loader.NotionLoader{},
 		&loader.ObsidianLoader{},
 		&loader.MarkdownLoader{},
-		&loader.HTMLLoader{},
-		&loader.JSONLoader{},
-		&loader.ConfluenceLoader{},
-		&loader.PDFLoader{OCR: loader.NewOCRRunner(ocrCfg, nil)},
-		&loader.DOCXLoader{},
+		&loader.TextLoader{},
 	)
 }
 

@@ -54,12 +54,7 @@ type Indexer struct {
 var supportedExts = map[string]bool{
 	".md":       true,
 	".markdown": true,
-	".pdf":      true,
-	".docx":     true,
-	".html":     true,
-	".htm":      true,
-	".json":     true,
-	".xml":      true,
+	".txt":      true,
 }
 
 // walkIndexable walks root, applying dir/file exclusion (ix.Filter, nil-safe:

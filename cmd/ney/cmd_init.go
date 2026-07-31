@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,14 +12,13 @@ import (
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/discover"
 	"github.com/naay99999/neything/internal/lockfile"
-	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/spf13/cobra"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Guided setup — discover documents, set up OCR, connect AI clients",
+	Short: "Guided setup — discover documents, connect AI clients",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runSetupWizard(cmd.Context())
 	},
@@ -65,13 +63,11 @@ func runSetupWizard(ctx context.Context) error {
 		return err
 	}
 
-	ocrEnabled := stepOCR()
-
 	stepClients()
 
 	w := stepEmbedder()
 
-	if err := writeSetupConfig(w, ocrEnabled); err != nil {
+	if err := writeSetupConfig(w); err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -102,7 +98,7 @@ func runSetupWizard(ctx context.Context) error {
 // --- step 1: folder discovery ---------------------------------------------------
 
 func stepFolders(ctx context.Context) ([]string, error) {
-	fmt.Println(Bold("[1/4] สแกนหาเอกสารในเครื่อง (Home + iCloud Drive)"))
+	fmt.Println(Bold("[1/3] สแกนหาเอกสารในเครื่อง (Home + iCloud Drive)"))
 	fmt.Println(Dim("      ข้ามโฟลเดอร์ระบบ/ซ่อน/secret อัตโนมัติ — อาจใช้เวลาสักครู่"))
 
 	cands, err := discover.Discover(ctx, discover.Options{}, func(dirs int) {
@@ -206,54 +202,11 @@ func summarizeExts(total int, byExt map[string]int) string {
 	return fmt.Sprintf("%d ไฟล์ (%s)", total, strings.Join(parts, ", "))
 }
 
-// --- step 2: OCR ----------------------------------------------------------------
-
-// stepOCR checks for the external OCR tools, offering a brew install when
-// they're missing. Returns whether OCR should be enabled in the config.
-// Never blocks setup: no brew / declined / failed → OCR stays off with
-// instructions printed.
-func stepOCR() bool {
-	fmt.Println()
-	fmt.Println(Bold("[2/4] OCR สำหรับ PDF สแกน (อ่านข้อความจากเอกสารที่เป็นภาพ)"))
-
-	probe := loader.OCRConfig{Enabled: true, TesseractCmd: "tesseract", PdftoppmCmd: "pdftoppm"}
-	if ok, _ := loader.OCRToolsAvailable(probe); ok {
-		fmt.Println(Green("      ✓ พบ tesseract/poppler แล้ว — เปิด OCR ภาษาไทย+อังกฤษให้เลย"))
-		return true
-	}
-
-	if _, err := exec.LookPath("brew"); err != nil {
-		fmt.Println(Yellow("      ยังไม่มี OCR tools และไม่พบ Homebrew — ติดตั้งเองแล้วรัน `ney init` ใหม่:"))
-		fmt.Println(Dim("      brew install tesseract poppler tesseract-lang"))
-		return false
-	}
-
-	ans := strings.ToLower(promptDefault("      ยังไม่พบ tesseract/poppler — ติดตั้งเลยไหม (brew install tesseract poppler tesseract-lang)? (y/n)", "y"))
-	if !strings.HasPrefix(ans, "y") {
-		fmt.Println(Dim("      ข้าม — เปิดทีหลังได้ด้วย `ney init`"))
-		return false
-	}
-
-	cmd := exec.Command("brew", "install", "tesseract", "poppler", "tesseract-lang")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Println(Yellow("      brew install ล้มเหลว: " + err.Error() + " — เปิดทีหลังได้ด้วย `ney init`"))
-		return false
-	}
-	if ok, msg := loader.OCRToolsAvailable(probe); !ok {
-		fmt.Println(Yellow("      ติดตั้งแล้วแต่ยังใช้ไม่ได้: " + msg))
-		return false
-	}
-	fmt.Println(Green("      ✓ ติดตั้งสำเร็จ — เปิด OCR ภาษาไทย+อังกฤษให้แล้ว"))
-	return true
-}
-
-// --- step 3: AI clients ---------------------------------------------------------
+// --- step 2: AI clients ---------------------------------------------------------
 
 func stepClients() {
 	fmt.Println()
-	fmt.Println(Bold("[3/4] เชื่อมกับ AI clients"))
+	fmt.Println(Bold("[2/3] เชื่อมกับ AI clients"))
 
 	neyBin, err := os.Executable()
 	if err == nil {
@@ -290,11 +243,11 @@ func indentLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-// --- step 4: optional embedder --------------------------------------------------
+// --- step 3: optional embedder --------------------------------------------------
 
 func stepEmbedder() *wizardChoice {
 	fmt.Println()
-	fmt.Println(Bold("[4/4] Semantic search (optional)"))
+	fmt.Println(Bold("[3/3] Semantic search (optional)"))
 	fmt.Println(Dim("      ค้นเชิงความหมายด้วย embedding model ในเครื่อง (Ollama/LM Studio) หรือ cloud"))
 	fmt.Println(Dim("      ไม่ตั้งก็ใช้ได้เต็มรูปแบบ — ค้นแบบ keyword ทำงานในเครื่อง 100%"))
 	ans := promptLine(Cyan("      ตั้งค่าเลยไหม? [Enter=ข้าม / y=ตั้งค่า] "))
@@ -473,7 +426,7 @@ func normalizeEndpoint(s string) string {
 
 // writeSetupConfig writes ~/.ney/config.yaml from the wizard's choices,
 // backing up any existing config first. embedder may be nil (keyword-only).
-func writeSetupConfig(w *wizardChoice, ocrEnabled bool) error {
+func writeSetupConfig(w *wizardChoice) error {
 	if err := os.MkdirAll(config.NeyDir(), 0o700); err != nil {
 		return err
 	}
@@ -507,11 +460,10 @@ index:
   exclude: []
 
 chunking:
-  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer | page
+  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
   target_chars: 1200
   overlap_chars: 150
 `)
-	fmt.Fprintf(&b, "\nloaders:\n  ocr:\n    enabled: %v\n    lang: tha+eng\n    min_chars: 32\n", ocrEnabled)
 	b.WriteString("\n# privacy — off by default\ntelemetry: false\n")
 
 	if err := os.WriteFile(cfgPath, []byte(b.String()), 0o600); err != nil {

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
-	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -98,38 +97,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	results = append(results, checkResult{
 		Check:   "loaders",
 		OK:      true,
-		Message: "Supported formats: .md, .pdf, .docx, .html, .json, .xml (+ Obsidian/Notion .md, Confluence .xml)",
+		Message: "Supported formats: .md, .markdown, .txt (+ Obsidian/Notion .md)",
 	})
-
-	if cfg.Loaders.OCR.Enabled {
-		ocrCfg := loader.OCRConfig{
-			Enabled:      cfg.Loaders.OCR.Enabled,
-			Lang:         cfg.Loaders.OCR.Lang,
-			TesseractCmd: cfg.Loaders.OCR.TesseractCmd,
-			PdftoppmCmd:  cfg.Loaders.OCR.PdftoppmCmd,
-			MinChars:     cfg.Loaders.OCR.MinChars,
-		}
-		if ok, msg := loader.OCRToolsAvailable(ocrCfg); ok {
-			results = append(results, checkResult{
-				Check:   "ocr_tools",
-				OK:      true,
-				Message: "OCR enabled — pdftoppm and tesseract available",
-			})
-		} else {
-			results = append(results, checkResult{
-				Check:   "ocr_tools",
-				OK:      false,
-				Message: "OCR enabled but tools missing: " + msg,
-				Hint:    "Install: brew install tesseract poppler (or set loaders.ocr.enabled: false)",
-			})
-		}
-	} else {
-		results = append(results, checkResult{
-			Check:   "ocr_tools",
-			OK:      true,
-			Message: "OCR disabled (default)",
-		})
-	}
 
 	// 2. Embedder is not Claude, and an informational note when unconfigured
 	switch {

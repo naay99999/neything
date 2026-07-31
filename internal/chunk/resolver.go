@@ -60,14 +60,10 @@ func NewResolver(strategy string, targetChars, overlapChars, targetTokens, overl
 
 func defaultByFormat() map[string]string {
 	return map[string]string{
-		"md":         "markdown",
-		"obsidian":   "markdown",
-		"notion":     "markdown",
-		"pdf":        "page",
-		"docx":       "paragraph",
-		"html":       "paragraph",
-		"json":       "character",
-		"confluence": "paragraph",
-		"git":        "paragraph",
+		"md":       "markdown",
+		"obsidian": "markdown",
+		"notion":   "markdown",
+		"txt":      "paragraph",
+		"git":      "paragraph",
 	}
 }

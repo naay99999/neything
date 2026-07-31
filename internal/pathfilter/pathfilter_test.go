@@ -25,7 +25,7 @@ func TestExcludedFileDeniesSecrets(t *testing.T) {
 func TestExcludedFileAllowsNormalFiles(t *testing.T) {
 	allowed := []string{
 		"notes.md", "tokenizer.md", "keyboard.md", "README.md",
-		"invoice-1233.pdf", "report.docx", "data.json", "envelope.md",
+		"invoice-1233.pdf", "report.rtf", "data.json", "envelope.md",
 		"monkey.md", // contains "key" but doesn't match *.key or *apikey*
 	}
 	var f *Filter

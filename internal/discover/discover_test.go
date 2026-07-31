@@ -126,14 +126,14 @@ func TestDiscoverNeverEmitsWalkRoot(t *testing.T) {
 func TestDiscoverByExtCounts(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "d", "one.md"))
-	write(t, filepath.Join(root, "d", "two.pdf"))
-	write(t, filepath.Join(root, "d", "three.pdf"))
+	write(t, filepath.Join(root, "d", "two.txt"))
+	write(t, filepath.Join(root, "d", "three.txt"))
 
 	cands := discoverIn(t, root)
 	if len(cands) != 1 {
 		t.Fatalf("expected 1 candidate, got %+v", cands)
 	}
-	if cands[0].ByExt[".pdf"] != 2 || cands[0].ByExt[".md"] != 1 {
+	if cands[0].ByExt[".txt"] != 2 || cands[0].ByExt[".md"] != 1 {
 		t.Fatalf("wrong ByExt: %+v", cands[0].ByExt)
 	}
 }

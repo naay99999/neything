@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<ac:confluence xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/">
-  <ac:rich-text-body>
-    <h1>Runbook</h1>
-    <p>Restart the service when latency exceeds threshold.</p>
-    <p>Check logs in CloudWatch.</p>
-  </ac:rich-text-body>
-</ac:confluence>

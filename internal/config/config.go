@@ -20,7 +20,6 @@ type Config struct {
 	Index       IndexConfig       `mapstructure:"index"`
 	Reranker    RerankerConfig    `mapstructure:"reranker"`
 	Chunking    ChunkingConfig    `mapstructure:"chunking"`
-	Loaders     LoadersConfig     `mapstructure:"loaders"`
 	VectorStore VectorStoreConfig `mapstructure:"vector_store"`
 	Telemetry   bool              `mapstructure:"telemetry"`
 }
@@ -72,18 +71,6 @@ type ChunkingConfig struct {
 	ByFormat      map[string]string `mapstructure:"by_format"`
 }
 
-type LoadersConfig struct {
-	OCR OCRConfig `mapstructure:"ocr"`
-}
-
-type OCRConfig struct {
-	Enabled      bool   `mapstructure:"enabled"`
-	Lang         string `mapstructure:"lang"`
-	TesseractCmd string `mapstructure:"tesseract_cmd"`
-	PdftoppmCmd  string `mapstructure:"pdftoppm_cmd"`
-	MinChars     int    `mapstructure:"min_chars"`
-}
-
 type VectorStoreConfig struct {
 	Backend string     `mapstructure:"backend"`
 	HNSW    HNSWConfig `mapstructure:"hnsw"`
@@ -100,7 +87,8 @@ const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 # Recommended: 'ney mcp' plugs ney straight into Claude Code/Desktop/Cursor
 # as an MCP server (search_documents/read_document/list_workspaces/
 # index_status) and works zero-config — keyword search from the moment it
-# starts, semantic search once an embedder is configured. See README.md.
+# starts, semantic search once an embedder is configured. Indexes markdown
+# (.md/.markdown, + Obsidian/Notion) and plain .txt files. See README.md.
 #
 # Tip: run 'ney init' to enable semantic search. Without an embedder, ney
 # still indexes and searches by keyword (FTS).
@@ -136,7 +124,7 @@ reranker:
 
 # chunking settings
 chunking:
-  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer | page
+  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
   target_chars: 1200
   overlap_chars: 150
   target_tokens: 300          # tokenizer strategy only (~4 chars/token)
@@ -144,15 +132,7 @@ chunking:
   # by_format used when strategy: auto
   # by_format:
   #   md: markdown
-  #   pdf: page
-  #   docx: paragraph
-
-# loader options
-loaders:
-  ocr:
-    enabled: false
-    lang: eng
-    min_chars: 32
+  #   txt: paragraph
 
 # vector store backend
 vector_store:
@@ -224,18 +204,6 @@ func Load() (*Config, error) {
 	}
 	if cfg.Chunking.OverlapTokens == 0 {
 		cfg.Chunking.OverlapTokens = 50
-	}
-	if cfg.Loaders.OCR.Lang == "" {
-		cfg.Loaders.OCR.Lang = "eng"
-	}
-	if cfg.Loaders.OCR.MinChars == 0 {
-		cfg.Loaders.OCR.MinChars = 32
-	}
-	if cfg.Loaders.OCR.TesseractCmd == "" {
-		cfg.Loaders.OCR.TesseractCmd = "tesseract"
-	}
-	if cfg.Loaders.OCR.PdftoppmCmd == "" {
-		cfg.Loaders.OCR.PdftoppmCmd = "pdftoppm"
 	}
 	if cfg.VectorStore.Backend == "" {
 		cfg.VectorStore.Backend = "brute"
@@ -310,14 +278,14 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("index.exclude: %w", err)
 	}
 	validChunk := map[string]bool{
-		"auto": true, "character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true, "page": true,
+		"auto": true, "character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true,
 	}
 	if !validChunk[cfg.Chunking.Strategy] {
-		return fmt.Errorf("unknown chunking strategy %q (valid: auto, character, paragraph, markdown, sentence, tokenizer, page)", cfg.Chunking.Strategy)
+		return fmt.Errorf("unknown chunking strategy %q (valid: auto, character, paragraph, markdown, sentence, tokenizer)", cfg.Chunking.Strategy)
 	}
 	if cfg.Chunking.Strategy == "auto" {
 		validPerFormat := map[string]bool{
-			"character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true, "page": true,
+			"character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true,
 		}
 		for docType, strat := range cfg.Chunking.ByFormat {
 			if !validPerFormat[strat] {

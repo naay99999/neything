@@ -39,11 +39,12 @@ const (
 )
 
 // contentGrepExts are the plain-text formats content grep is allowed to
-// read. Deliberately does NOT include .pdf/.docx (design §6: "ไม่แตะ
-// PDF/DOCX — parse สดแพงเกิน, filename match ครอบเคสนั้น") and is a
-// superset unrelated to internal/index's supportedExts — a live scan must
-// still report filename hits on any extension (e.g. order-1233.xlsx), it
-// just can't grep their contents.
+// read. Deliberately excludes binary/rich-document formats (design §6:
+// parsing them fresh on every live-scan call is too expensive; filename
+// match already covers that case) and is a superset unrelated to
+// internal/index's supportedExts — a live scan must still report filename
+// hits on any extension (e.g. order-1233.xlsx), it just can't grep their
+// contents.
 var contentGrepExts = map[string]bool{
 	".md":   true,
 	".txt":  true,

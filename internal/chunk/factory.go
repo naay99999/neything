@@ -20,9 +20,7 @@ func NewChunker(strategy string, targetChars, overlapChars, targetTokens, overla
 			overlapTokens = 50
 		}
 		return &TokenizerChunker{TargetTokens: targetTokens, OverlapTokens: overlapTokens}, nil
-	case "page":
-		return &PageChunker{TargetChars: targetChars, OverlapChars: overlapChars}, nil
 	default:
-		return nil, fmt.Errorf("unknown chunk strategy %q (valid: character, paragraph, markdown, sentence, tokenizer, page)", strategy)
+		return nil, fmt.Errorf("unknown chunk strategy %q (valid: character, paragraph, markdown, sentence, tokenizer)", strategy)
 	}
 }

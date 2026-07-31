@@ -7,12 +7,6 @@ func FormatLocation(docType string, start, end int) string {
 		return ""
 	}
 	label := "lines"
-	switch docType {
-	case "pdf":
-		label = "pages"
-	case "docx":
-		label = "paragraphs"
-	}
 	if start > 0 && end > 0 && start != end {
 		return fmt.Sprintf("%s %d-%d", label, start, end)
 	}

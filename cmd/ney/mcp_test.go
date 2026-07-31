@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/naay99999/neything/internal/store"
 )
 
 // mcpTestEnv bundles everything a test needs to drive the 4 MCP tools
@@ -334,59 +333,6 @@ func TestMCPReadDocumentPathGuardRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
-// --- read_document: binary (pdf/docx) chunk reassembly --------------------------
-
-func TestMCPReadDocumentBinaryChunkReassembly(t *testing.T) {
-	env := newMCPTestEnv(t)
-
-	// A real PDF/DOCX loader round-trip is out of scope here — what
-	// read_document actually needs to prove is the chunk-reassembly path
-	// itself (join by chunk_index), so seed a document+chunk rows directly,
-	// same as the indexer would have produced. The path guard requires the
-	// file to exist on disk (EvalSymlinks), so create a dummy one too — its
-	// bytes are never read on this path.
-	pdfPath := filepath.Join(env.root, "report.pdf")
-	writeTestFile(t, pdfPath, "%PDF-1.4 dummy bytes, never read via the chunks path\n")
-
-	ws, err := env.app.DB.GetWorkspaceByName("corpus")
-	if err != nil || ws == nil {
-		t.Fatalf("expected corpus workspace to exist: %v", err)
-	}
-	docID, err := env.app.DB.UpsertDocument(&store.Document{
-		WorkspaceID: ws.ID,
-		Path:        pdfPath,
-		Type:        "pdf",
-		Hash:        "deadbeef",
-		SizeBytes:   42,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := env.app.DB.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunks := []*store.Chunk{
-		{DocumentID: docID, ChunkIndex: 0, Content: "Part one of the report.", StartPos: 1, EndPos: 1},
-		{DocumentID: docID, ChunkIndex: 1, Content: "Part two of the report.", StartPos: 2, EndPos: 2},
-	}
-	if err := env.app.DB.InsertChunks(tx, chunks); err != nil {
-		tx.Rollback()
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	out := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: pdfPath})
-	if out.Source != "chunks" {
-		t.Fatalf("expected source=chunks for an indexed pdf, got %q", out.Source)
-	}
-	want := "Part one of the report.\nPart two of the report."
-	if out.Content != want {
-		t.Fatalf("expected chunk-joined content %q, got %q", want, out.Content)
-	}
-}
 
 // --- list_workspaces + index_status ---------------------------------------------
 

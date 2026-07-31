@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/naay99999/neything/internal/citation"
@@ -18,16 +17,10 @@ import (
 	"github.com/naay99999/neything/internal/search"
 )
 
-// maxReadFileSize bounds both the direct-read (plain-text) and fresh-parse
-// (unindexed pdf/docx) paths of read_document, mirroring the design's "size
-// cap 20 MB" for fresh parses — applied uniformly so a stray multi-GB file
-// under a watched root can't be read into memory whole by an MCP client.
+// maxReadFileSize bounds read_document's direct disk read so a stray
+// multi-GB file under a watched root can't be read into memory whole by an
+// MCP client.
 const maxReadFileSize = 20 * 1024 * 1024
-
-// freshParseTimeout bounds how long read_document's fresh-parse fallback
-// (for a not-yet-indexed pdf/docx, which may run OCR) is allowed to block a
-// tool call.
-const freshParseTimeout = 10 * time.Second
 
 const (
 	defaultSearchTopK = 8
@@ -71,8 +64,8 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "index_folder",
-		Description: "Permanently index ONE folder (under the user's home or iCloud Drive) so its contents — " +
-			"including PDF/DOCX text — become fully searchable from now on, for every connected AI client. " +
+		Description: "Permanently index ONE folder (under the user's home or iCloud Drive) so its markdown/text " +
+			"contents become fully searchable from now on, for every connected AI client. " +
 			"Use when the user wants a folder searchable long-term (\"index โฟลเดอร์นี้\", deep/recurring " +
 			"search needs); for a quick one-off lookup use search_folder instead. Indexing runs synchronously " +
 			"and may take a while on large folders. Unavailable while another ney process holds the writer lock.",
@@ -90,12 +83,8 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "read_document",
-		Description: "Read the text of one indexed (or indexable) file, windowed by offset_chars/max_chars. " +
-			"Plain-text formats (.md/.txt/.html/.json/...) are read directly from disk. PDF/DOCX are " +
-			"reassembled from indexed chunk rows in order when available (approximate: chunk overlap can " +
-			"duplicate ~150 chars at each join, and start/end positions are pages/paragraphs, not exact " +
-			"char offsets) — or parsed fresh (size-capped, OCR time-boxed) if the file exists under an " +
-			"indexed root but hasn't been indexed yet. Allowed paths: inside a known workspace root, or " +
+		Description: "Read the text of one file (.md/.markdown/.txt), windowed by offset_chars/max_chars, " +
+			"read directly from disk (size-capped). Allowed paths: inside a known workspace root, or " +
 			"files previously surfaced by a search_folder call this session; hidden files and secret-looking " +
 			"files (.env, keys, credentials, ...) are never served.",
 	}, readDocumentHandler(app, deps.rs, flt, state))
@@ -499,7 +488,7 @@ type readDocumentOutput struct {
 	TotalChars int    `json:"total_chars"`
 	Truncated  bool   `json:"truncated"`
 	NextOffset int    `json:"next_offset,omitempty"`
-	Source     string `json:"source"` // file | chunks | fresh-parse
+	Source     string `json:"source"` // always "file" — every supported format is read directly off disk
 }
 
 func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, state *serverState) mcp.ToolHandlerFor[readDocumentInput, readDocumentOutput] {
@@ -535,15 +524,7 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 			maxChars = maxReadChars
 		}
 
-		ext := strings.ToLower(filepath.Ext(resolved))
-		isBinary := ext == ".pdf" || ext == ".docx"
-
-		var full, source string
-		if isBinary {
-			full, source, err = readBinaryDocument(ctx, app, resolved)
-		} else {
-			full, source, err = readPlainTextFile(resolved)
-		}
+		full, source, err := readPlainTextFile(resolved)
 		if err != nil {
 			return nil, readDocumentOutput{}, err
 		}
@@ -560,60 +541,8 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 	}
 }
 
-// readBinaryDocument returns the full text of a pdf/docx document, either
-// reassembled from its indexed chunk rows (in chunk_index order — the
-// approximate path the tool description warns about) or, if it hasn't been
-// indexed yet, parsed fresh via the same loader registry `ney index` uses.
-func readBinaryDocument(ctx context.Context, app *AppState, resolved string) (content, source string, err error) {
-	doc, err := app.DB.GetDocumentByPath(resolved)
-	if err != nil {
-		return "", "", err
-	}
-	if doc != nil {
-		chunks, err := app.DB.GetChunksByDocumentOrdered(doc.ID)
-		if err != nil {
-			return "", "", err
-		}
-		parts := make([]string, len(chunks))
-		for i, c := range chunks {
-			parts[i] = c.Content
-		}
-		return strings.Join(parts, "\n"), "chunks", nil
-	}
-
-	fi, err := os.Stat(resolved)
-	if err != nil {
-		return "", "", fmt.Errorf("path not found: %s", resolved)
-	}
-	if fi.Size() > maxReadFileSize {
-		return "", "", fmt.Errorf("file too large to parse fresh (%d bytes, max %d)", fi.Size(), maxReadFileSize)
-	}
-
-	cfg, err := loadConfig()
-	if err != nil {
-		return "", "", err
-	}
-	reg := newLoaderRegistry(cfg)
-	ld, ok := reg.Dispatch(resolved)
-	if !ok {
-		return "", "", fmt.Errorf("no loader available for %s", resolved)
-	}
-
-	parseCtx, cancel := context.WithTimeout(ctx, freshParseTimeout)
-	defer cancel()
-	docs, err := ld.Load(parseCtx, resolved)
-	if err != nil {
-		return "", "", fmt.Errorf("parse %s: %w", resolved, err)
-	}
-	parts := make([]string, len(docs))
-	for i, d := range docs {
-		parts[i] = d.Content
-	}
-	return strings.Join(parts, "\n"), "fresh-parse", nil
-}
-
-// readPlainTextFile reads a non-pdf/docx file directly off disk — the fast,
-// exact path for markdown/text/html/json/etc.
+// readPlainTextFile reads a file directly off disk — every supported format
+// (.md/.markdown/.txt) is plain text, so this is the only read path.
 func readPlainTextFile(resolved string) (content, source string, err error) {
 	fi, err := os.Stat(resolved)
 	if err != nil {

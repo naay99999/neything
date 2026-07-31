@@ -61,7 +61,7 @@ func TestValidateRerankRequiresProvider(t *testing.T) {
 func TestValidateAutoChunkingByFormat(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"pdf": "page"}},
+		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"txt": "paragraph"}},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
 	if err := Validate(cfg); err != nil {
@@ -72,7 +72,7 @@ func TestValidateAutoChunkingByFormat(t *testing.T) {
 func TestValidateAutoRejectsInvalidByFormat(t *testing.T) {
 	cfg := &Config{
 		Embedder:    EmbedderConfig{Provider: "ollama", Model: "bge-m3"},
-		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"pdf": "invalid"}},
+		Chunking:    ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"txt": "invalid"}},
 		VectorStore: VectorStoreConfig{Backend: "brute"},
 	}
 	if err := Validate(cfg); err == nil {
@@ -259,6 +259,28 @@ loaders:
 `)
 	if cfg.Retrieval.TopK != 8 {
 		t.Fatalf("expected top_k 8, got %d", cfg.Retrieval.TopK)
+	}
+}
+
+// TestLoadIgnoresLegacyLoaderKeys guards against regressions for pre-md-only-
+// cut installs whose config.yaml still has a loaders: section (the Config
+// struct no longer has a Loaders field at all) and by_format entries for
+// removed doc types — viper must silently ignore the former, and the latter
+// is inert (only checked when chunking.strategy is "auto").
+func TestLoadIgnoresLegacyLoaderKeys(t *testing.T) {
+	cfg := writeTestConfig(t, `embedder:
+  provider: none
+loaders:
+  some_removed_loader:
+    enabled: true
+    extra: eng
+chunking:
+  strategy: markdown
+  by_format:
+    some_removed_doc_type: some_removed_strategy
+`)
+	if cfg.Chunking.Strategy != "markdown" {
+		t.Fatalf("expected chunking.strategy markdown, got %q", cfg.Chunking.Strategy)
 	}
 }
 

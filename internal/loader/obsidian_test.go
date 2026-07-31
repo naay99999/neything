@@ -65,25 +65,6 @@ func TestMarkdownLoaderPlainFallback(t *testing.T) {
 	}
 }
 
-func TestConfluenceLoader(t *testing.T) {
-	path := filepath.Join("testdata", "confluence.xml")
-	l := &ConfluenceLoader{}
-	if !l.Supports(path) {
-		t.Fatal("expected supports confluence xml")
-	}
-	docs, err := l.Load(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	doc := docs[0]
-	if doc.Type != "confluence" {
-		t.Fatalf("expected confluence type, got %s", doc.Type)
-	}
-	if !strings.Contains(doc.Content, "Restart the service") {
-		t.Fatalf("missing content: %q", doc.Content)
-	}
-}
-
 func TestRegistryDispatchOrder(t *testing.T) {
 	reg := NewRegistry(
 		&NotionLoader{},

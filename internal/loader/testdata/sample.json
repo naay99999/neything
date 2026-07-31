@@ -1,8 +1,0 @@
-{
-  "title": "API Reference",
-  "endpoints": [
-    {"path": "/search", "method": "GET"},
-    {"path": "/ask", "method": "POST"}
-  ],
-  "version": 1
-}

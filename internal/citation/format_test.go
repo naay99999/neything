@@ -10,8 +10,8 @@ func TestFormatLocation(t *testing.T) {
 		want    string
 	}{
 		{"md", 12, 40, "lines 12-40"},
-		{"pdf", 3, 5, "pages 3-5"},
-		{"docx", 1, 1, "paragraphs 1"},
+		{"txt", 3, 5, "lines 3-5"},
+		{"obsidian", 1, 1, "lines 1"},
 		{"md", 0, 0, ""},
 	}
 	for _, tc := range tests {
