@@ -38,8 +38,8 @@ type Stats struct {
 const flushEveryDocs = 100
 
 type Indexer struct {
-	DB      *store.DB
-	Vectors vectorstore.VectorStore
+	DB       *store.DB
+	Vectors  vectorstore.VectorStore
 	Embedder embed.Embedder
 	Loaders  loader.Registry
 	// Filter decides which files/dirs are excluded (dotfiles + secret-file

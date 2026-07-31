@@ -15,8 +15,8 @@ func (m *MarkdownHeadingChunker) Chunk(doc loader.Document) []Chunk {
 	lines := strings.Split(doc.Content, "\n")
 
 	type section struct {
-		heading  string
-		content  string
+		heading   string
+		content   string
 		byteStart int
 	}
 

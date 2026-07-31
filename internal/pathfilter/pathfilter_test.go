@@ -87,9 +87,9 @@ func TestExcludedPath(t *testing.T) {
 		{"sub/notes.md", false},
 		{".env", true},
 		{"sub/.env", true},
-		{".ssh/id_rsa", true},          // denied dir component
-		{"sub/passwords.md", true},     // denied file component
-		{"secrets/plan.md", true},      // denied intermediate dir
+		{".ssh/id_rsa", true},      // denied dir component
+		{"sub/passwords.md", true}, // denied file component
+		{"secrets/plan.md", true},  // denied intermediate dir
 		{"docs/deep/tokenizer.md", false},
 	}
 	for _, c := range cases {

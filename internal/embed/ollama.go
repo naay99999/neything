@@ -40,8 +40,8 @@ func NewOllamaEmbedder(baseURL, model string) (*OllamaEmbedder, error) {
 	return e, nil
 }
 
-func (e *OllamaEmbedder) ModelID() string  { return e.Model }
-func (e *OllamaEmbedder) Dimensions() int  { return e.dimensions }
+func (e *OllamaEmbedder) ModelID() string { return e.Model }
+func (e *OllamaEmbedder) Dimensions() int { return e.dimensions }
 
 func (e *OllamaEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	// detect legacy mode on first call

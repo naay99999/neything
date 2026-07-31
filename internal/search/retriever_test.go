@@ -87,8 +87,8 @@ func seedRetrieverDB(t *testing.T) (*store.DB, []int64) {
 func TestRetriever_AutoModeMatrix(t *testing.T) {
 	const query = "billing uses stripe subscriptions for recurring revenue"
 	queryVec := []float32{1, 0, 0, 0}
-	matchVec := []float32{1, 0, 0, 0}   // parallel to queryVec -> cosine 1
-	otherVec := []float32{0, 1, 0, 0}   // orthogonal -> cosine 0
+	matchVec := []float32{1, 0, 0, 0} // parallel to queryVec -> cosine 1
+	otherVec := []float32{0, 1, 0, 0} // orthogonal -> cosine 0
 
 	type setup struct {
 		name         string

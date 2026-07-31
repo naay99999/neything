@@ -107,4 +107,3 @@ func TestReleaseIdempotent(t *testing.T) {
 		t.Fatalf("Release on nil *Lock should be a no-op, got: %v", err)
 	}
 }
-
