@@ -143,11 +143,13 @@ Principle: **Layer 1 must never fail.**
 - `remember`/`update_profile` write to exactly two fixed destinations:
   under `~/.ney/memory/` and `profile.md`. No AI-supplied paths; slugs pass a
   sanitizer (strip separators, `..`, length cap).
-- `~/.ney` is a dot-dir, which `pathfilter` denies by design. Add an
-  **explicit exemption for the built-in memory workspace root only**, lifting
-  only the dotfile rule — secret-name globs still apply inside it. The MCP
-  invariant (everything served passes containment + pathfilter) is unchanged;
-  the memory root becomes a served root like any other.
+- `~/.ney` is a dot-dir, but no pathfilter change is needed: `ExcludedPath`
+  and the indexer walk apply deny rules only to components *under* a root,
+  never to the root itself. The memory dir is registered internally by
+  `ney mcp` at startup as a built-in workspace root (not via `index_folder`,
+  whose path validation may reject hidden dirs). Secret-name globs still
+  apply to files inside it. The MCP invariant (containment + pathfilter) is
+  unchanged; the memory root becomes a served root like any other.
 
 ## Testing
 
