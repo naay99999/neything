@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
+	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/discover"
 	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/store"
@@ -18,7 +19,7 @@ import (
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Guided setup — discover documents, connect AI clients",
+	Short: "Guided setup — discover repos, set up profile, connect AI clients",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runSetupWizard(cmd.Context())
 	},
@@ -54,23 +55,29 @@ func setupCompleted() bool {
 // is idempotent and skippable; setup_completed is recorded only at the end,
 // so an interrupted run simply offers itself again next time.
 func runSetupWizard(ctx context.Context) error {
-	fmt.Println(Bold("Ney setup — ให้ AI ของคุณค้นเอกสารในเครื่องได้อย่างปลอดภัย"))
+	fmt.Println(Bold("Ney setup — ให้ AI ของคุณรู้จักโปรเจกต์และค้นเอกสารในเครื่องได้อย่างปลอดภัย"))
 	fmt.Println(Dim("Enter = ค่าเริ่มต้น, Ctrl+C = ยกเลิก (รัน `ney init` ซ้ำได้เสมอ)"))
 	fmt.Println()
 
-	selected, err := stepFolders(ctx)
+	// Loaded early (and reloaded after writeSetupConfig) because step 1
+	// needs cfg.Context.DevRoots to know where to scan for repos.
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
+
+	selected, devRoot := stepRepos(ctx, cfg)
+
+	stepProfile()
 
 	stepClients()
 
 	w := stepEmbedder()
 
-	if err := writeSetupConfig(w); err != nil {
+	if err := writeSetupConfig(w, devRoot); err != nil {
 		return err
 	}
-	cfg, err := config.Load()
+	cfg, err = config.Load()
 	if err != nil {
 		return err
 	}
@@ -89,45 +96,72 @@ func runSetupWizard(ctx context.Context) error {
 	fmt.Println()
 	fmt.Println(Bold("✓ Setup เสร็จแล้ว"))
 	if indexed > 0 {
-		fmt.Printf("  index แล้ว %d โฟลเดอร์ — เปิด Claude/Codex แล้วถามหาไฟล์ได้เลย\n", indexed)
+		fmt.Printf("  index แล้ว %d repo — เปิด Claude/Codex แล้วถามหาไฟล์หรือถามความคืบหน้าโปรเจกต์ได้เลย\n", indexed)
 	}
 	fmt.Println(Dim("  เพิ่ม/แก้ทีหลัง: รัน `ney init` อีกครั้ง หรือบอก AI ว่า \"index โฟลเดอร์นี้ให้หน่อย\""))
+	fmt.Println()
+	fmt.Println(Dim("  Memory: บอก AI ว่า \"จำไว้ว่า...\" แล้วมันจะเซฟเป็นไฟล์ที่ " + displayPath(memoryDir()) + " — ค้นเจอผ่าน search_documents ได้ในไม่กี่วินาที (แก้ profile ได้ตรงๆ ที่ " + displayPath(filepath.Join(config.NeyDir(), "profile.md")) + " เมื่อไหร่ก็ได้)"))
 	return nil
 }
 
-// --- step 1: folder discovery ---------------------------------------------------
+// --- step 1: repo discovery ------------------------------------------------------
 
-func stepFolders(ctx context.Context) ([]string, error) {
-	fmt.Println(Bold("[1/3] สแกนหาเอกสารในเครื่อง (Home + iCloud Drive)"))
-	fmt.Println(Dim("      ข้ามโฟลเดอร์ระบบ/ซ่อน/secret อัตโนมัติ — อาจใช้เวลาสักครู่"))
+// stepRepos scans cfg.Context.DevRoots for git repositories and lets the
+// user pick which ones to index. If DevRoots is empty (no configured
+// dev_roots and no ~/workspace), it prompts for a root to scan; when the
+// user provides one, devRootToPersist is returned non-empty so the caller
+// writes it into config.yaml (otherwise it would be re-asked every run).
+func stepRepos(ctx context.Context, cfg *config.Config) (selected []string, devRootToPersist string) {
+	fmt.Println(Bold("[1/4] สแกนหา repo ในเครื่อง (git repositories)"))
 
-	cands, err := discover.Discover(ctx, discover.Options{}, func(dirs int) {
-		fmt.Fprintf(os.Stderr, "\r      สแกนแล้ว %d โฟลเดอร์...", dirs)
+	roots := cfg.Context.DevRoots
+	if len(roots) == 0 {
+		fmt.Println(Dim("      ยังไม่ได้ตั้งค่าโฟลเดอร์เก็บโปรเจกต์ (context.dev_roots) และไม่พบ ~/workspace"))
+		line := promptLine(Cyan("      พิมพ์ path โฟลเดอร์ที่เก็บ repo ต่างๆ (เช่น ~/code, Enter=ข้าม): "))
+		if line = strings.TrimSpace(line); line != "" {
+			abs, err := filepath.Abs(expandTilde(line))
+			if err != nil {
+				fmt.Println(Yellow("      ข้าม: path ไม่ถูกต้อง"))
+			} else if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
+				fmt.Println(Yellow("      ข้าม: ไม่พบโฟลเดอร์นี้"))
+			} else {
+				roots = []string{abs}
+				devRootToPersist = abs
+			}
+		}
+	}
+	if len(roots) == 0 {
+		fmt.Println(Dim("      ข้ามการสแกน repo — ตั้งค่า context.dev_roots ใน config.yaml แล้วรัน `ney init` ใหม่ได้ทีหลัง"))
+		return nil, devRootToPersist
+	}
+
+	cands, err := discover.Discover(ctx, discover.Options{Roots: roots}, func(scanned int) {
+		fmt.Fprintf(os.Stderr, "\r      สแกนแล้ว %d repo...", scanned)
 	})
 	fmt.Fprint(os.Stderr, "\r\033[K")
 	if err != nil {
-		return nil, err
+		fmt.Println(Yellow("      สแกน repo ไม่สำเร็จ: " + err.Error()))
+		return nil, devRootToPersist
 	}
 
 	if len(cands) == 0 {
-		fmt.Println("      ไม่พบโฟลเดอร์ที่มีเอกสารกระจุกตัว — พิมพ์ path เองได้ด้านล่าง")
+		fmt.Println("      ไม่พบ git repo ใน " + strings.Join(displayPaths(roots), ", ") + " — พิมพ์ path เองได้ด้านล่าง")
 	} else {
-		fmt.Println("      พบเอกสารกระจุกอยู่ที่:")
+		fmt.Println("      พบ repo:")
 		for i, c := range cands {
-			fmt.Printf("      [%d] %-40s %s\n", i+1, displayPath(c.Path), Dim(summarizeExts(c.DocCount, c.ByExt)))
+			fmt.Printf("      [%d] %-24s %-40s %s\n", i+1, c.Name, Dim(displayPath(c.Path)),
+				Dim(fmt.Sprintf("%d ไฟล์ · commit ล่าสุด %s", c.DocCount, relativeAge(c.LastCommit))))
 		}
 	}
 	fmt.Println(Dim("      เลือกที่จะให้ AI ค้นได้ เช่น 1,3 / a=ทั้งหมด / พิมพ์ path เพิ่มเองก็ได้ / Enter=ข้าม"))
 	line := promptLine(Cyan("      เลือก: "))
 
-	selected, unknown := parseSelection(line, len(cands))
-	var out []string
-	for _, idx := range selected {
-		out = append(out, cands[idx].Path)
+	indices, unknown := parseSelection(line, len(cands))
+	for _, idx := range indices {
+		selected = append(selected, cands[idx].Path)
 	}
 	for _, raw := range unknown {
-		p := expandTilde(raw)
-		abs, err := filepath.Abs(p)
+		abs, err := filepath.Abs(expandTilde(raw))
 		if err != nil {
 			fmt.Println(Yellow("      ข้าม " + raw + ": path ไม่ถูกต้อง"))
 			continue
@@ -140,9 +174,81 @@ func stepFolders(ctx context.Context) ([]string, error) {
 		if strings.HasPrefix(abs, "/Volumes/") {
 			fmt.Println(Yellow("      หมายเหตุ: " + raw + " อยู่บน external drive — ถ้าถอดไดรฟ์ ไฟล์ชุดนี้จะหายจากผลค้นจนกว่าจะเสียบและ index ใหม่"))
 		}
-		out = append(out, abs)
+		selected = append(selected, abs)
 	}
-	return out, nil
+	return selected, devRootToPersist
+}
+
+// displayPaths applies displayPath to each entry, for compact log lines.
+func displayPaths(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = displayPath(p)
+	}
+	return out
+}
+
+// relativeAge renders t relative to now as a short human string ("2h ago",
+// "3d ago"), mirroring internal/context's render.go formatting for the
+// wizard's plain-text repo list.
+func relativeAge(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d/time.Minute))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d/time.Hour))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
+	case d < 365*24*time.Hour:
+		return fmt.Sprintf("%dmo ago", int(d/(30*24*time.Hour)))
+	default:
+		return fmt.Sprintf("%dy ago", int(d/(365*24*time.Hour)))
+	}
+}
+
+// --- step 2: profile bootstrap ---------------------------------------------------
+
+// stepProfile creates ~/.ney/profile.md from the embedded template (via
+// neycontext.LoadProfile) and, on a fresh profile, asks 2-3 short questions
+// to seed it. If a profile already exists, this step is a no-op note — the
+// file is user-owned from then on (AI edits it via update_profile).
+func stepProfile() {
+	fmt.Println()
+	fmt.Println(Bold("[2/4] ตั้งค่า profile (~/.ney/profile.md)"))
+
+	profilePath := filepath.Join(config.NeyDir(), "profile.md")
+	if _, err := os.Stat(profilePath); err == nil {
+		fmt.Println(Dim("      พบ profile.md อยู่แล้ว — ข้าม (แก้เองได้ตรงๆ หรือให้ AI แก้ผ่าน update_profile)"))
+		return
+	}
+
+	if _, _, err := neycontext.LoadProfile(profilePath); err != nil {
+		fmt.Println(Yellow("      สร้าง profile.md ไม่สำเร็จ: " + err.Error()))
+		return
+	}
+
+	fmt.Println(Dim("      ตอบสั้นๆ ได้เลย (Enter = ข้ามข้อนั้น) — แก้เพิ่มทีหลังได้ที่ " + displayPath(profilePath)))
+
+	if ans := promptLine(Cyan("      คุณเป็นใคร ทำงานอะไร: ")); strings.TrimSpace(ans) != "" {
+		_ = neycontext.UpdateProfile(profilePath, "Name & role", ans, false)
+	}
+	if ans := promptLine(Cyan("      ตอนนี้กำลังโฟกัสอะไรอยู่: ")); strings.TrimSpace(ans) != "" {
+		_ = neycontext.UpdateProfile(profilePath, "Current focus", ans, false)
+	}
+	if ans := promptLine(Cyan("      สไตล์การทำงาน/สิ่งที่อยากให้ AI รู้ไว้: ")); strings.TrimSpace(ans) != "" {
+		_ = neycontext.UpdateProfile(profilePath, "Working style", ans, false)
+	}
+
+	fmt.Println(Green("      ✓ บันทึก profile.md แล้ว"))
 }
 
 // parseSelection parses the folder-picker input: comma/space-separated
@@ -176,37 +282,11 @@ func parseSelection(line string, n int) (indices []int, paths []string) {
 	return indices, paths
 }
 
-func summarizeExts(total int, byExt map[string]int) string {
-	type kv struct {
-		ext string
-		n   int
-	}
-	var top []kv
-	for e, n := range byExt {
-		top = append(top, kv{e, n})
-	}
-	for i := 0; i < len(top); i++ {
-		for j := i + 1; j < len(top); j++ {
-			if top[j].n > top[i].n {
-				top[i], top[j] = top[j], top[i]
-			}
-		}
-	}
-	parts := make([]string, 0, 3)
-	for i, t := range top {
-		if i == 3 {
-			break
-		}
-		parts = append(parts, fmt.Sprintf("%d %s", t.n, strings.TrimPrefix(t.ext, ".")))
-	}
-	return fmt.Sprintf("%d ไฟล์ (%s)", total, strings.Join(parts, ", "))
-}
-
-// --- step 2: AI clients ---------------------------------------------------------
+// --- step 3: AI clients ---------------------------------------------------------
 
 func stepClients() {
 	fmt.Println()
-	fmt.Println(Bold("[2/3] เชื่อมกับ AI clients"))
+	fmt.Println(Bold("[3/4] เชื่อมกับ AI clients"))
 
 	neyBin, err := os.Executable()
 	if err == nil {
@@ -243,11 +323,11 @@ func indentLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-// --- step 3: optional embedder --------------------------------------------------
+// --- step 4: optional embedder --------------------------------------------------
 
 func stepEmbedder() *wizardChoice {
 	fmt.Println()
-	fmt.Println(Bold("[3/3] Semantic search (optional)"))
+	fmt.Println(Bold("[4/4] Semantic search (optional)"))
 	fmt.Println(Dim("      ค้นเชิงความหมายด้วย embedding model ในเครื่อง (Ollama/LM Studio) หรือ cloud"))
 	fmt.Println(Dim("      ไม่ตั้งก็ใช้ได้เต็มรูปแบบ — ค้นแบบ keyword ทำงานในเครื่อง 100%"))
 	ans := promptLine(Cyan("      ตั้งค่าเลยไหม? [Enter=ข้าม / y=ตั้งค่า] "))
@@ -426,7 +506,11 @@ func normalizeEndpoint(s string) string {
 
 // writeSetupConfig writes ~/.ney/config.yaml from the wizard's choices,
 // backing up any existing config first. embedder may be nil (keyword-only).
-func writeSetupConfig(w *wizardChoice) error {
+// devRoot, when non-empty, is a dev root the user typed during step 1
+// (because context.dev_roots was unset and ~/workspace didn't exist) — it
+// is persisted as context.dev_roots so the wizard doesn't ask again and
+// get_context/list_projects pick it up.
+func writeSetupConfig(w *wizardChoice, devRoot string) error {
 	if err := os.MkdirAll(config.NeyDir(), 0o700); err != nil {
 		return err
 	}
@@ -464,6 +548,9 @@ chunking:
   target_chars: 1200
   overlap_chars: 150
 `)
+	if devRoot != "" {
+		fmt.Fprintf(&b, "\n# layered context (get_context / list_projects): where to look for git repos\ncontext:\n  dev_roots: [%q]\n", devRoot)
+	}
 	b.WriteString("\n# privacy — off by default\ntelemetry: false\n")
 
 	if err := os.WriteFile(cfgPath, []byte(b.String()), 0o600); err != nil {

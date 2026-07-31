@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/store"
 )
 
@@ -45,8 +48,8 @@ func TestParseSelection(t *testing.T) {
 		{"all", 2, []int{0, 1}, nil},
 		{"2,~/notes", 3, []int{1}, []string{"~/notes"}},
 		{"", 3, nil, nil},
-		{"9", 3, nil, nil},           // out of range dropped
-		{"1,1,1", 3, []int{0}, nil},  // deduped
+		{"9", 3, nil, nil},          // out of range dropped
+		{"1,1,1", 3, []int{0}, nil}, // deduped
 	}
 	for _, c := range cases {
 		idx, paths := parseSelection(c.in, c.n)
@@ -77,5 +80,81 @@ func TestWorkspaceNameFor(t *testing.T) {
 	// Different root with colliding basename -> disambiguated.
 	if got := workspaceNameFor(db, "/Users/x/other/docs"); got != "docs-other" {
 		t.Fatalf("collision should append parent name, got %q", got)
+	}
+}
+
+func TestRelativeAge(t *testing.T) {
+	if got := relativeAge(time.Time{}); got != "unknown" {
+		t.Errorf("zero time: got %q, want unknown", got)
+	}
+	now := time.Now()
+	cases := []struct {
+		ago  time.Duration
+		want string
+	}{
+		{30 * time.Second, "just now"},
+		{5 * time.Minute, "5m ago"},
+		{3 * time.Hour, "3h ago"},
+		{2 * 24 * time.Hour, "2d ago"},
+	}
+	for _, c := range cases {
+		if got := relativeAge(now.Add(-c.ago)); got != c.want {
+			t.Errorf("relativeAge(-%v) = %q, want %q", c.ago, got, c.want)
+		}
+	}
+}
+
+func TestDisplayPaths(t *testing.T) {
+	got := displayPaths([]string{"/a", "/b"})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %v", got)
+	}
+}
+
+// TestWriteSetupConfigPersistsDevRoot covers the step-1 "prompt for a dev
+// root when unset" flow: whatever the user typed must survive into
+// config.yaml as context.dev_roots, or the wizard would ask again on every
+// run and get_context/list_projects would never see repos under it.
+func TestWriteSetupConfigPersistsDevRoot(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	devRoot := filepath.Join(dir, "code")
+	if err := writeSetupConfig(nil, devRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != devRoot {
+		t.Fatalf("expected dev_roots=[%s], got %v", devRoot, cfg.Context.DevRoots)
+	}
+}
+
+// TestWriteSetupConfigNoDevRootLeavesDefault covers the common case: no
+// custom dev root was typed (context.dev_roots was already set, or the
+// wizard fell back silently), so writeSetupConfig must not force an empty
+// context.dev_roots — Load()'s own default (~/workspace if present) should
+// still apply.
+func TestWriteSetupConfigNoDevRootLeavesDefault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeSetupConfig(nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "workspace")
+	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != want {
+		t.Fatalf("expected default dev_roots=[%s], got %v", want, cfg.Context.DevRoots)
 	}
 }
