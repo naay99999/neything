@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/index"
 )
 
 // mcpTestEnv bundles everything a test needs to drive the 4 MCP tools
@@ -333,36 +336,35 @@ func TestMCPReadDocumentPathGuardRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+// --- list_projects + index_status ---------------------------------------------
 
-// --- list_workspaces + index_status ---------------------------------------------
-
-func TestMCPListWorkspacesAndIndexStatus(t *testing.T) {
+func TestMCPListProjectsAndIndexStatus(t *testing.T) {
 	env := newMCPTestEnv(t)
 
-	wsOut := callTool[listWorkspacesOutput](t, env, "list_workspaces", listWorkspacesInput{})
-	if len(wsOut.Workspaces) != 1 {
-		t.Fatalf("expected exactly 1 workspace, got %d: %+v", len(wsOut.Workspaces), wsOut.Workspaces)
+	projOut := callTool[listProjectsOutput](t, env, "list_projects", listProjectsInput{})
+	if len(projOut.Projects) != 1 {
+		t.Fatalf("expected exactly 1 project, got %d: %+v", len(projOut.Projects), projOut.Projects)
 	}
-	w := wsOut.Workspaces[0]
-	if w.Name != "corpus" {
-		t.Fatalf("expected workspace name=corpus, got %q", w.Name)
+	p := projOut.Projects[0]
+	if p.Name != "corpus" {
+		t.Fatalf("expected project name=corpus, got %q", p.Name)
 	}
-	if w.Documents != 2 {
-		t.Fatalf("expected 2 documents (notes.md, sub/more.md), got %d", w.Documents)
+	if !p.Indexed {
+		t.Fatal("expected corpus to be indexed (it's a served root)")
 	}
-	if w.Chunks == 0 {
+	if p.Documents != 2 {
+		t.Fatalf("expected 2 documents (notes.md, sub/more.md), got %d", p.Documents)
+	}
+	if p.Chunks == 0 {
 		t.Fatal("expected at least 1 chunk")
-	}
-	if w.EmbedCoverage != 0 {
-		t.Fatalf("expected embed_coverage=0 with no embedder configured, got %v", w.EmbedCoverage)
 	}
 
 	statusOut := callTool[indexStatusOutput](t, env, "index_status", indexStatusInput{})
 	if len(statusOut.Workspaces) != 1 || statusOut.Workspaces[0].Name != "corpus" {
 		t.Fatalf("expected index_status to report the corpus workspace, got %+v", statusOut.Workspaces)
 	}
-	if statusOut.Workspaces[0].Chunks != w.Chunks || statusOut.Workspaces[0].Documents != w.Documents {
-		t.Fatalf("index_status counts should match list_workspaces: %+v vs %+v", statusOut.Workspaces[0], w)
+	if statusOut.Workspaces[0].Chunks != p.Chunks || statusOut.Workspaces[0].Documents != p.Documents {
+		t.Fatalf("index_status counts should match list_projects: %+v vs %+v", statusOut.Workspaces[0], p)
 	}
 	if statusOut.Embedder.Configured {
 		t.Fatal("expected embedder.configured=false — this test env has no embedder")
@@ -372,6 +374,32 @@ func TestMCPListWorkspacesAndIndexStatus(t *testing.T) {
 	}
 	if len(statusOut.PhaseARunning) != 0 {
 		t.Fatalf("expected no roots mid-scan after setup finished indexing synchronously, got %v", statusOut.PhaseARunning)
+	}
+}
+
+// TestMCPListWorkspacesToolRemoved guards the tool-surface rewire: the
+// list_workspaces tool no longer appears in tools/list, and list_projects
+// takes its place.
+func TestMCPListWorkspacesToolRemoved(t *testing.T) {
+	env := newMCPTestEnv(t)
+	res, err := env.cs.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool, len(res.Tools))
+	for _, tl := range res.Tools {
+		names[tl.Name] = true
+	}
+	if names["list_workspaces"] {
+		t.Fatal("expected list_workspaces to be removed from the tool surface")
+	}
+	if !names["list_projects"] {
+		t.Fatal("expected list_projects to be registered")
+	}
+	for _, want := range []string{"get_context", "remember", "update_profile"} {
+		if !names[want] {
+			t.Fatalf("expected %s to be registered", want)
+		}
 	}
 }
 
@@ -403,7 +431,8 @@ func TestMCPStdoutHygiene(t *testing.T) {
 
 	env := newMCPTestEnv(t)
 	_ = callTool[searchDocumentsOutput](t, env, "search_documents", searchDocumentsInput{Query: "invoice"})
-	_ = callTool[listWorkspacesOutput](t, env, "list_workspaces", listWorkspacesInput{})
+	_ = callTool[listProjectsOutput](t, env, "list_projects", listProjectsInput{})
+	_ = callTool[getContextOutput](t, env, "get_context", getContextInput{})
 	_ = callTool[indexStatusOutput](t, env, "index_status", indexStatusInput{})
 	_ = callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: filepath.Join(env.root, "notes.md")})
 
@@ -695,5 +724,223 @@ func TestMCPIndexFolderRejectsNameCollision(t *testing.T) {
 	msg := callToolExpectError(t, env, "index_folder", indexFolderInput{Path: folder})
 	if !strings.Contains(msg, "already bound") {
 		t.Fatalf("expected collision rejection, got: %s", msg)
+	}
+}
+
+// --- layered context: get_context / list_projects / remember / update_profile ----
+
+// requireGitForMCPTest skips the test if git isn't on PATH — ScanRepos
+// shells out to git, matching internal/context's own test guard.
+func requireGitForMCPTest(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+}
+
+// initGitFixtureRepo creates a one-commit git repo at dir, for tests that
+// exercise ScanRepos indirectly through get_context/list_projects.
+func initGitFixtureRepo(t *testing.T, dir, subject string) {
+	t.Helper()
+	requireGitForMCPTest(t)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "Test")
+	writeTestFile(t, filepath.Join(dir, "README.md"), "# hi\n")
+	run("add", "README.md")
+	run("commit", "-q", "-m", subject)
+}
+
+// newMCPTestEnvFullLoop builds a write-mode server the way runMCP does when
+// serving a dev root (found via cfg.Context.DevRoots' default ~/workspace)
+// plus the always-on memory workspace, so a test can drive the whole
+// get_context -> remember -> search_documents loop through the real tool
+// handlers. Returns the env plus the indexer, so a test can trigger a
+// re-index of the memory workspace itself instead of standing up a real
+// fsnotify watcher (equivalent to "wait for Phase A" per the plan).
+func newMCPTestEnvFullLoop(t *testing.T) (*mcpTestEnv, *index.Indexer) {
+	t.Helper()
+	requireGitForMCPTest(t)
+	t.Setenv("HOME", t.TempDir())
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoDir := filepath.Join(home, "workspace", "myproject")
+	initGitFixtureRepo(t, repoDir, "initial commit")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Context.DevRoots) != 1 {
+		t.Fatalf("expected dev_roots to default to the freshly-created ~/workspace, got %v", cfg.Context.DevRoots)
+	}
+
+	app, err := initAppWithOptions(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		app.DB.Close()
+		app.Vectors.Close()
+	})
+
+	memPath := memoryDir()
+	if err := os.MkdirAll(memPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	ix, err := newIndexer(app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ix.Index(context.Background(), memPath, "memory"); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := []mcpRoot{{Name: "memory", Path: memPath}}
+	state := newServerState(rootNames(roots), false)
+	var mu sync.Mutex
+	server := newMCPServer(mcpDeps{
+		app: app, cfg: cfg, state: state, rs: newRootSet(roots),
+		flt: newPathFilter(cfg), ix: ix,
+		serialize: func(run func()) { mu.Lock(); defer mu.Unlock(); run() },
+	})
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := server.Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	return &mcpTestEnv{cs: cs, app: app, state: state, root: memPath}, ix
+}
+
+func TestMCPFullContextLoop(t *testing.T) {
+	env, ix := newMCPTestEnvFullLoop(t)
+
+	// get_context: profile.md doesn't exist yet, so LoadProfile creates it
+	// from the template — its section headings must show up in the render —
+	// plus the fixture repo under the dev root.
+	ctxOut := callTool[getContextOutput](t, env, "get_context", getContextInput{})
+	if !strings.Contains(ctxOut.Context, "Name & role") {
+		t.Fatalf("expected the profile template marker in get_context output, got: %s", ctxOut.Context)
+	}
+	if !strings.Contains(ctxOut.Context, "myproject") {
+		t.Fatalf("expected the fixture repo name in get_context output, got: %s", ctxOut.Context)
+	}
+
+	// remember: writes a new memory file under ~/.ney/memory.
+	remOut := callTool[rememberOutput](t, env, "remember", rememberInput{
+		Title:   "ney pivot decision",
+		Content: "Decided to reposition ney as a personal context server; zebraquokka marker.",
+	})
+	if remOut.Path == "" {
+		t.Fatal("expected a non-empty path from remember")
+	}
+	if _, err := os.Stat(remOut.Path); err != nil {
+		t.Fatalf("expected the memory file to exist on disk: %v", err)
+	}
+
+	// Simulate the memory workspace's watcher picking up the new file (the
+	// real server has one running continuously; here we just re-run Phase A
+	// once, deterministically, instead of waiting on fsnotify).
+	if _, err := ix.Index(context.Background(), env.root, "memory"); err != nil {
+		t.Fatal(err)
+	}
+
+	searchOut := callTool[searchDocumentsOutput](t, env, "search_documents", searchDocumentsInput{Query: "zebraquokka marker"})
+	found := false
+	for _, r := range searchOut.Results {
+		if r.Path == remOut.Path {
+			found = true
+			if r.Source != "index" {
+				t.Fatalf("expected source=index for the newly-indexed memory, got %q", r.Source)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected the new memory to be searchable after re-indexing, got %+v", searchOut.Results)
+	}
+}
+
+func TestMCPRememberWorksOnReadOnlyServer(t *testing.T) {
+	env := newMCPTestEnvReadOnly(t)
+
+	out := callTool[rememberOutput](t, env, "remember", rememberInput{
+		Title:   "read-only remember test",
+		Content: "written while the server is read-only",
+	})
+	if out.Path == "" {
+		t.Fatal("expected a non-empty path")
+	}
+	data, err := os.ReadFile(out.Path)
+	if err != nil {
+		t.Fatalf("expected the memory file to exist at %s: %v", out.Path, err)
+	}
+	if !strings.Contains(string(data), "written while the server is read-only") {
+		t.Fatalf("expected the written file to contain the memory content, got: %s", data)
+	}
+	wantDir := filepath.Join(config.NeyDir(), "memory")
+	if filepath.Dir(out.Path) != wantDir {
+		t.Fatalf("expected the memory to be written under %s, got %s", wantDir, out.Path)
+	}
+}
+
+func TestMCPRememberRequiresTitleAndContent(t *testing.T) {
+	env := newMCPTestEnv(t)
+	if msg := callToolExpectError(t, env, "remember", rememberInput{Content: "no title"}); !strings.Contains(msg, "title is required") {
+		t.Fatalf("expected 'title is required', got: %s", msg)
+	}
+	if msg := callToolExpectError(t, env, "remember", rememberInput{Title: "no content"}); !strings.Contains(msg, "content is required") {
+		t.Fatalf("expected 'content is required', got: %s", msg)
+	}
+}
+
+func TestMCPUpdateProfileRoundTrip(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	upOut := callTool[updateProfileOutput](t, env, "update_profile", updateProfileInput{
+		Section: "Current focus",
+		Content: "Building the layered context MCP surface.",
+	})
+	if upOut.Path == "" {
+		t.Fatal("expected a non-empty path")
+	}
+
+	ctxOut := callTool[getContextOutput](t, env, "get_context", getContextInput{})
+	if !strings.Contains(ctxOut.Context, "Building the layered context MCP surface.") {
+		t.Fatalf("expected get_context to reflect the profile update, got: %s", ctxOut.Context)
+	}
+
+	// Works read-only too, same reasoning as remember.
+	roEnv := newMCPTestEnvReadOnly(t)
+	roOut := callTool[updateProfileOutput](t, roEnv, "update_profile", updateProfileInput{
+		Section: "Working style",
+		Content: "Prefers terse commit messages.",
+	})
+	data, err := os.ReadFile(roOut.Path)
+	if err != nil {
+		t.Fatalf("expected profile.md to exist: %v", err)
+	}
+	if !strings.Contains(string(data), "Prefers terse commit messages.") {
+		t.Fatalf("expected profile.md to contain the update, got: %s", data)
 	}
 }

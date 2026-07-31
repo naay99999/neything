@@ -21,6 +21,7 @@ type Config struct {
 	Reranker    RerankerConfig    `mapstructure:"reranker"`
 	Chunking    ChunkingConfig    `mapstructure:"chunking"`
 	VectorStore VectorStoreConfig `mapstructure:"vector_store"`
+	Context     ContextConfig     `mapstructure:"context"`
 	Telemetry   bool              `mapstructure:"telemetry"`
 }
 
@@ -82,13 +83,28 @@ type HNSWConfig struct {
 	EfSearch       int `mapstructure:"ef_search"`
 }
 
+// ContextConfig controls the "layered context" get_context/list_projects
+// surface (internal/context): where to look for git repos on disk, and how
+// wide the "active" window is when deciding which projects to surface.
+type ContextConfig struct {
+	// DevRoots is where ScanRepos looks for git repositories. Defaults to
+	// ["~/workspace"] if that directory exists at load time, else empty (no
+	// live repo scan; get_context still works off indexed workspaces alone).
+	// Leading "~" is expanded against the user's home directory on load.
+	DevRoots []string `mapstructure:"dev_roots"`
+	// ActiveDays is the recency window (in days) a project's last commit
+	// must fall within to count as "active" in get_context. Defaults to 14.
+	ActiveDays int `mapstructure:"active_days"`
+}
+
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 
 # Recommended: 'ney mcp' plugs ney straight into Claude Code/Desktop/Cursor
-# as an MCP server (search_documents/read_document/list_workspaces/
-# index_status) and works zero-config — keyword search from the moment it
-# starts, semantic search once an embedder is configured. Indexes markdown
-# (.md/.markdown, + Obsidian/Notion) and plain .txt files. See README.md.
+# as an MCP server (get_context/list_projects/search_documents/read_document/
+# remember/update_profile/index_status) and works zero-config — keyword
+# search from the moment it starts, semantic search once an embedder is
+# configured. Indexes markdown (.md/.markdown, + Obsidian/Notion) and plain
+# .txt files. See README.md.
 #
 # Tip: run 'ney init' to enable semantic search. Without an embedder, ney
 # still indexes and searches by keyword (FTS).
@@ -141,6 +157,14 @@ vector_store:
     m: 16
     ef_construction: 200
     ef_search: 50
+
+# layered context (get_context / list_projects): where to look for git repos,
+# and how recent a project's last commit must be to count as "active"
+context:
+  # dev_roots defaults to ["~/workspace"] if that directory exists (checked
+  # fresh on every load), else no repo scan runs — uncomment to override:
+  # dev_roots: ["~/workspace", "~/code"]
+  active_days: 14
 
 # privacy — off by default
 telemetry: false
@@ -216,6 +240,16 @@ func Load() (*Config, error) {
 	}
 	if cfg.VectorStore.HNSW.EfSearch == 0 {
 		cfg.VectorStore.HNSW.EfSearch = 50
+	}
+	if cfg.Context.ActiveDays == 0 {
+		cfg.Context.ActiveDays = 14
+	}
+	if !v.IsSet("context.dev_roots") {
+		cfg.Context.DevRoots = defaultDevRoots()
+	} else {
+		for i, r := range cfg.Context.DevRoots {
+			cfg.Context.DevRoots[i] = expandTilde(r)
+		}
 	}
 
 	cfg.Retrieval.Mode = normalizeRetrievalMode(v)
@@ -305,6 +339,12 @@ func Validate(cfg *Config) error {
 	validVectorStore := map[string]bool{"brute": true, "hnsw": true}
 	if !validVectorStore[cfg.VectorStore.Backend] {
 		return fmt.Errorf("unknown vector_store.backend %q (valid: brute, hnsw)", cfg.VectorStore.Backend)
+	}
+	// 0 is accepted here (treated as "unset" by structs built directly in
+	// tests without setting Context.ActiveDays); Load() always normalizes it
+	// to a concrete positive value via its default-application step.
+	if cfg.Context.ActiveDays < 0 {
+		return fmt.Errorf("context.active_days must be greater than 0, got %d", cfg.Context.ActiveDays)
 	}
 	// "" is accepted here (treated as "auto" by callers) so structs built
 	// directly in tests without setting Retrieval.Mode don't need to know
@@ -450,4 +490,31 @@ func NewVectorStore(cfg *Config, db *store.DB, migrate bool) (vectorstore.Vector
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// defaultDevRoots returns ["~/workspace"] (expanded) if that directory
+// exists at load time, else an empty slice — an install with no dev_roots
+// configured and no ~/workspace simply gets no live repo scan; get_context
+// still works off indexed workspaces alone.
+func defaultDevRoots() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return []string{}
+	}
+	ws := filepath.Join(home, "workspace")
+	if fi, err := os.Stat(ws); err == nil && fi.IsDir() {
+		return []string{ws}
+	}
+	return []string{}
+}
+
+// expandTilde resolves a leading "~" or "~/..." in p to the user's home
+// directory. Paths without a leading ~ are returned unchanged.
+func expandTilde(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, strings.TrimPrefix(p[1:], "/"))
+		}
+	}
+	return p
 }

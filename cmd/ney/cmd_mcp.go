@@ -24,7 +24,7 @@ var flagMCPRoots []string
 
 var mcpCmd = &cobra.Command{
 	Use:   "mcp",
-	Short: "Run ney as an MCP server over stdio (search_documents, read_document, list_workspaces, index_status)",
+	Short: "Run ney as an MCP server over stdio (get_context, list_projects, search_documents, read_document, remember, update_profile, index_status)",
 	Long: "Run ney as an MCP server over stdio, for AI clients like Claude Code/Desktop/Cursor.\n" +
 		"Serves query tools immediately while indexing/embedding continue in the background.\n" +
 		"stdout is reserved for the MCP protocol — all diagnostics go to stderr.",
@@ -44,7 +44,7 @@ type mcpRoot struct {
 }
 
 // runMCP wires one long-lived server process: acquire the writer lock, open
-// the DB/Vectors/Embedder once for the process's lifetime, register the 4
+// the DB/Vectors/Embedder once for the process's lifetime, register the 9
 // MCP tools, and start serving over stdio immediately — Phase A indexing,
 // background embedding, and filesystem watching all happen in goroutines
 // alongside it, never blocking the first tool call.
@@ -79,6 +79,23 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 	if len(roots) == 0 {
 		fmt.Fprintln(os.Stderr, "ney mcp: no workspaces to serve yet — pass --root <path>, or run `ney index` first")
+	}
+
+	// The memory workspace (~/.ney/memory, written by the `remember` tool) is
+	// always served: read_document/search must be able to reach it in both
+	// read-write and read-only mode, and — write mode only — it's indexed
+	// and watched exactly like any other root, through the same per-root
+	// pipeline below. It's registered here directly, not through
+	// index_folder's home-directory validation, and doesn't count toward the
+	// "no workspaces to serve yet" hint above. A prior run may already have
+	// persisted it as a DB workspace (resolveMCPRoots would then have
+	// returned it above) — skip re-adding it in that case.
+	memPath := memoryDir()
+	if err := os.MkdirAll(memPath, 0700); err != nil {
+		return fmt.Errorf("create memory dir: %w", err)
+	}
+	if !hasRootNamed(roots, "memory") {
+		roots = append(roots, mcpRoot{Name: "memory", Path: memPath})
 	}
 
 	state := newServerState(rootNames(roots), readOnly)
@@ -339,6 +356,17 @@ func rootNames(roots []mcpRoot) []string {
 		names[i] = r.Name
 	}
 	return names
+}
+
+// hasRootNamed reports whether roots already contains an entry with the
+// given name.
+func hasRootNamed(roots []mcpRoot, name string) bool {
+	for _, r := range roots {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // rootSet is the live set of served roots. It starts as the startup roots

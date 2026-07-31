@@ -5,17 +5,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/naay99999/neything/internal/citation"
 	"github.com/naay99999/neything/internal/config"
+	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/scan"
 	"github.com/naay99999/neything/internal/search"
 )
+
+// memoryDir is where the `remember` tool writes memory files, and the root
+// runMCP registers as the always-served, always-indexed "memory" workspace
+// (see cmd_mcp.go's runMCP). One md file per memory (see internal/context's
+// WriteMemory), watched and indexed like any other workspace once a writer
+// holds the lock.
+func memoryDir() string {
+	return filepath.Join(config.NeyDir(), "memory")
+}
 
 // maxReadFileSize bounds read_document's direct disk read so a stray
 // multi-GB file under a watched root can't be read into memory whole by an
@@ -43,13 +55,44 @@ type mcpDeps struct {
 	startWatcher func(r mcpRoot, wsID int64, disablePrune bool)
 }
 
-// newMCPServer builds the MCP server and registers all 6 tools. Factored out
-// of runMCP so tests can construct one against an in-memory transport
+// newMCPServer builds the MCP server and registers all 9 tools (get_context,
+// list_projects, remember, update_profile, search_documents, search_folder,
+// read_document, index_folder, index_status). Factored out of runMCP so
+// tests can construct one against an in-memory transport
 // (mcp.NewInMemoryTransports) without going through stdio or the CLI's
 // lockfile/signal-handling — see mcp_test.go.
 func newMCPServer(deps mcpDeps) *mcp.Server {
 	app, cfg, state, worker, flt := deps.app, deps.cfg, deps.state, deps.worker, deps.flt
 	server := mcp.NewServer(&mcp.Implementation{Name: "ney", Version: Version}, nil)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_context",
+		Description: "Call this FIRST, at the start of a session: a small markdown blob with who the user is " +
+			"(their profile), which projects they've worked on recently (git activity across dev_roots + indexed " +
+			"workspaces), and how to dig deeper. Cheap, never fails.",
+	}, getContextHandler(deps))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_projects",
+		Description: "Full detail for every known project (git repos under dev_roots, plus every indexed " +
+			"workspace): path, branch, dirty state, last commit time + subject, indexed?, document/chunk counts. " +
+			"Use this when get_context's one-line-per-project summary isn't enough.",
+	}, listProjectsHandler(deps))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "remember",
+		Description: "Save a fact or decision to memory (~/.ney/memory), so it's still known in future sessions " +
+			"and across every connected AI client. Server derives the filename (date + sanitized title slug) — " +
+			"no path argument. Becomes searchable via search_documents within moments (works even when this " +
+			"server is read-only).",
+	}, rememberHandler())
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "update_profile",
+		Description: "Propose an edit to one section of the user's profile (~/.ney/profile.md), which get_context " +
+			"reads every session. Replaces the named section's content, or appends to it if append=true; creates " +
+			"the section if it doesn't exist yet. Works even when this server is read-only.",
+	}, updateProfileHandler())
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search_documents",
@@ -88,11 +131,6 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 			"files previously surfaced by a search_folder call this session; hidden files and secret-looking " +
 			"files (.env, keys, credentials, ...) are never served.",
 	}, readDocumentHandler(app, deps.rs, flt, state))
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_workspaces",
-		Description: "List every indexed workspace with document/chunk counts and embedding coverage (0..1).",
-	}, listWorkspacesHandler(app))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "index_status",
@@ -641,7 +679,7 @@ func windowContent(full string, offset, maxChars int) (content string, total int
 	return content, total, truncated, nextOffset
 }
 
-// --- list_workspaces -----------------------------------------------------------
+// --- get_context / list_projects: shared project-set assembly ------------------
 
 type workspaceInfo struct {
 	Name          string  `json:"name"`
@@ -651,26 +689,263 @@ type workspaceInfo struct {
 	EmbedCoverage float64 `json:"embed_coverage"`
 }
 
-type listWorkspacesInput struct{}
+// buildProjects assembles the project set both get_context and list_projects
+// render from: every git repo found live under cfg.Context.DevRoots, unioned
+// by path with every workspace root already in the DB — so a workspace that
+// isn't a git repo (a plain docs folder, or the built-in "memory" workspace)
+// still shows up as a project, just without branch/commit info. A DB
+// workspace whose root_path matches a scanned repo's path is folded into
+// that repo's entry rather than duplicated.
+//
+// Indexed is set per the *current* served root set (rs.snapshot()), not the
+// DB snapshot, so it reflects roots index_folder added this session and
+// (in read-only mode) never flips true for roots this process can't index.
+//
+// A DB error degrades rather than aborting: the caller gets the scanned
+// repos plus a non-nil error to decide how to report it (get_context must
+// never fail; list_projects may surface it as a tool error).
+func buildProjects(ctx context.Context, cfg *config.Config, app *AppState, rs *rootSet) ([]neycontext.Project, error) {
+	projects := neycontext.ScanRepos(ctx, cfg.Context.DevRoots)
+	byPath := make(map[string]bool, len(projects))
+	for _, p := range projects {
+		byPath[filepath.Clean(p.Path)] = true
+	}
 
-type listWorkspacesOutput struct {
-	Workspaces []workspaceInfo `json:"workspaces"`
+	workspaces, dberr := app.DB.ListWorkspaces()
+	for _, ws := range workspaces {
+		path := filepath.Clean(ws.RootPath)
+		if byPath[path] {
+			continue // already represented by a scanned repo at this path
+		}
+		byPath[path] = true
+		projects = append(projects, neycontext.Project{Name: ws.Name, Path: path})
+	}
+
+	roots := rs.snapshot()
+	for i := range projects {
+		projects[i].Indexed = coveredByRoot(projects[i].Path, roots)
+	}
+
+	sort.Slice(projects, func(i, j int) bool {
+		return projects[i].LastCommit.After(projects[j].LastCommit)
+	})
+	return projects, dberr
 }
 
-func listWorkspacesHandler(app *AppState) mcp.ToolHandlerFor[listWorkspacesInput, listWorkspacesOutput] {
-	return func(_ context.Context, _ *mcp.CallToolRequest, _ listWorkspacesInput) (*mcp.CallToolResult, listWorkspacesOutput, error) {
-		infos, err := computeWorkspaceInfo(app)
+// coveredByRoot reports whether path is exactly, or nested under, one of
+// roots — the same containment test read_document uses (resolveAllowedPath),
+// applied here to decide a project's Indexed flag against the live served
+// root set.
+func coveredByRoot(path string, roots []mcpRoot) bool {
+	for _, r := range roots {
+		if path == r.Path || strings.HasPrefix(path, r.Path+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// --- get_context -----------------------------------------------------------------
+
+type getContextInput struct{}
+
+type getContextOutput struct {
+	Context string `json:"context"`
+}
+
+// getContextHandler renders the Layer-1 bootstrap blob (design §"get_context
+// output"): profile + active projects + how-to-dig-deeper. Per the design's
+// "Layer 1 must never fail" principle, every failure path here degrades —
+// a broken DB read or an unreadable profile is noted in the rendered text
+// instead of returning an MCP error.
+func getContextHandler(deps mcpDeps) mcp.ToolHandlerFor[getContextInput, getContextOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ getContextInput) (*mcp.CallToolResult, getContextOutput, error) {
+		var notes []string
+
+		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs)
 		if err != nil {
-			return nil, listWorkspacesOutput{}, err
+			notes = append(notes, fmt.Sprintf("note: could not list indexed workspaces (%v) — showing scanned repos only.", err))
 		}
+
+		profilePath := filepath.Join(config.NeyDir(), "profile.md")
+		profile, created, perr := neycontext.LoadProfile(profilePath)
+		if perr != nil {
+			notes = append(notes, fmt.Sprintf("note: could not load profile.md (%v) — proceeding with an empty profile.", perr))
+			profile = ""
+		} else if created {
+			notes = append(notes, fmt.Sprintf("note: no profile existed yet — created a starter template at %s; consider filling it in via update_profile.", profilePath))
+		}
+
+		activeDays := deps.cfg.Context.ActiveDays
+		if activeDays <= 0 {
+			activeDays = 14
+		}
+		text := neycontext.Render(profile, projects, activeDays, 10, time.Now())
+		for _, n := range notes {
+			text += "\n" + n + "\n"
+		}
+
+		out := getContextOutput{Context: text}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- list_projects -----------------------------------------------------------------
+
+type projectDetail struct {
+	Name              string `json:"name"`
+	Path              string `json:"path"`
+	Branch            string `json:"branch,omitempty"`
+	Dirty             bool   `json:"dirty"`
+	LastCommit        string `json:"last_commit,omitempty"` // RFC3339; empty if unknown (not a git repo)
+	LastCommitSubject string `json:"last_commit_subject,omitempty"`
+	Indexed           bool   `json:"indexed"`
+	Documents         int    `json:"documents"`
+	Chunks            int    `json:"chunks"`
+}
+
+type listProjectsInput struct{}
+
+type listProjectsOutput struct {
+	Projects []projectDetail `json:"projects"`
+}
+
+// listProjectsHandler is the L1.5 detail view: the same project set as
+// get_context, one full detail block per project, with per-workspace
+// document/chunk counts folded in via computeWorkspaceInfo. Replaces the
+// removed list_workspaces tool.
+func listProjectsHandler(deps mcpDeps) mcp.ToolHandlerFor[listProjectsInput, listProjectsOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, _ listProjectsInput) (*mcp.CallToolResult, listProjectsOutput, error) {
+		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs)
+		if err != nil {
+			return nil, listProjectsOutput{}, err
+		}
+		wsInfo, err := computeWorkspaceInfo(deps.app)
+		if err != nil {
+			return nil, listProjectsOutput{}, err
+		}
+		docsByPath := make(map[string]workspaceInfo, len(wsInfo))
+		for _, w := range wsInfo {
+			docsByPath[filepath.Clean(w.RootPath)] = w
+		}
+
+		out := make([]projectDetail, 0, len(projects))
 		var b strings.Builder
-		fmt.Fprintf(&b, "%d workspace(s):\n", len(infos))
-		for _, w := range infos {
-			fmt.Fprintf(&b, "- %s (%s): %d documents, %d chunks, %.0f%% embedded\n",
-				w.Name, w.RootPath, w.Documents, w.Chunks, w.EmbedCoverage*100)
+		fmt.Fprintf(&b, "%d project(s):\n", len(projects))
+		for _, p := range projects {
+			d := projectDetail{
+				Name:              p.Name,
+				Path:              p.Path,
+				Branch:            p.Branch,
+				Dirty:             p.Dirty,
+				LastCommitSubject: p.LastCommitSubject,
+				Indexed:           p.Indexed,
+			}
+			if !p.LastCommit.IsZero() {
+				d.LastCommit = p.LastCommit.Format(time.RFC3339)
+			}
+			if w, ok := docsByPath[filepath.Clean(p.Path)]; ok {
+				d.Documents = w.Documents
+				d.Chunks = w.Chunks
+			}
+			out = append(out, d)
+
+			fmt.Fprintf(&b, "- %s (%s)", d.Name, d.Path)
+			if d.Branch != "" {
+				fmt.Fprintf(&b, " · %s", d.Branch)
+			}
+			if d.Dirty {
+				b.WriteString(" · dirty")
+			}
+			if d.LastCommit != "" {
+				fmt.Fprintf(&b, " · last commit %s", d.LastCommit)
+				if d.LastCommitSubject != "" {
+					fmt.Fprintf(&b, ": %q", d.LastCommitSubject)
+				}
+			}
+			if d.Indexed {
+				fmt.Fprintf(&b, " · indexed (%d docs, %d chunks)", d.Documents, d.Chunks)
+			} else {
+				b.WriteString(" · not indexed")
+			}
+			b.WriteString("\n")
 		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}},
-			listWorkspacesOutput{Workspaces: infos}, nil
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, listProjectsOutput{Projects: out}, nil
+	}
+}
+
+// --- remember ----------------------------------------------------------------------
+
+type rememberInput struct {
+	Title   string   `json:"title" jsonschema:"short title for this memory (used to derive the filename)"`
+	Content string   `json:"content" jsonschema:"the fact or decision to remember"`
+	Project string   `json:"project,omitempty" jsonschema:"optional project name this memory relates to"`
+	Tags    []string `json:"tags,omitempty" jsonschema:"optional tags"`
+}
+
+type rememberOutput struct {
+	Path string `json:"path"`
+}
+
+// rememberHandler writes a new memory file. It never touches the DB or
+// vector store — only a plain md file under memoryDir() — so per the
+// design's "Layer 1 must never fail" / read-only-mode reasoning it works
+// identically whether this server holds the writer lock or not; indexing
+// the new file is the lock holder's watcher's job.
+func rememberHandler() mcp.ToolHandlerFor[rememberInput, rememberOutput] {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in rememberInput) (*mcp.CallToolResult, rememberOutput, error) {
+		if strings.TrimSpace(in.Title) == "" {
+			return nil, rememberOutput{}, fmt.Errorf("title is required")
+		}
+		if strings.TrimSpace(in.Content) == "" {
+			return nil, rememberOutput{}, fmt.Errorf("content is required")
+		}
+		path, err := neycontext.WriteMemory(memoryDir(), neycontext.Memory{
+			Title:   in.Title,
+			Content: in.Content,
+			Project: in.Project,
+			Tags:    in.Tags,
+			Date:    time.Now(),
+		})
+		if err != nil {
+			return nil, rememberOutput{}, err
+		}
+		out := rememberOutput{Path: path}
+		text := fmt.Sprintf("Saved memory to %s. It becomes searchable via search_documents shortly (the memory workspace is watched and indexed automatically).", path)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
+// --- update_profile ------------------------------------------------------------------
+
+type updateProfileInput struct {
+	Section string `json:"section" jsonschema:"the profile section heading to edit (e.g. 'Current focus')"`
+	Content string `json:"content" jsonschema:"the new section content"`
+	Append  bool   `json:"append,omitempty" jsonschema:"append to the existing section body instead of replacing it (default: replace)"`
+}
+
+type updateProfileOutput struct {
+	Path string `json:"path"`
+}
+
+// updateProfileHandler edits one named section of ~/.ney/profile.md. Like
+// remember, it only ever touches that one plain md file — read-only-safe for
+// the same reason.
+func updateProfileHandler() mcp.ToolHandlerFor[updateProfileInput, updateProfileOutput] {
+	return func(_ context.Context, _ *mcp.CallToolRequest, in updateProfileInput) (*mcp.CallToolResult, updateProfileOutput, error) {
+		if strings.TrimSpace(in.Section) == "" {
+			return nil, updateProfileOutput{}, fmt.Errorf("section is required")
+		}
+		if strings.TrimSpace(in.Content) == "" {
+			return nil, updateProfileOutput{}, fmt.Errorf("content is required")
+		}
+		path := filepath.Join(config.NeyDir(), "profile.md")
+		if err := neycontext.UpdateProfile(path, in.Section, in.Content, in.Append); err != nil {
+			return nil, updateProfileOutput{}, err
+		}
+		out := updateProfileOutput{Path: path}
+		text := fmt.Sprintf("Updated profile section %q at %s.", in.Section, path)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
 	}
 }
 

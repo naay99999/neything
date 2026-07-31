@@ -350,3 +350,77 @@ func TestValidateAcceptsAllRetrievalModes(t *testing.T) {
 		}
 	}
 }
+
+// --- context.dev_roots / context.active_days -----------------------------------
+
+func TestValidateRejectsNegativeActiveDays(t *testing.T) {
+	cfg := baseValidCfg()
+	cfg.Context.ActiveDays = -1
+	if err := Validate(cfg); err == nil {
+		t.Fatal("expected error for negative context.active_days")
+	}
+}
+
+// TestValidateZeroActiveDaysAccepted guards the "unset" convention shared
+// with Retrieval.Mode's "": structs built directly in tests (bypassing
+// Load()'s defaulting step) leave ActiveDays at its zero value and must
+// still validate — Load() is the only place that turns 0 into 14.
+func TestValidateZeroActiveDaysAccepted(t *testing.T) {
+	cfg := baseValidCfg()
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("zero (unset) context.active_days should validate: %v", err)
+	}
+}
+
+func TestLoadDefaultsActiveDaysTo14(t *testing.T) {
+	cfg := writeTestConfig(t, "embedder:\n  provider: none\n")
+	if cfg.Context.ActiveDays != 14 {
+		t.Fatalf("expected default context.active_days=14, got %d", cfg.Context.ActiveDays)
+	}
+}
+
+func TestLoadDevRootsDefaultsToWorkspaceIfExists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	neyDir := filepath.Join(dir, ".ney")
+	if err := os.MkdirAll(neyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(neyDir, "config.yaml"), []byte("embedder:\n  provider: none\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := filepath.Join(dir, "workspace")
+	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != want {
+		t.Fatalf("expected dev_roots=[%s], got %v", want, cfg.Context.DevRoots)
+	}
+}
+
+func TestLoadDevRootsDefaultsToEmptyIfWorkspaceMissing(t *testing.T) {
+	cfg := writeTestConfig(t, "embedder:\n  provider: none\n")
+	if len(cfg.Context.DevRoots) != 0 {
+		t.Fatalf("expected empty dev_roots when ~/workspace doesn't exist, got %v", cfg.Context.DevRoots)
+	}
+}
+
+func TestLoadDevRootsExpandsTilde(t *testing.T) {
+	cfg := writeTestConfig(t, "context:\n  dev_roots: [\"~/code\"]\n")
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, "code")
+	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != want {
+		t.Fatalf("expected dev_roots=[%s], got %v", want, cfg.Context.DevRoots)
+	}
+}
+
+func TestLoadDevRootsExplicitValueOverridesDefault(t *testing.T) {
+	cfg := writeTestConfig(t, "context:\n  dev_roots: [\"/srv/repos\"]\n")
+	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != "/srv/repos" {
+		t.Fatalf("expected explicit dev_roots to win, got %v", cfg.Context.DevRoots)
+	}
+}
