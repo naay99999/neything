@@ -1,5 +1,7 @@
 package search
 
+import "sort"
+
 const defaultRRFK = 60
 
 // ReciprocalRankFusion merges semantic and keyword result lists by chunk ID.
@@ -49,12 +51,13 @@ func ReciprocalRankFusion(semantic, keyword []EnrichedResult, rrfK int) []Enrich
 	return results
 }
 
+// sortByScoreDesc sorts by score descending, breaking ties by chunk ID
+// ascending so results are deterministic regardless of map iteration order.
 func sortByScoreDesc(results []EnrichedResult) {
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].Score > results[i].Score {
-				results[i], results[j] = results[j], results[i]
-			}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
 		}
-	}
+		return results[i].ChunkID < results[j].ChunkID
+	})
 }

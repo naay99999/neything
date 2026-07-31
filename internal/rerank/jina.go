@@ -34,10 +34,7 @@ func (r *JinaReranker) Rerank(ctx context.Context, query string, candidates []Ca
 		return nil, nil
 	}
 
-	docs := make([]string, len(candidates))
-	for i, c := range candidates {
-		docs[i] = c.Content
-	}
+	docs := docsForRerank(candidates)
 
 	body, _ := json.Marshal(map[string]any{
 		"model":     r.Model,

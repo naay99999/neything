@@ -49,11 +49,22 @@ func (e *OpenAIEmbedder) Dimensions() int {
 	}
 }
 
+// openAIMaxBatchSize is OpenAI's documented /v1/embeddings request-size
+// ceiling — see MaxBatchSize, consumed by EmbedWorker's provider-aware
+// batching (internal/index/embedworker.go) so it actually hands Embed
+// batches this large instead of the old flat default of 32. The chunking
+// loop in Embed below stays as a defensive fallback for any other caller
+// that hands it more than openAIMaxBatchSize texts at once.
+const openAIMaxBatchSize = 100
+
+// MaxBatchSize reports OpenAI's /v1/embeddings request-size ceiling — see
+// the batchSizer capability EmbedWorker looks for.
+func (e *OpenAIEmbedder) MaxBatchSize() int { return openAIMaxBatchSize }
+
 func (e *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	const batchSize = 100
 	var all [][]float32
-	for i := 0; i < len(texts); i += batchSize {
-		end := i + batchSize
+	for i := 0; i < len(texts); i += openAIMaxBatchSize {
+		end := i + openAIMaxBatchSize
 		if end > len(texts) {
 			end = len(texts)
 		}

@@ -2,9 +2,6 @@ package loader
 
 import (
 	"context"
-	"crypto/sha256"
-	"fmt"
-	"os"
 	"strings"
 )
 
@@ -23,13 +20,8 @@ func (n *NotionLoader) Supports(path string) bool {
 	return isNotionExport(peek)
 }
 
-func (n *NotionLoader) Load(_ context.Context, path string) ([]Document, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func (n *NotionLoader) Load(_ context.Context, path string, data []byte, hash string) ([]Document, error) {
 	content := string(data)
-	hash := fmt.Sprintf("%x", sha256.Sum256(data))
 	body := stripNotionPropertyTable(content)
 	posMap := buildLinePositionMap(body)
 
@@ -60,13 +52,8 @@ func (o *ObsidianLoader) Supports(path string) bool {
 	return isObsidianNote(peek)
 }
 
-func (o *ObsidianLoader) Load(_ context.Context, path string) ([]Document, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func (o *ObsidianLoader) Load(_ context.Context, path string, data []byte, hash string) ([]Document, error) {
 	content := string(data)
-	hash := fmt.Sprintf("%x", sha256.Sum256(data))
 
 	fm := parseFrontmatter(content)
 	body := fm.body

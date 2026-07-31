@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/naay99999/neything/internal/citation"
@@ -53,6 +54,12 @@ type mcpDeps struct {
 	ix           *index.Indexer
 	serialize    func(func())
 	startWatcher func(r mcpRoot, wsID int64, disablePrune bool)
+	// scanCache memoizes buildProjects' ScanRepos call for a short TTL, so
+	// get_context immediately followed by list_projects (or vice versa)
+	// reuses one scan instead of re-forking git per repo twice. nil is valid
+	// (falls back to an uncached scan every call) — tests that don't care
+	// about this optimization can leave it unset.
+	scanCache *neycontext.ScanCache
 }
 
 // newMCPServer builds the MCP server and registers all 9 tools (get_context,
@@ -658,20 +665,52 @@ func resolveAllowedPath(rawPath string, roots []mcpRoot) (string, mcpRoot, error
 // offset_chars/max_chars naming) starting at offset for up to maxChars
 // characters, reporting the total length, whether more remains, and the
 // offset a follow-up call should use to continue.
+//
+// This decodes full incrementally via utf8.DecodeRuneInString, tracking
+// byte offsets, instead of allocating a []rune copy of the whole string —
+// for a large file (read_document caps single reads at maxReadFileSize) that
+// conversion would allocate up to ~4x the file's size (each rune is an
+// int32) on every single paginated call, even when only a small window is
+// requested. The returned content is a zero-copy substring of full (Go
+// string slicing shares the backing array, no allocation). Computing an
+// exact total still requires visiting every byte once — same as before —
+// but with no per-call rune-array allocation and no second copy to rebuild
+// the windowed string.
 func windowContent(full string, offset, maxChars int) (content string, total int, truncated bool, nextOffset int) {
-	runes := []rune(full)
-	total = len(runes)
 	if offset < 0 {
 		offset = 0
 	}
-	if offset > total {
-		offset = total
+	if maxChars < 0 {
+		maxChars = 0
 	}
 	end := offset + maxChars
-	if end > total {
-		end = total
+
+	startByte, endByte := -1, -1
+	runeCount := 0
+	byteOffset := 0
+	for byteOffset < len(full) {
+		if runeCount == offset {
+			startByte = byteOffset
+		}
+		if runeCount == end {
+			endByte = byteOffset
+		}
+		_, size := utf8.DecodeRuneInString(full[byteOffset:])
+		byteOffset += size
+		runeCount++
 	}
-	content = string(runes[offset:end])
+	total = runeCount
+	// A target at or beyond EOF (offset/end >= total) never gets set inside
+	// the loop above — clamp it to EOF, matching the old []rune-slice
+	// clamping behavior (runes[total:] == "").
+	if startByte == -1 {
+		startByte = len(full)
+	}
+	if endByte == -1 {
+		endByte = len(full)
+	}
+
+	content = full[startByte:endByte]
 	truncated = end < total
 	if truncated {
 		nextOffset = end
@@ -704,8 +743,19 @@ type workspaceInfo struct {
 // A DB error degrades rather than aborting: the caller gets the scanned
 // repos plus a non-nil error to decide how to report it (get_context must
 // never fail; list_projects may surface it as a tool error).
-func buildProjects(ctx context.Context, cfg *config.Config, app *AppState, rs *rootSet) ([]neycontext.Project, error) {
-	projects := neycontext.ScanRepos(ctx, cfg.Context.DevRoots)
+//
+// scanCache, when non-nil, memoizes the ScanRepos call for a short TTL so a
+// get_context call immediately followed by list_projects (a common
+// session-start pattern) reuses one scan instead of forking git 3x per repo
+// twice over. A nil scanCache (e.g. in tests that don't wire one) just scans
+// fresh every call — same behavior as before this cache existed.
+func buildProjects(ctx context.Context, cfg *config.Config, app *AppState, rs *rootSet, scanCache *neycontext.ScanCache) ([]neycontext.Project, error) {
+	var projects []neycontext.Project
+	if scanCache != nil {
+		projects = scanCache.Get(ctx, cfg.Context.DevRoots)
+	} else {
+		projects = neycontext.ScanRepos(ctx, cfg.Context.DevRoots)
+	}
 	byPath := make(map[string]bool, len(projects))
 	for _, p := range projects {
 		byPath[filepath.Clean(p.Path)] = true
@@ -762,7 +812,7 @@ func getContextHandler(deps mcpDeps) mcp.ToolHandlerFor[getContextInput, getCont
 	return func(ctx context.Context, _ *mcp.CallToolRequest, _ getContextInput) (*mcp.CallToolResult, getContextOutput, error) {
 		var notes []string
 
-		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs)
+		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs, deps.scanCache)
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("note: could not list indexed workspaces (%v) — showing scanned repos only.", err))
 		}
@@ -816,11 +866,14 @@ type listProjectsOutput struct {
 // removed list_workspaces tool.
 func listProjectsHandler(deps mcpDeps) mcp.ToolHandlerFor[listProjectsInput, listProjectsOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, _ listProjectsInput) (*mcp.CallToolResult, listProjectsOutput, error) {
-		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs)
+		projects, err := buildProjects(ctx, deps.cfg, deps.app, deps.rs, deps.scanCache)
 		if err != nil {
 			return nil, listProjectsOutput{}, err
 		}
-		wsInfo, err := computeWorkspaceInfo(deps.app)
+		// list_projects doesn't surface EmbedCoverage (only Documents/Chunks
+		// are read below), so skip building the vector-ID set entirely — see
+		// computeWorkspaceInfo's withCoverage param.
+		wsInfo, err := computeWorkspaceInfo(deps.app, false)
 		if err != nil {
 			return nil, listProjectsOutput{}, err
 		}
@@ -949,49 +1002,66 @@ func updateProfileHandler() mcp.ToolHandlerFor[updateProfileInput, updateProfile
 	}
 }
 
-// computeWorkspaceInfo builds counts + embedding coverage per workspace.
-// Vector IDs are fetched once (app.Vectors.IDs()) and reused as an in-memory
-// set for every workspace's diff, per the design's "build vector ID set once
-// per call; fine at current scale" note — avoids an O(workspaces) number of
-// full vector-store scans.
-func computeWorkspaceInfo(app *AppState) ([]workspaceInfo, error) {
+// computeWorkspaceInfo builds document/chunk counts per workspace via
+// SELECT COUNT(*) (internal/store/counts.go) instead of loading full
+// document rows or chunk-ID slices just to take len() of them.
+//
+// When withCoverage is false (list_projects, which never reads
+// EmbedCoverage from its output), counting is all that happens — no vector
+// IDs are touched. When withCoverage is true (index_status, which reports
+// "N% embedded"), app.Vectors.IDs() is fetched exactly once and reused as an
+// in-memory set for every workspace's diff against its chunk IDs, per the
+// design's "build vector ID set once per call; fine at current scale" note —
+// avoiding an O(workspaces) number of full vector-store scans. Computing
+// exact coverage still needs the actual chunk IDs (to diff against vector
+// IDs), so that part falls back to GetChunkIDsByWorkspace regardless.
+func computeWorkspaceInfo(app *AppState, withCoverage bool) ([]workspaceInfo, error) {
 	workspaces, err := app.DB.ListWorkspaces()
 	if err != nil {
 		return nil, err
 	}
 
-	vecIDs := make(map[string]bool, app.Vectors.Count())
-	for _, id := range app.Vectors.IDs() {
-		vecIDs[id] = true
+	var vecIDs map[string]bool
+	if withCoverage {
+		vecIDs = make(map[string]bool, app.Vectors.Count())
+		for _, id := range app.Vectors.IDs() {
+			vecIDs[id] = true
+		}
 	}
 
 	out := make([]workspaceInfo, 0, len(workspaces))
 	for _, ws := range workspaces {
-		docs, err := app.DB.GetDocumentsByWorkspace(ws.ID)
+		docCount, err := app.DB.CountDocumentsByWorkspace(ws.ID)
 		if err != nil {
 			return nil, err
 		}
-		chunkIDs, err := app.DB.GetChunkIDsByWorkspace(ws.ID)
-		if err != nil {
-			return nil, err
-		}
-		coverage := 0.0
-		if len(chunkIDs) > 0 {
-			embedded := 0
-			for _, id := range chunkIDs {
-				if vecIDs[strconv.FormatInt(id, 10)] {
-					embedded++
-				}
+
+		info := workspaceInfo{Name: ws.Name, RootPath: ws.RootPath, Documents: docCount}
+		if withCoverage {
+			chunkIDs, err := app.DB.GetChunkIDsByWorkspace(ws.ID)
+			if err != nil {
+				return nil, err
 			}
-			coverage = float64(embedded) / float64(len(chunkIDs))
+			coverage := 0.0
+			if len(chunkIDs) > 0 {
+				embedded := 0
+				for _, id := range chunkIDs {
+					if vecIDs[strconv.FormatInt(id, 10)] {
+						embedded++
+					}
+				}
+				coverage = float64(embedded) / float64(len(chunkIDs))
+			}
+			info.Chunks = len(chunkIDs)
+			info.EmbedCoverage = coverage
+		} else {
+			chunkCount, err := app.DB.CountChunksByWorkspace(ws.ID)
+			if err != nil {
+				return nil, err
+			}
+			info.Chunks = chunkCount
 		}
-		out = append(out, workspaceInfo{
-			Name:          ws.Name,
-			RootPath:      ws.RootPath,
-			Documents:     len(docs),
-			Chunks:        len(chunkIDs),
-			EmbedCoverage: coverage,
-		})
+		out = append(out, info)
 	}
 	return out, nil
 }
@@ -1025,7 +1095,7 @@ type indexStatusOutput struct {
 
 func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker) mcp.ToolHandlerFor[indexStatusInput, indexStatusOutput] {
 	return func(_ context.Context, _ *mcp.CallToolRequest, _ indexStatusInput) (*mcp.CallToolResult, indexStatusOutput, error) {
-		infos, err := computeWorkspaceInfo(app)
+		infos, err := computeWorkspaceInfo(app, true)
 		if err != nil {
 			return nil, indexStatusOutput{}, err
 		}

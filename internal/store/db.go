@@ -70,7 +70,11 @@ func Open(dbPath string) (*DB, error) {
 	// busy_timeout: with WAL, a second process can open/read while a writer
 	// holds a write transaction (e.g. read-only `ney mcp` starting up while a
 	// read-write one is indexing) — wait briefly instead of failing SQLITE_BUSY.
-	if _, err := sqldb.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
+	// synchronous=NORMAL is safe (not just fast) under WAL: durability is only
+	// at risk on an OS crash, not a process crash, and a checkpoint still
+	// fsyncs. cache_size/temp_store trade memory for fewer spills to disk
+	// during indexing's chunk/FTS writes.
+	if _, err := sqldb.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA temp_store=MEMORY;"); err != nil {
 		sqldb.Close()
 		return nil, fmt.Errorf("set pragmas: %w", err)
 	}
@@ -96,16 +100,14 @@ func (d *DB) Begin() (*sql.Tx, error) { return d.db.Begin() }
 // Workspace
 
 func (d *DB) UpsertWorkspace(name, rootPath string) (int64, error) {
-	_, err := d.db.Exec(
-		`INSERT INTO workspaces(name, root_path) VALUES(?, ?)
-		 ON CONFLICT(name) DO UPDATE SET root_path=excluded.root_path`,
-		name, rootPath,
-	)
-	if err != nil {
-		return 0, err
-	}
 	var id int64
-	if err := d.db.QueryRow(`SELECT id FROM workspaces WHERE name=?`, name).Scan(&id); err != nil {
+	err := d.db.QueryRow(
+		`INSERT INTO workspaces(name, root_path) VALUES(?, ?)
+		 ON CONFLICT(name) DO UPDATE SET root_path=excluded.root_path
+		 RETURNING id`,
+		name, rootPath,
+	).Scan(&id)
+	if err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -146,7 +148,8 @@ func (d *DB) DeleteWorkspace(id int64) error {
 // Document
 
 func (d *DB) UpsertDocument(doc *Document) (int64, error) {
-	_, err := d.db.Exec(
+	var id int64
+	err := d.db.QueryRow(
 		`INSERT INTO documents(workspace_id, path, type, hash, size_bytes, indexed_at)
 		 VALUES(?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
@@ -154,14 +157,11 @@ func (d *DB) UpsertDocument(doc *Document) (int64, error) {
 		   type=excluded.type,
 		   hash=excluded.hash,
 		   size_bytes=excluded.size_bytes,
-		   indexed_at=excluded.indexed_at`,
+		   indexed_at=excluded.indexed_at
+		 RETURNING id`,
 		doc.WorkspaceID, doc.Path, doc.Type, doc.Hash, doc.SizeBytes, time.Now(),
-	)
+	).Scan(&id)
 	if err != nil {
-		return 0, err
-	}
-	var id int64
-	if err := d.db.QueryRow(`SELECT id FROM documents WHERE path=?`, doc.Path).Scan(&id); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -176,6 +176,54 @@ func (d *DB) GetDocumentByPath(path string) (*Document, error) {
 		return nil, nil
 	}
 	return doc, err
+}
+
+// GetDocumentsByPaths batch-fetches document rows keyed by path, batching
+// IN(...) lists at idBatchSize. Used by the indexer's rename-detection pass
+// to replace a GetDocumentByPath call per (missing-document, candidate-path)
+// pair with one query per batch of candidates.
+func (d *DB) GetDocumentsByPaths(paths []string) (map[string]*Document, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]*Document, len(paths))
+	for start := 0; start < len(paths); start += idBatchSize {
+		end := start + idBatchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, p := range batch {
+			placeholders[i] = "?"
+			args[i] = p
+		}
+		rows, err := d.db.Query(
+			`SELECT id, workspace_id, path, type, hash, size_bytes, indexed_at FROM documents WHERE path IN (`+
+				strings.Join(placeholders, ",")+`)`,
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			doc := &Document{}
+			if err := rows.Scan(&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Type, &doc.Hash, &doc.SizeBytes, &doc.IndexedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[doc.Path] = doc
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		// Close explicitly (not deferred) before the next batch's Query —
+		// SetMaxOpenConns(1) means an open sql.Rows would block it.
+		rows.Close()
+	}
+	return out, nil
 }
 
 func (d *DB) GetDocumentsByWorkspace(workspaceID int64) ([]*Document, error) {
@@ -279,34 +327,50 @@ func (d *DB) InsertChunks(tx *sql.Tx, chunks []*Chunk) error {
 	return nil
 }
 
+// idBatchSize keeps IN(...) lists well under SQLite's bound-variable limit
+// for large ID slices — mirrors ftsDeleteBatch in fts.go.
+const idBatchSize = 500
+
 func (d *DB) GetChunksByIDs(ids []int64) ([]*Chunk, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := d.db.Query(
-		`SELECT id, document_id, chunk_index, content, start_pos, end_pos FROM chunks WHERE id IN (`+
-			strings.Join(placeholders, ",")+`)`,
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []*Chunk
-	for rows.Next() {
-		c := &Chunk{}
-		if err := rows.Scan(&c.ID, &c.DocumentID, &c.ChunkIndex, &c.Content, &c.StartPos, &c.EndPos); err != nil {
+	for start := 0; start < len(ids); start += idBatchSize {
+		end := start + idBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := d.db.Query(
+			`SELECT id, document_id, chunk_index, content, start_pos, end_pos FROM chunks WHERE id IN (`+
+				strings.Join(placeholders, ",")+`)`,
+			args...,
+		)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		for rows.Next() {
+			c := &Chunk{}
+			if err := rows.Scan(&c.ID, &c.DocumentID, &c.ChunkIndex, &c.Content, &c.StartPos, &c.EndPos); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, c)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // GetChunksByDocumentOrdered returns every chunk row for docID ordered by
@@ -371,34 +435,46 @@ func (d *DB) GetDocumentsByChunkIDs(chunkIDs []int64) (map[int64]*DocWithWorkspa
 	if len(chunkIDs) == 0 {
 		return nil, nil
 	}
-	placeholders := make([]string, len(chunkIDs))
-	args := make([]any, len(chunkIDs))
-	for i, id := range chunkIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := d.db.Query(
-		`SELECT c.id, d.id, d.workspace_id, d.path, d.type, d.hash, d.size_bytes, d.indexed_at, w.name
-		 FROM chunks c
-		 JOIN documents d ON d.id = c.document_id
-		 JOIN workspaces w ON w.id = d.workspace_id
-		 WHERE c.id IN (`+strings.Join(placeholders, ",")+`)`,
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[int64]*DocWithWorkspace)
-	for rows.Next() {
-		var chunkID int64
-		dw := &DocWithWorkspace{}
-		if err := rows.Scan(&chunkID, &dw.ID, &dw.WorkspaceID, &dw.Path, &dw.Type, &dw.Hash, &dw.SizeBytes, &dw.IndexedAt, &dw.WorkspaceName); err != nil {
+	out := make(map[int64]*DocWithWorkspace, len(chunkIDs))
+	for start := 0; start < len(chunkIDs); start += idBatchSize {
+		end := start + idBatchSize
+		if end > len(chunkIDs) {
+			end = len(chunkIDs)
+		}
+		batch := chunkIDs[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := d.db.Query(
+			`SELECT c.id, d.id, d.workspace_id, d.path, d.type, d.hash, d.size_bytes, d.indexed_at, w.name
+			 FROM chunks c
+			 JOIN documents d ON d.id = c.document_id
+			 JOIN workspaces w ON w.id = d.workspace_id
+			 WHERE c.id IN (`+strings.Join(placeholders, ",")+`)`,
+			args...,
+		)
+		if err != nil {
 			return nil, err
 		}
-		out[chunkID] = dw
+		for rows.Next() {
+			var chunkID int64
+			dw := &DocWithWorkspace{}
+			if err := rows.Scan(&chunkID, &dw.ID, &dw.WorkspaceID, &dw.Path, &dw.Type, &dw.Hash, &dw.SizeBytes, &dw.IndexedAt, &dw.WorkspaceName); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[chunkID] = dw
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Provider / IndexMeta

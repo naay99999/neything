@@ -5,29 +5,33 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
+	"runtime"
 	"sync"
 )
 
+// parallelSearchThreshold is the store size above which Search shards the
+// scan across goroutines. Below it, goroutine setup overhead isn't worth
+// it.
+const parallelSearchThreshold = 5000
+
 type BruteForceStore struct {
-	mu      sync.RWMutex
-	items   []VectorItem
-	norms   []float32      // norms[i] = |items[i].Vector|, cached for search
-	idx     map[string]int // ID → position in items
-	path    string
-	unsaved bool
+	mu    sync.RWMutex
+	items []VectorItem
+	norms []float32      // norms[i] = |items[i].Vector|, cached for search
+	idx   map[string]int // ID → position in items
+	flat  *flatFile
 }
 
 func NewBruteForceStore(path string) (*BruteForceStore, error) {
-	s := &BruteForceStore{path: path, idx: make(map[string]int)}
-	if err := s.load(); err != nil && !os.IsNotExist(err) {
+	s := &BruteForceStore{idx: make(map[string]int), flat: newFlatFile(path)}
+	if err := s.load(); err != nil {
 		return nil, fmt.Errorf("load vectors: %w", err)
 	}
 	return s, nil
 }
 
 func (s *BruteForceStore) load() error {
-	items, err := loadFlatVectors(s.path)
+	items, err := s.flat.load()
 	if err != nil {
 		return err
 	}
@@ -54,8 +58,8 @@ func (s *BruteForceStore) Add(_ context.Context, items []VectorItem) error {
 			s.items = append(s.items, item)
 			s.norms = append(s.norms, norm(item.Vector))
 		}
+		s.flat.stageAdd(item)
 	}
-	s.unsaved = true
 	return nil
 }
 
@@ -75,11 +79,20 @@ func (s *BruteForceStore) Search(_ context.Context, query []float32, k int) ([]S
 		return nil, nil
 	}
 
+	if len(s.items) < parallelSearchThreshold {
+		return searchTopK(s.items, s.norms, query, qNorm, k), nil
+	}
+	return parallelSearchTopK(s.items, s.norms, query, qNorm, k), nil
+}
+
+// searchTopK scans items[i] against query serially, returning the top k by
+// cosine similarity in descending score order.
+func searchTopK(items []VectorItem, norms []float32, query []float32, qNorm float32, k int) []SearchResult {
 	h := &minHeap{}
 	heap.Init(h)
 
-	for i, item := range s.items {
-		n := s.norms[i]
+	for i, item := range items {
+		n := norms[i]
 		if n == 0 {
 			continue
 		}
@@ -96,7 +109,61 @@ func (s *BruteForceStore) Search(_ context.Context, query []float32, k int) ([]S
 	for i := len(results) - 1; i >= 0; i-- {
 		results[i] = heap.Pop(h).(SearchResult)
 	}
-	return results, nil
+	return results
+}
+
+// parallelSearchTopK shards items across GOMAXPROCS-bounded goroutines,
+// each computing a local top-k via searchTopK, then merges the shard
+// results into a single top-k. Same result set as searchTopK (modulo
+// arbitrary tie-break ordering on exactly-equal scores).
+func parallelSearchTopK(items []VectorItem, norms []float32, query []float32, qNorm float32, k int) []SearchResult {
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(items) {
+		workers = len(items)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	shardSize := (len(items) + workers - 1) / workers
+
+	shardResults := make([][]SearchResult, 0, workers)
+	resultsCh := make(chan []SearchResult, workers)
+	var wg sync.WaitGroup
+	for start := 0; start < len(items); start += shardSize {
+		end := start + shardSize
+		if end > len(items) {
+			end = len(items)
+		}
+		wg.Add(1)
+		go func(items []VectorItem, norms []float32) {
+			defer wg.Done()
+			resultsCh <- searchTopK(items, norms, query, qNorm, k)
+		}(items[start:end], norms[start:end])
+	}
+	wg.Wait()
+	close(resultsCh)
+	for r := range resultsCh {
+		shardResults = append(shardResults, r)
+	}
+
+	merged := &minHeap{}
+	heap.Init(merged)
+	for _, shard := range shardResults {
+		for _, r := range shard {
+			if merged.Len() < k {
+				heap.Push(merged, r)
+			} else if r.Score > (*merged)[0].Score {
+				heap.Pop(merged)
+				heap.Push(merged, r)
+			}
+		}
+	}
+
+	out := make([]SearchResult, merged.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(merged).(SearchResult)
+	}
+	return out
 }
 
 func (s *BruteForceStore) Delete(_ context.Context, ids []string) error {
@@ -105,8 +172,14 @@ func (s *BruteForceStore) Delete(_ context.Context, ids []string) error {
 
 	del := make(map[string]bool, len(ids))
 	for _, id := range ids {
-		del[id] = true
+		if _, exists := s.idx[id]; exists {
+			del[id] = true
+		}
 	}
+	if len(del) == 0 {
+		return nil
+	}
+
 	filteredItems := s.items[:0]
 	filteredNorms := s.norms[:0]
 	for i, item := range s.items {
@@ -121,21 +194,16 @@ func (s *BruteForceStore) Delete(_ context.Context, ids []string) error {
 	for i, item := range s.items {
 		s.idx[item.ID] = i
 	}
-	s.unsaved = true
+	for id := range del {
+		s.flat.stageDelete(id)
+	}
 	return nil
 }
 
 func (s *BruteForceStore) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.unsaved {
-		return nil
-	}
-	if err := saveFlatVectors(s.path, s.items); err != nil {
-		return err
-	}
-	s.unsaved = false
-	return nil
+	return s.flat.flush(func() []VectorItem { return s.items })
 }
 
 func (s *BruteForceStore) Count() int {

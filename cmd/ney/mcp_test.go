@@ -303,6 +303,60 @@ func TestMCPReadDocumentPlainTextWindowing(t *testing.T) {
 	}
 }
 
+// TestWindowContentMultibyteEquivalence checks windowContent's incremental
+// byte-offset decode (added to avoid allocating a full []rune copy of large
+// files on every paginated read_document call) against a naive
+// []rune-slice reference implementation — the exact algorithm windowContent
+// used before that change — across Thai (3-byte) and emoji (4-byte) UTF-8
+// content, and offsets that land mid-rune-boundary-adjacent, at the very
+// end, and past the end of the content.
+func TestWindowContentMultibyteEquivalence(t *testing.T) {
+	reference := func(full string, offset, maxChars int) (string, int, bool, int) {
+		runes := []rune(full)
+		total := len(runes)
+		if offset < 0 {
+			offset = 0
+		}
+		if offset > total {
+			offset = total
+		}
+		end := offset + maxChars
+		if end > total {
+			end = total
+		}
+		content := string(runes[offset:end])
+		truncated := end < total
+		next := 0
+		if truncated {
+			next = end
+		}
+		return content, total, truncated, next
+	}
+
+	samples := []string{
+		"สวัสดีครับ นี่คือการทดสอบภาษาไทย ทดสอบตัวอักษรหลายไบต์", // Thai, 3-byte runes
+		"hello 👋 world 🌍 multibyte emoji test 🚀🚀🚀 done", // emoji, 4-byte runes
+		"mixed ภาษาไทย and 🎉 emoji and plain ascii text together",
+		"",
+		"x",
+	}
+	offsets := []int{0, 1, 3, 5, 100, -1}
+	maxCharsCases := []int{0, 1, 2, 5, 1000}
+
+	for _, s := range samples {
+		for _, off := range offsets {
+			for _, mc := range maxCharsCases {
+				wantContent, wantTotal, wantTrunc, wantNext := reference(s, off, mc)
+				gotContent, gotTotal, gotTrunc, gotNext := windowContent(s, off, mc)
+				if gotContent != wantContent || gotTotal != wantTotal || gotTrunc != wantTrunc || gotNext != wantNext {
+					t.Errorf("windowContent(%q, %d, %d) = (%q, %d, %v, %d), want (%q, %d, %v, %d)",
+						s, off, mc, gotContent, gotTotal, gotTrunc, gotNext, wantContent, wantTotal, wantTrunc, wantNext)
+				}
+			}
+		}
+	}
+}
+
 // --- read_document: path guard --------------------------------------------------
 
 func TestMCPReadDocumentPathGuardRejectsOutsidePath(t *testing.T) {

@@ -28,7 +28,7 @@ func TestTextLoaderLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	docs, err := (&TextLoader{}).Load(context.Background(), path)
+	docs, err := (&TextLoader{}).Load(context.Background(), path, []byte(content), "testhash")
 	if err != nil {
 		t.Fatal(err)
 	}

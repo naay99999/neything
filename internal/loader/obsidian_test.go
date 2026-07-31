@@ -2,10 +2,20 @@ package loader
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 
 func TestNotionLoader(t *testing.T) {
 	path := filepath.Join("testdata", "notion.md")
@@ -13,7 +23,7 @@ func TestNotionLoader(t *testing.T) {
 	if !l.Supports(path) {
 		t.Fatal("expected supports notion md")
 	}
-	docs, err := l.Load(context.Background(), path)
+	docs, err := l.Load(context.Background(), path, mustReadFile(t, path), "testhash")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +45,7 @@ func TestObsidianLoader(t *testing.T) {
 	if !l.Supports(path) {
 		t.Fatal("expected supports obsidian md")
 	}
-	docs, err := l.Load(context.Background(), path)
+	docs, err := l.Load(context.Background(), path, mustReadFile(t, path), "testhash")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +66,7 @@ func TestMarkdownLoaderPlainFallback(t *testing.T) {
 	if (&NotionLoader{}).Supports(path) || (&ObsidianLoader{}).Supports(path) {
 		t.Fatal("specialized loaders should not claim plain md")
 	}
-	docs, err := (&MarkdownLoader{}).Load(context.Background(), path)
+	docs, err := (&MarkdownLoader{}).Load(context.Background(), path, mustReadFile(t, path), "testhash")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +91,7 @@ func TestRegistryDispatchOrder(t *testing.T) {
 		if !ok {
 			t.Fatalf("no loader for %s", path)
 		}
-		docs, err := ld.Load(context.Background(), path)
+		docs, err := ld.Load(context.Background(), path, mustReadFile(t, path), "testhash")
 		if err != nil {
 			t.Fatalf("load %s: %v", path, err)
 		}

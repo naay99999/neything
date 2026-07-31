@@ -35,6 +35,8 @@ func (e *ErrEmbedderMismatch) Error() string {
 
 const (
 	// defaultEmbedBatchSize mirrors the pipeline's old embed batch size.
+	// Only used when the configured Embedder doesn't report a preferred
+	// batch size via the batchSizer capability (see batchSize()).
 	defaultEmbedBatchSize = 32
 
 	// chunkIDPageSize bounds how many chunk IDs GetChunkIDsPage fetches per
@@ -50,18 +52,48 @@ const (
 	// §4.2) unresolved until the next Notify.
 	orphanBatchThreshold = 50
 
-	// flushEveryBatches bounds how much embedded work a crash could lose
-	// between flushes, similar in spirit to the pipeline's flushEveryDocs.
-	flushEveryBatches = 4
+	// flushInterval bounds how much embedded work a crash could lose between
+	// flushes. It replaces a batch-count trigger (flush every N batches):
+	// with provider-aware batch sizes now up to ~100 chunks/batch (see
+	// batchSize()), a fixed batch count amplified into a much bigger — and
+	// increasingly provider-dependent — number of unflushed chunks. A wall
+	// clock bound is provider-agnostic and gives a predictable worst-case
+	// data-loss window regardless of batch size. Run always flushes once
+	// more at end-of-drain (and on every error/cancellation exit path)
+	// regardless of this interval.
+	flushInterval = 30 * time.Second
 
-	// maxConsecutiveFailures is how many retries (with backoff) a single
-	// batch gets before Run gives up and returns the error — enough to ride
-	// out a brief outage without hanging forever on a truly broken embedder.
+	// maxConsecutiveFailures is how many retries (with backoff) a batch gets
+	// before it's treated as broken — enough to ride out a brief outage
+	// without hanging forever on a truly broken embedder. For a batch of
+	// more than one chunk, exhausting this budget triggers bisection
+	// (embedChunksBisect) rather than aborting the whole Run — see there.
 	maxConsecutiveFailures = 5
+
+	// bisectAttempts/bisectRetryDelay govern retries for the sub-batches
+	// embedChunksBisect tries while isolating a poison chunk. The top-level
+	// batch already paid the full maxConsecutiveFailures/backoff cost before
+	// bisection ever starts, so each split only needs a couple of quick
+	// retries to rule out transient noise before splitting further or
+	// quarantining — not another full exponential-backoff cycle.
+	bisectAttempts   = 2
+	bisectRetryDelay = 2 * time.Second
 
 	defaultBackoffBase = 30 * time.Second
 	maxBackoff         = 5 * time.Minute
 )
+
+// batchSizer is an optional capability an Embedder implementation can
+// satisfy to report the largest batch it wants handed to a single Embed
+// call (e.g. OpenAI's REST API accepts up to 100 inputs/request). EmbedWorker
+// uses min(providerMax, configured) when BatchSize was explicitly configured,
+// or providerMax on its own otherwise — see batchSize(). Embedders that don't
+// implement this (e.g. Ollama, whose /api/embed batching characteristics
+// aren't well-known enough to hardcode) keep falling back to BatchSize /
+// defaultEmbedBatchSize exactly as before.
+type batchSizer interface {
+	MaxBatchSize() int
+}
 
 // EmbedWorker computes pending = chunk IDs - VectorStore IDs and embeds them
 // in batches, entirely outside of any SQLite transaction (see
@@ -97,11 +129,39 @@ type EmbedWorker struct {
 	// maxBackoff.
 	BackoffBase time.Duration
 
+	// BisectDelay overrides the fixed delay embedChunksBisectAt uses between
+	// retries of a sub-batch while isolating a poison chunk (tests only;
+	// defaults to bisectRetryDelay). Unlike BackoffBase this never doubles —
+	// see embedWithLimitedRetries.
+	BisectDelay time.Duration
+
 	notifyOnce sync.Once
 	notifyCh   chan struct{}
 
 	statusMu sync.Mutex
 	status   WorkerStatus
+
+	// quarantineMu/quarantined hold chunk IDs that embedChunksBisect isolated
+	// as poison (repeatedly fail to embed on their own, non-systemically) —
+	// see embedChunksBisect. Quarantine is in-memory and per-process by
+	// design (CLAUDE.md-equivalent design note in the fix): a process
+	// restart or a re-chunk that assigns the document a new chunk ID gets a
+	// fresh chance. Guarded independently of statusMu since it's read from
+	// the pending-list builder on every Run, not just from Status().
+	quarantineMu sync.Mutex
+	quarantined  map[int64]bool
+
+	// wm* fields cache the state observed at the end of the last *fully
+	// completed* global (Workspace=="") drain, so the next Run can cheaply
+	// prove nothing changed instead of re-running the full chunk-ID/vector-ID
+	// diff (see tryShortCircuit). Only ever read/written from Run, which is
+	// never called concurrently with itself on the same EmbedWorker (RunLoop
+	// drains sequentially; CLI callers construct one EmbedWorker per Run) —
+	// no separate mutex needed.
+	wmValid    bool
+	wmMaxID    int64
+	wmChunkCnt int
+	wmVecCnt   int
 }
 
 // Worker states reported by Status(). "disabled" means no embedder is
@@ -173,11 +233,43 @@ func (w *EmbedWorker) Notify() {
 	}
 }
 
+// batchSize resolves how many chunks go into one Embed call: when the
+// configured Embedder reports a capability via batchSizer, that's the
+// ceiling — min(providerMax, w.BatchSize) if BatchSize was explicitly set,
+// else providerMax outright (so e.g. OpenAI's 100/request default is actually
+// used instead of the old flat 32). Embedders without the capability keep
+// the pre-existing behavior: w.BatchSize if set, else defaultEmbedBatchSize.
 func (w *EmbedWorker) batchSize() int {
+	if bs, ok := w.Embedder.(batchSizer); ok {
+		if max := bs.MaxBatchSize(); max > 0 {
+			if w.BatchSize > 0 && w.BatchSize < max {
+				return w.BatchSize
+			}
+			return max
+		}
+	}
 	if w.BatchSize > 0 {
 		return w.BatchSize
 	}
 	return defaultEmbedBatchSize
+}
+
+// quarantine marks id as poison for the rest of this process's lifetime:
+// listChunkIDs' caller (Run) excludes it from every future pending list, and
+// it's logged once here for operator visibility.
+func (w *EmbedWorker) quarantine(id int64) {
+	w.quarantineMu.Lock()
+	if w.quarantined == nil {
+		w.quarantined = make(map[int64]bool)
+	}
+	w.quarantined[id] = true
+	w.quarantineMu.Unlock()
+}
+
+func (w *EmbedWorker) isQuarantined(id int64) bool {
+	w.quarantineMu.Lock()
+	defer w.quarantineMu.Unlock()
+	return w.quarantined[id]
 }
 
 func (w *EmbedWorker) backoffBase() time.Duration {
@@ -185,6 +277,13 @@ func (w *EmbedWorker) backoffBase() time.Duration {
 		return w.BackoffBase
 	}
 	return defaultBackoffBase
+}
+
+func (w *EmbedWorker) bisectDelay() time.Duration {
+	if w.BisectDelay > 0 {
+		return w.BisectDelay
+	}
+	return bisectRetryDelay
 }
 
 // checkModelConsistency compares the model recorded in index_meta's
@@ -254,25 +353,46 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 		w.setState(WorkerStateBlockedMismatch)
 		return err
 	}
-	w.setState(WorkerStateRunning)
-
 	global := w.Workspace == ""
+
+	// Cheap short-circuit: if nothing has changed in the chunks table or the
+	// vector store since the last fully-completed global drain, skip the
+	// full paged chunk-ID scan + vector-ID diff entirely. See
+	// tryShortCircuit for why this is safe (chunk IDs are AUTOINCREMENT and
+	// never reused).
+	if global && w.tryShortCircuit() {
+		w.setState(WorkerStateIdle)
+		w.setProgress(0, 0)
+		return nil
+	}
+
+	w.setState(WorkerStateRunning)
 
 	allChunkIDs, err := w.listChunkIDs()
 	if err != nil {
 		return fmt.Errorf("list chunk ids: %w", err)
 	}
 
-	vecIDSet := make(map[string]bool, len(w.Vectors.IDs()))
-	for _, id := range w.Vectors.IDs() {
+	// Call VectorStore.IDs() exactly once per Run and reuse the resulting
+	// set both for the pending diff below and for cleanupOrphans (passed in
+	// directly) instead of each recomputing it independently.
+	vecIDs := w.Vectors.IDs()
+	vecIDSet := make(map[string]bool, len(vecIDs))
+	for _, id := range vecIDs {
 		vecIDSet[id] = true
 	}
 
 	var pending []int64
 	for _, id := range allChunkIDs {
-		if !vecIDSet[strconv.FormatInt(id, 10)] {
-			pending = append(pending, id)
+		if vecIDSet[strconv.FormatInt(id, 10)] {
+			continue
 		}
+		if w.isQuarantined(id) {
+			// Poison chunk isolated by a previous drain's bisection — never
+			// embeddable this process, don't keep retrying it.
+			continue
+		}
+		pending = append(pending, id)
 	}
 
 	total := len(pending)
@@ -282,8 +402,8 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 
 	bs := w.batchSize()
 	done := 0
-	batchesSinceFlush := 0
 	embedderRecorded := false
+	lastFlush := time.Now()
 	w.setProgress(done, total)
 
 	for done < total {
@@ -313,43 +433,34 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 			continue
 		}
 
-		texts := make([]string, len(chunks))
-		for i, c := range chunks {
-			texts[i] = c.Content
+		// embedChunksBisect tries the whole batch first and only falls back
+		// to isolating individual poison chunks (quarantining them) if the
+		// batch as a whole can't be embedded — see its doc comment. It can
+		// return a non-nil items slice *and* a non-nil error: everything
+		// embeddable in this batch gets added before Run aborts on a
+		// systemic failure, so already-completed work is never thrown away.
+		items, err := w.embedChunksBisect(ctx, chunks)
+		if len(items) > 0 {
+			if addErr := w.Vectors.Add(ctx, items); addErr != nil {
+				_ = w.Vectors.Flush()
+				return fmt.Errorf("add vectors: %w", addErr)
+			}
+			if !embedderRecorded {
+				if err := w.DB.SetActiveEmbedder(w.Embedder.ModelID(), w.Embedder.ModelID(), w.Embedder.Dimensions()); err != nil {
+					_ = w.Vectors.Flush()
+					return fmt.Errorf("record active embedder: %w", err)
+				}
+				embedderRecorded = true
+			}
 		}
-
-		vecs, err := w.embedBatch(ctx, texts)
 		if err != nil {
 			_ = w.Vectors.Flush()
 			return err
 		}
 
-		items := make([]vectorstore.VectorItem, 0, len(chunks))
-		for i, c := range chunks {
-			if i < len(vecs) {
-				items = append(items, vectorstore.VectorItem{
-					ID:     strconv.FormatInt(c.ID, 10),
-					Vector: vecs[i],
-				})
-			}
-		}
-		if err := w.Vectors.Add(ctx, items); err != nil {
-			_ = w.Vectors.Flush()
-			return fmt.Errorf("add vectors: %w", err)
-		}
-
-		if !embedderRecorded {
-			if err := w.DB.SetActiveEmbedder(w.Embedder.ModelID(), w.Embedder.ModelID(), w.Embedder.Dimensions()); err != nil {
-				_ = w.Vectors.Flush()
-				return fmt.Errorf("record active embedder: %w", err)
-			}
-			embedderRecorded = true
-		}
-
 		done = end
-		batchesSinceFlush++
-		if batchesSinceFlush >= flushEveryBatches {
-			batchesSinceFlush = 0
+		if time.Since(lastFlush) >= flushInterval {
+			lastFlush = time.Now()
 			if err := w.Vectors.Flush(); err != nil {
 				return fmt.Errorf("flush vectors: %w", err)
 			}
@@ -365,14 +476,79 @@ func (w *EmbedWorker) Run(ctx context.Context) error {
 	}
 
 	if global {
+		// Skipping the orphan sweep entirely when nothing changed is handled
+		// by the short-circuit at the top of Run (it returns before this
+		// point is ever reached). Once we get this far there was a full
+		// diff, so always give cleanupOrphans a chance — it internally
+		// no-ops when there's nothing to delete.
 		remaining := len(pending) - done
-		if err := w.cleanupOrphans(ctx, allChunkIDs, remaining == 0); err != nil {
+		idleDrain := remaining == 0
+		if err := w.cleanupOrphans(ctx, allChunkIDs, vecIDSet, idleDrain); err != nil {
 			return err
+		}
+
+		if idleDrain {
+			// Record the watermark for the next Run's short-circuit check.
+			// allChunkIDs is sorted ascending (listChunkIDs pages in
+			// increasing-id order), so its last element is the max chunk ID
+			// observed by this drain.
+			w.wmValid = true
+			w.wmChunkCnt = len(allChunkIDs)
+			if n := len(allChunkIDs); n > 0 {
+				w.wmMaxID = allChunkIDs[n-1]
+			} else {
+				w.wmMaxID = 0
+			}
+			w.wmVecCnt = len(w.Vectors.IDs())
+		} else {
+			w.wmValid = false
 		}
 	}
 
 	w.setState(WorkerStateIdle)
 	return nil
+}
+
+// tryShortCircuit reports whether Run can skip its full pending diff (the
+// paged GetChunkIDsPage scan of every chunk ID plus VectorStore.IDs()) this
+// call, because nothing has changed since the watermark recorded by the
+// previous fully-completed global drain (see the end of Run). It only
+// applies in global (unscoped) mode — scoped Run calls always do the full
+// diff, since a workspace-scoped worker's watermark would need to track
+// cross-workspace state it doesn't otherwise look at.
+//
+// Correctness rests on one CLAUDE.md-documented fact: chunk IDs are
+// AUTOINCREMENT and never reused. That means any DB change since the
+// watermark falls into one of three cases, and every case is caught:
+//   - a chunk inserted (new doc, re-chunk, etc.): its ID is greater than any
+//     ID that existed at watermark time, so the cheap
+//     GetChunkIDsPage(wmMaxID, 1) probe below returns a non-empty page;
+//   - a chunk deleted with nothing inserted (doc removed): the total chunk
+//     count (CountChunks, a single COUNT(*) query) no longer matches;
+//   - a delete+insert pair (re-chunk): the insert half is caught by the
+//     first case regardless of whether the count happens to net out even.
+//
+// A vector-store-only change (e.g. cleanupOrphans running from a *different*
+// EmbedWorker instance, or a concurrent scoped Run adding vectors) is caught
+// by the len(w.Vectors.IDs()) comparison. Any query error, or a watermark
+// that was never set (fresh EmbedWorker, or the last drain didn't fully
+// complete), falls through to the full diff — "when in doubt, full diff".
+func (w *EmbedWorker) tryShortCircuit() bool {
+	if !w.wmValid {
+		return false
+	}
+	tail, err := w.DB.GetChunkIDsPage(w.wmMaxID, 1)
+	if err != nil || len(tail) != 0 {
+		return false
+	}
+	count, err := w.DB.CountChunks()
+	if err != nil || count != w.wmChunkCnt {
+		return false
+	}
+	if len(w.Vectors.IDs()) != w.wmVecCnt {
+		return false
+	}
+	return true
 }
 
 // embedBatch calls Embedder.Embed, retrying the same batch with exponential
@@ -418,6 +594,156 @@ func (w *EmbedWorker) embedBatch(ctx context.Context, texts []string) ([][]float
 	return nil, fmt.Errorf("embedding failed %d times in a row, giving up: %w", maxConsecutiveFailures, lastErr)
 }
 
+// embedChunksBisect embeds chunks, trying the whole slice as one batch first
+// (via embedBatch, with its full retry/backoff budget). If that fails —
+// after ruling out cancellation, which is propagated immediately — it
+// bisects: recursively retries each half with a much smaller retry budget
+// (bisectAttempts, fixed short delay) rather than paying another full
+// exponential-backoff cycle per split, since the top-level batch already
+// did that. Splitting continues down to individual chunks, which get
+// quarantined (see quarantine) rather than retried forever once isolated —
+// unless the failure looks systemic (auth/model-not-found — see
+// isSystemicEmbedError), in which case bisection stops and the error
+// propagates up to abort the whole Run instead: retrying every other chunk
+// one-by-one against a broken embedder/credential would be pointless and
+// slow.
+//
+// It always returns whatever it managed to embed, even when it also returns
+// an error — Run adds partial items before propagating an abort, so a
+// systemic failure discovered deep in one batch doesn't throw away
+// successfully embedded chunks from earlier in the same batch.
+func (w *EmbedWorker) embedChunksBisect(ctx context.Context, chunks []*store.Chunk) ([]vectorstore.VectorItem, error) {
+	return w.embedChunksBisectAt(ctx, chunks, true)
+}
+
+// embedChunksBisectAt is embedChunksBisect's recursive implementation.
+// topLevel is true only for the initial (whole-batch) call from Run's loop —
+// that one gets the full embedBatch retry/backoff treatment, since it's a
+// fresh batch that hasn't failed yet. Every split produced by bisecting a
+// failed batch uses embedWithLimitedRetries instead: the parent batch
+// already paid the full backoff cost, so each half only needs a couple of
+// quick, fixed-delay retries to rule out transient noise before either
+// succeeding, splitting further, or (once down to a single chunk)
+// quarantining.
+func (w *EmbedWorker) embedChunksBisectAt(ctx context.Context, chunks []*store.Chunk, topLevel bool) ([]vectorstore.VectorItem, error) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	texts := make([]string, len(chunks))
+	for i, c := range chunks {
+		texts[i] = c.Content
+	}
+
+	var vecs [][]float32
+	var err error
+	if topLevel {
+		vecs, err = w.embedBatch(ctx, texts)
+	} else {
+		vecs, err = w.embedWithLimitedRetries(ctx, texts, bisectAttempts, w.bisectDelay())
+	}
+	if err == nil {
+		items := make([]vectorstore.VectorItem, 0, len(chunks))
+		for i, c := range chunks {
+			if i < len(vecs) {
+				items = append(items, vectorstore.VectorItem{
+					ID:     strconv.FormatInt(c.ID, 10),
+					Vector: vecs[i],
+				})
+			}
+		}
+		return items, nil
+	}
+
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+
+	// Check for a systemic-looking failure (bad credentials, wrong model,
+	// ...) *before* bisecting further, at whatever size this batch is — not
+	// just at a single-chunk leaf. Otherwise a genuinely broken embedder
+	// (every chunk fails identically) would pointlessly bisect all the way
+	// down to individual chunks, burning through bisectAttempts retries at
+	// every split, before finally recognizing the same systemic error at
+	// the last leaf. Recognizing it as early as the first failed batch is
+	// both faster and exactly as correct, since a systemic error being
+	// systemic doesn't depend on how big the failing batch was.
+	if isSystemicEmbedError(err) {
+		return nil, fmt.Errorf("embedding failed with what looks like a systemic error, aborting: %w", err)
+	}
+
+	if len(chunks) == 1 {
+		fmt.Fprintf(os.Stderr, "warning: quarantining chunk %d after repeated embed failures, will not retry this process: %v\n",
+			chunks[0].ID, err)
+		w.quarantine(chunks[0].ID)
+		return nil, nil
+	}
+
+	mid := len(chunks) / 2
+	leftItems, lerr := w.embedChunksBisectAt(ctx, chunks[:mid], false)
+	if lerr != nil {
+		return leftItems, lerr
+	}
+	rightItems, rerr := w.embedChunksBisectAt(ctx, chunks[mid:], false)
+	return append(leftItems, rightItems...), rerr
+}
+
+// embedWithLimitedRetries is embedChunksBisectAt's retry helper for
+// sub-batches produced while isolating a poison chunk — see its doc
+// comment for why this uses a much smaller, fixed-delay budget than
+// embedBatch's exponential backoff.
+func (w *EmbedWorker) embedWithLimitedRetries(ctx context.Context, texts []string, attempts int, delay time.Duration) ([][]float32, error) {
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		vecs, err := w.Embedder.Embed(ctx, texts)
+		if err == nil {
+			return vecs, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, lastErr
+}
+
+// isSystemicEmbedError does a best-effort, provider-agnostic classification
+// of an embed error as "the whole embedder looks broken" (bad/expired
+// credentials, wrong model name) rather than "this specific input is
+// unembeddable" (the poison-chunk case bisection exists to isolate). It's
+// deliberately conservative — a false negative just means one more chunk
+// gets quarantined instead of aborting the Run, which is the safer failure
+// mode; a false positive would wrongly abort a Run that bisection could
+// otherwise have completed around a handful of bad chunks.
+func isSystemicEmbedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	systemicPatterns := []string{
+		"401", "403", "unauthorized", "invalid api key", "invalid_api_key",
+		"authentication", "forbidden", "permission denied",
+		"model not found", "does not exist", "no such model",
+	}
+	for _, p := range systemicPatterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // listChunkIDs returns every chunk ID in scope: paginated across the whole
 // DB when Workspace == "", or GetChunkIDsByWorkspace otherwise. Each
 // underlying query fully drains its sql.Rows (via defer Close, see
@@ -459,21 +785,25 @@ func (w *EmbedWorker) listChunkIDs() ([]int64, error) {
 
 // cleanupOrphans removes VectorStore IDs that no longer have a chunk row
 // (allChunkIDs is always the *global* chunk ID set — orphan cleanup only
-// ever runs in unscoped mode, enforced by the caller). Per the design doc
-// (§4.2), HNSWStore.Delete unconditionally dirties the whole graph
-// regardless of how many IDs are removed, forcing a full rebuild on the
-// next Search — so this batches all orphans into one Delete call, and only
-// bothers when there's a real backlog (>= orphanBatchThreshold) or when
-// pending has fully drained (idleDrain), matching the "batch and defer"
-// rule from the spec.
-func (w *EmbedWorker) cleanupOrphans(ctx context.Context, allChunkIDs []int64, idleDrain bool) error {
+// ever runs in unscoped mode, enforced by the caller). vecIDSet is the same
+// set Run already built from a single w.Vectors.IDs() call at the top of
+// this drain — nothing added during the drain itself can ever be an orphan
+// (it was only added because a matching chunk row exists), so reusing the
+// pre-drain snapshot here instead of calling IDs() again is correct, not
+// just cheaper. Per the design doc (§4.2), HNSWStore.Delete unconditionally
+// dirties the whole graph regardless of how many IDs are removed, forcing a
+// full rebuild on the next Search — so this batches all orphans into one
+// Delete call, and only bothers when there's a real backlog (>=
+// orphanBatchThreshold) or when pending has fully drained (idleDrain),
+// matching the "batch and defer" rule from the spec.
+func (w *EmbedWorker) cleanupOrphans(ctx context.Context, allChunkIDs []int64, vecIDSet map[string]bool, idleDrain bool) error {
 	chunkIDSet := make(map[string]bool, len(allChunkIDs))
 	for _, id := range allChunkIDs {
 		chunkIDSet[strconv.FormatInt(id, 10)] = true
 	}
 
 	var orphans []string
-	for _, vid := range w.Vectors.IDs() {
+	for vid := range vecIDSet {
 		if !chunkIDSet[vid] {
 			orphans = append(orphans, vid)
 		}

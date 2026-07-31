@@ -116,6 +116,13 @@ func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, tr
 	var results []Hit
 	filesWalked := 0
 
+	// grepBuf is reused across every grepFile call in this Scan invocation
+	// instead of each of the (up to MaxFiles, default 10k) candidate files
+	// allocating its own 64KB scanner buffer. Safe because the walk below
+	// is strictly sequential — WalkDir's callback runs one file at a time,
+	// never concurrently — so there's no need for a sync.Pool.
+	grepBuf := make([]byte, 0, 64*1024)
+
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Unreadable file/dir: skip it, same as the indexer's walk.
@@ -142,7 +149,7 @@ func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, tr
 			return filepath.SkipAll
 		}
 
-		if hit, ok := scoreFile(scanCtx, path, tokens); ok {
+		if hit, ok := scoreFile(scanCtx, path, d, tokens, grepBuf); ok {
 			results = append(results, hit)
 		}
 		return nil
@@ -180,14 +187,14 @@ func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, tr
 // matched by either signal (filename ∪ content) — so a file matched by both
 // channels scores at least as high as either alone, which is what the
 // design means by "content match adds to score".
-func scoreFile(ctx context.Context, path string, tokens []string) (Hit, bool) {
+func scoreFile(ctx context.Context, path string, d fs.DirEntry, tokens []string, grepBuf []byte) (Hit, bool) {
 	base := strings.ToLower(filepath.Base(path))
 	fMatched := matchedTokenSet(base, tokens)
 
 	var cMatched map[string]bool
 	var snippet string
-	if isContentGrepCandidate(path) {
-		cMatched, snippet = grepFile(ctx, path, tokens)
+	if isContentGrepCandidate(path, d) {
+		cMatched, snippet = grepFile(ctx, path, tokens, grepBuf)
 	}
 
 	if len(fMatched) == 0 && len(cMatched) == 0 {
@@ -219,13 +226,16 @@ func scoreFile(ctx context.Context, path string, tokens []string) (Hit, bool) {
 }
 
 // isContentGrepCandidate reports whether path is small enough and a plain
-// enough format for content grep: a recognized text extension, ≤ 2 MB.
-func isContentGrepCandidate(path string) bool {
+// enough format for content grep: a recognized text extension, ≤ 2 MB. d is
+// the DirEntry WalkDir already produced for path — its Info() reuses the
+// directory-read stat WalkDir performed, avoiding a second os.Stat syscall
+// per candidate file.
+func isContentGrepCandidate(path string, d fs.DirEntry) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	if !contentGrepExts[ext] {
 		return false
 	}
-	fi, err := os.Stat(path)
+	fi, err := d.Info()
 	if err != nil || fi.IsDir() || fi.Size() > maxContentBytes {
 		return false
 	}
@@ -236,8 +246,10 @@ func isContentGrepCandidate(path string) bool {
 // returning the set of tokens matched anywhere in the file and up to
 // maxSnippetLines matching lines joined as a snippet. Best-effort: an
 // unreadable file, or one whose scan is interrupted by ctx, simply returns
-// whatever was found before the problem.
-func grepFile(ctx context.Context, path string, tokens []string) (map[string]bool, string) {
+// whatever was found before the problem. buf is a scanner buffer reused
+// across every candidate file in one Scan call (see grepBuf in Scan) —
+// safe because Scan's walk is sequential, never concurrent.
+func grepFile(ctx context.Context, path string, tokens []string, buf []byte) (map[string]bool, string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, ""
@@ -248,7 +260,7 @@ func grepFile(ctx context.Context, path string, tokens []string) (map[string]boo
 	var snippetLines []string
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
+	scanner.Buffer(buf, maxLineBytes)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			break

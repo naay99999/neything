@@ -5,11 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/naay99999/neything/internal/apiretry"
 )
+
+// geminiMaxBatchSize is the largest number of texts sent to Gemini's
+// batchEmbedContents endpoint in one HTTP call. Gemini's documented limit
+// for this endpoint is 100 requests/call — see MaxBatchSize, consumed by
+// EmbedWorker's provider-aware batching (internal/index/embedworker.go).
+const geminiMaxBatchSize = 100
 
 type GeminiEmbedder struct {
 	APIKey string
@@ -38,118 +44,90 @@ func (e *GeminiEmbedder) Dimensions() int {
 	}
 }
 
+// MaxBatchSize reports Gemini's batchEmbedContents request-size ceiling —
+// see the batchSizer capability EmbedWorker looks for.
+func (e *GeminiEmbedder) MaxBatchSize() int { return geminiMaxBatchSize }
+
+// Embed embeds texts via Gemini's batchEmbedContents endpoint — one HTTP
+// request per up-to-geminiMaxBatchSize texts, instead of the old one
+// request per text (embedContent, sequentially). texts longer than
+// geminiMaxBatchSize are split into multiple batchEmbedContents calls;
+// EmbedWorker's provider-aware batch sizing (batchSize(), which consults
+// MaxBatchSize above) means that split essentially never triggers in
+// practice, but Embed stays correct for any caller regardless of what batch
+// size they hand it.
 func (e *GeminiEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	results := make([][]float32, len(texts))
-	// sequential to stay within free-tier RPM limits
-	for i, text := range texts {
-		vec, err := e.embedOneWithRetry(ctx, text)
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	all := make([][]float32, 0, len(texts))
+	for i := 0; i < len(texts); i += geminiMaxBatchSize {
+		end := i + geminiMaxBatchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		vecs, err := e.embedBatch(ctx, texts[i:end])
 		if err != nil {
 			return nil, err
 		}
-		results[i] = vec
+		all = append(all, vecs...)
 	}
-	return results, nil
+	return all, nil
 }
 
-func (e *GeminiEmbedder) embedOneWithRetry(ctx context.Context, text string) ([]float32, error) {
-	const maxRetries = 5
-	delay := 5 * time.Second
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		vec, retryAfter, err := e.embedOne(ctx, text)
-		if err == nil {
-			return vec, nil
+// embedBatch calls batchEmbedContents for one batch of up to
+// geminiMaxBatchSize texts. Retries (on 429/503, and now on transient
+// network errors too) are handled by apiretry.Do, same as the OpenAI
+// embedder — Gemini's 429 responses report their retry delay in the
+// response body rather than a Retry-After header, which apiretry.retryAfter
+// parses as a fallback (see internal/apiretry/retry.go).
+func (e *GeminiEmbedder) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	requests := make([]map[string]any, len(texts))
+	for i, text := range texts {
+		requests[i] = map[string]any{
+			"model": "models/" + e.Model,
+			"content": map[string]any{
+				"parts": []map[string]string{{"text": text}},
+			},
 		}
-		if retryAfter == 0 {
-			return nil, err // non-retryable error
-		}
-		wait := retryAfter
-		if wait < delay {
-			wait = delay
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(wait):
-		}
-		delay *= 2
 	}
-	return nil, fmt.Errorf("gemini embeddings: exceeded max retries")
-}
-
-// embedOne returns (vector, retryAfter, error).
-// retryAfter > 0 means 429 and the caller should retry after that duration.
-func (e *GeminiEmbedder) embedOne(ctx context.Context, text string) ([]float32, time.Duration, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model": "models/" + e.Model,
-		"content": map[string]any{
-			"parts": []map[string]string{{"text": text}},
-		},
-	})
+	body, _ := json.Marshal(map[string]any{"requests": requests})
 
 	url := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s",
+		"https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s",
 		e.Model, e.APIKey,
 	)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := e.client.Do(req)
+	resp, err := apiretry.Do(ctx, e.client, req, 5)
 	if err != nil {
-		return nil, 0, err
+		return nil, fmt.Errorf("gemini embeddings: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		b, _ := io.ReadAll(resp.Body)
-		// parse retryDelay from error details if present
-		retryAfter := parseRetryDelay(b)
-		if retryAfter == 0 {
-			retryAfter = 60 * time.Second
-		}
-		return nil, retryAfter, fmt.Errorf("rate limited (retry in %s)", retryAfter.Round(time.Second))
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, 0, fmt.Errorf("gemini embeddings: status %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+		return nil, fmt.Errorf("gemini embeddings: status %d%s", resp.StatusCode, errBodySnippet(resp.Body))
 	}
 
 	var out struct {
-		Embedding struct {
+		Embeddings []struct {
 			Values []float32 `json:"values"`
-		} `json:"embedding"`
+		} `json:"embeddings"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	if len(out.Embedding.Values) == 0 {
-		return nil, 0, fmt.Errorf("gemini embeddings: empty response")
+	if len(out.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("gemini embeddings: expected %d embeddings, got %d", len(texts), len(out.Embeddings))
 	}
-	return out.Embedding.Values, 0, nil
-}
 
-// parseRetryDelay extracts the retry delay from a Gemini 429 response body.
-// The body contains {"error":{"details":[{"retryDelay":"37s"}]}}.
-func parseRetryDelay(body []byte) time.Duration {
-	// fast path: find "retryDelay" string value
-	s := string(body)
-	idx := strings.Index(s, `"retryDelay"`)
-	if idx < 0 {
-		return 0
+	result := make([][]float32, len(out.Embeddings))
+	for i, emb := range out.Embeddings {
+		result[i] = emb.Values
 	}
-	rest := s[idx+len(`"retryDelay"`):]
-	// skip : whitespace "
-	rest = strings.TrimLeft(rest, `: "`)
-	end := strings.IndexAny(rest, `"`)
-	if end < 0 {
-		return 0
-	}
-	d, err := time.ParseDuration(rest[:end])
-	if err != nil {
-		return 0
-	}
-	return d
+	return result, nil
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/naay99999/neything/internal/config"
+	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/store"
@@ -163,6 +164,12 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		ix:           ix,
 		serialize:    serialize,
 		startWatcher: startWatcher,
+		// scanCache lives on this long-running process only — get_context and
+		// list_projects called close together reuse one ScanRepos pass instead
+		// of forking git 3x per repo twice. CLI one-shot paths (e.g.
+		// internal/discover, ney init's wizard) call ScanRepos directly and
+		// never see this cache, so staleness is never a concern there.
+		scanCache: &neycontext.ScanCache{},
 	})
 
 	if readOnly {
@@ -419,7 +426,22 @@ type serverState struct {
 	// (and never if pathfilter denies them) — so the AI can follow up on a
 	// search the user asked for, but can't cold-read arbitrary home files.
 	discovered map[string]bool
+	// discoveredOrder tracks insertion order of discovered's keys so it can
+	// be capped at discoveredCap with FIFO eviction — otherwise a
+	// long-running `ney mcp` process (days/weeks of uptime) would grow this
+	// map without bound as search_folder gets called over and over.
+	discoveredOrder []string
 }
+
+// discoveredCap bounds serverState.discovered so a long-running server's
+// memory doesn't grow unboundedly with every search_folder hit over its
+// lifetime. Eviction is oldest-first: once the cap is hit, the
+// least-recently-discovered path is forgotten to make room for a new one.
+// Per CLAUDE.md, this set only gates read_document's fallback path for
+// search_folder-surfaced files — eviction just means the user re-runs
+// search_folder for that path; it never weakens the containment or
+// pathfilter checks that gate every other read.
+const discoveredCap = 500
 
 func newServerState(names []string, readOnly bool) *serverState {
 	s := &serverState{
@@ -436,7 +458,16 @@ func newServerState(names []string, readOnly bool) *serverState {
 func (s *serverState) addDiscovered(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.discovered[path] {
+		return
+	}
+	if len(s.discoveredOrder) >= discoveredCap {
+		oldest := s.discoveredOrder[0]
+		s.discoveredOrder = s.discoveredOrder[1:]
+		delete(s.discovered, oldest)
+	}
 	s.discovered[path] = true
+	s.discoveredOrder = append(s.discoveredOrder, path)
 }
 
 func (s *serverState) isDiscovered(path string) bool {

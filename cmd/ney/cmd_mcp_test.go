@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -86,5 +87,48 @@ func TestResolveMCPRootsReadOnlyDoesNotPersist(t *testing.T) {
 	}
 	if len(wss) != 1 {
 		t.Fatalf("read-write resolve should persist the workspace, got %+v", wss)
+	}
+}
+
+// TestServerStateDiscoveredCapEvictsOldest: a long-running `ney mcp` process
+// must not let serverState.discovered (the read_document allowlist that
+// search_folder populates) grow without bound over its lifetime — once
+// discoveredCap entries are recorded, adding one more must evict the
+// oldest rather than keep growing.
+func TestServerStateDiscoveredCapEvictsOldest(t *testing.T) {
+	s := newServerState(nil, false)
+
+	// Fill exactly to the cap.
+	for i := 0; i < discoveredCap; i++ {
+		s.addDiscovered(fmt.Sprintf("/path/%d", i))
+	}
+	if !s.isDiscovered("/path/0") {
+		t.Fatal("expected the first-added path to still be discovered before the cap is exceeded")
+	}
+	if len(s.discoveredOrder) != discoveredCap {
+		t.Fatalf("expected discoveredOrder to hold exactly %d entries, got %d", discoveredCap, len(s.discoveredOrder))
+	}
+
+	// One more entry should evict the oldest (path 0), not grow past the cap.
+	s.addDiscovered("/path/overflow")
+	if s.isDiscovered("/path/0") {
+		t.Fatal("expected the oldest discovered path to be evicted once the cap was exceeded")
+	}
+	if !s.isDiscovered("/path/1") {
+		t.Fatal("expected the second-oldest path to survive eviction")
+	}
+	if !s.isDiscovered("/path/overflow") {
+		t.Fatal("expected the newly discovered path to be present")
+	}
+	if len(s.discoveredOrder) != discoveredCap {
+		t.Fatalf("expected discoveredOrder to stay capped at %d entries, got %d", discoveredCap, len(s.discoveredOrder))
+	}
+
+	// Re-discovering an already-known path must not grow the set or evict
+	// anything (it's a no-op once present).
+	before := len(s.discoveredOrder)
+	s.addDiscovered("/path/overflow")
+	if len(s.discoveredOrder) != before {
+		t.Fatalf("re-adding an already-discovered path should be a no-op, size changed %d -> %d", before, len(s.discoveredOrder))
 	}
 }

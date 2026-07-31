@@ -13,6 +13,26 @@ import (
 	"github.com/naay99999/neything/internal/index"
 )
 
+// skipDirNames are directory basenames addRecursive never registers an
+// fsnotify watch on (and never descends into), on top of the existing
+// dot-directory skip. These are the well-known dependency/build output
+// directories that can contain hundreds of thousands of files with no
+// value to the index — watching them wastes fsnotify's per-directory kernel
+// resources (inotify watch descriptors on Linux, kqueue FDs on macOS) and
+// makes every build/install/compile a storm of debounced flush work.
+var skipDirNames = map[string]bool{
+	"node_modules": true,
+	"vendor":       true,
+	"dist":         true,
+	"build":        true,
+	"target":       true,
+	".next":        true,
+	"out":          true,
+	"__pycache__":  true,
+	".venv":        true,
+	"venv":         true,
+}
+
 type Stats struct {
 	FilesIndexed  int
 	FilesRemoved  int
@@ -180,6 +200,15 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Stop the pending debounce timer explicitly: without this, a
+			// timer scheduled just before shutdown could still fire flush()
+			// after Run has returned and the caller has moved on to closing
+			// the DB/Vectors — racing a write against Close().
+			debounceMu.Lock()
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			debounceMu.Unlock()
 			flush()
 			if !w.DisablePrune {
 				pruneFinal()
@@ -198,7 +227,7 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 				return stats, nil
 			}
 			if ev.Op&fsnotify.Create == fsnotify.Create {
-				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
+				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() && !skipDirNames[filepath.Base(ev.Name)] {
 					_ = addRecursive(fsw, ev.Name)
 				}
 			}
@@ -218,7 +247,7 @@ func addRecursive(fsw *fsnotify.Watcher, root string) error {
 			return nil
 		}
 		if d.IsDir() {
-			if path != root && d.Name()[0] == '.' {
+			if path != root && (d.Name()[0] == '.' || skipDirNames[d.Name()]) {
 				return filepath.SkipDir
 			}
 			return fsw.Add(path)

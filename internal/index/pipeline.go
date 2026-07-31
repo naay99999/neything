@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -17,6 +18,13 @@ import (
 	"github.com/naay99999/neything/internal/store"
 	"github.com/naay99999/neything/internal/vectorstore"
 )
+
+// maxIndexFileSize caps how large a file Index/IndexPath will read into
+// memory before hashing/chunking it — matches read_document's cap
+// (maxReadFileSize in cmd/ney/mcp_tools.go). Oversized files are skipped
+// with a stderr warning; stdout is reserved for the MCP protocol, so
+// diagnostics from any path runMCP can reach must never write there.
+const maxIndexFileSize = 20 * 1024 * 1024
 
 type Stats struct {
 	FilesScanned  int
@@ -47,8 +55,12 @@ type Indexer struct {
 	// only — see pathfilter.
 	Filter        *pathfilter.Filter
 	ChunkResolver *chunk.Resolver
-	BatchSize     int
-	OnProgress    func(file string, chunks int)
+	// BatchSize is unused by indexDocument as of the prepared-statement-per-
+	// document fix (chunks/FTS rows for a document are now inserted in one
+	// call each, not sub-batched) — kept only so existing callers that set
+	// it don't need updating.
+	BatchSize  int
+	OnProgress func(file string, chunks int)
 }
 
 var supportedExts = map[string]bool{
@@ -125,14 +137,21 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		stats.FilesScanned++
 		seenPaths[path] = true
 
+		if info, ierr := d.Info(); ierr == nil && info.Size() > maxIndexFileSize {
+			stats.FilesSkipped++
+			fmt.Fprintf(os.Stderr, "warning: skip %s: file too large (%d bytes, max %d)\n", path, info.Size(), maxIndexFileSize)
+			return nil
+		}
+
 		fileData, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
-		hash := fmt.Sprintf("%x", sha256.Sum256(fileData))
+		sum := sha256.Sum256(fileData)
+		hash := hex.EncodeToString(sum[:])
 		pathToHash[path] = hash
 
-		if err := ix.indexFileIfNeeded(ctx, path, workspaceID, hash, len(fileData), stats); err != nil {
+		if err := ix.indexFileIfNeeded(ctx, path, workspaceID, fileData, hash, stats); err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
@@ -179,14 +198,21 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 		return &Stats{FilesScanned: 1, FilesSkipped: 1}, nil
 	}
 
+	stats := &Stats{FilesScanned: 1}
+	if info, ierr := os.Stat(path); ierr == nil && info.Size() > maxIndexFileSize {
+		stats.FilesSkipped++
+		fmt.Fprintf(os.Stderr, "warning: skip %s: file too large (%d bytes, max %d)\n", path, info.Size(), maxIndexFileSize)
+		return stats, nil
+	}
+
 	fileData, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	hash := fmt.Sprintf("%x", sha256.Sum256(fileData))
+	sum := sha256.Sum256(fileData)
+	hash := hex.EncodeToString(sum[:])
 
-	stats := &Stats{FilesScanned: 1}
-	if err := ix.indexFileIfNeeded(ctx, path, workspaceID, hash, len(fileData), stats); err != nil {
+	if err := ix.indexFileIfNeeded(ctx, path, workspaceID, fileData, hash, stats); err != nil {
 		return stats, err
 	}
 
@@ -244,13 +270,19 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 
 	// Hash lazily: pruneMissing only asks for rename candidates, and only
 	// when documents actually went missing — the common no-op sync (e.g.
-	// the watcher's periodic prune) never reads file contents at all.
+	// the watcher's periodic prune) never reads file contents at all. Also
+	// respects maxIndexFileSize so a huge untracked file can't be read
+	// fully into memory just to check whether it's a rename.
 	hashFor := func(path string) string {
+		if info, err := os.Stat(path); err != nil || info.Size() > maxIndexFileSize {
+			return ""
+		}
 		fileData, err := os.ReadFile(path)
 		if err != nil {
 			return ""
 		}
-		return fmt.Sprintf("%x", sha256.Sum256(fileData))
+		sum := sha256.Sum256(fileData)
+		return hex.EncodeToString(sum[:])
 	}
 
 	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, hashFor, stats); err != nil {
@@ -267,7 +299,7 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 	return stats, nil
 }
 
-func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspaceID int64, hash string, sizeBytes int, stats *Stats) error {
+func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspaceID int64, data []byte, hash string, stats *Stats) error {
 	existing, err := ix.DB.GetDocumentByPath(path)
 	if err != nil {
 		return fmt.Errorf("get doc: %w", err)
@@ -275,8 +307,10 @@ func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspace
 	if existing != nil && existing.Hash == hash {
 		// Only trust the hash if chunks actually exist — heals indexes
 		// where an earlier failed run left a hashed but chunk-less row.
-		ids, cErr := ix.DB.GetChunkIDsByDocument(existing.ID)
-		if cErr == nil && len(ids) > 0 {
+		// EXISTS-style check instead of materializing every chunk ID just
+		// to test len(ids) > 0.
+		exists, cErr := ix.DB.ChunkExistsForDocument(existing.ID)
+		if cErr == nil && exists {
 			stats.FilesSkipped++
 			return nil
 		}
@@ -300,12 +334,12 @@ func (ix *Indexer) indexFileIfNeeded(ctx context.Context, path string, workspace
 	if !ok {
 		return nil
 	}
-	docs, err := ld.Load(ctx, path)
+	docs, err := ld.Load(ctx, path, data, hash)
 	if err != nil {
 		return err
 	}
 	for _, doc := range docs {
-		if err := ix.indexDocument(ctx, doc, workspaceID, hash, sizeBytes, stats); err != nil {
+		if err := ix.indexDocument(ctx, doc, workspaceID, hash, len(data), stats); err != nil {
 			return err
 		}
 	}
@@ -337,15 +371,39 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 	}
 
 	// Rename candidates are files without a document row of their own in
-	// this workspace; only those need hashing.
+	// this workspace; only those need hashing. Further narrow to files
+	// whose size matches some missing document's stored size_bytes — a
+	// content match is impossible otherwise, so this skips hashing (and,
+	// for PruneMissing's lazy hashFor, reading) most of the tree instead of
+	// hashing every untracked file to find renames among a handful.
+	wantedSizes := make(map[int64]bool, len(missing))
+	for _, doc := range missing {
+		wantedSizes[doc.SizeBytes] = true
+	}
+
 	hashToPaths := make(map[string][]string)
 	for p := range seenPaths {
 		if docPaths[p] {
 			continue
 		}
+		if info, err := os.Stat(p); err != nil || !wantedSizes[info.Size()] {
+			continue
+		}
 		if h := hashFor(p); h != "" {
 			hashToPaths[h] = append(hashToPaths[h], p)
 		}
+	}
+
+	// Batch-fetch document rows for every candidate path that might be
+	// consulted below, instead of one GetDocumentByPath query per
+	// (missing-document, candidate) pair.
+	var candidatePaths []string
+	for _, doc := range missing {
+		candidatePaths = append(candidatePaths, hashToPaths[doc.Hash]...)
+	}
+	existingByPath, err := ix.DB.GetDocumentsByPaths(candidatePaths)
+	if err != nil {
+		return err
 	}
 
 	claimed := make(map[string]bool)
@@ -358,11 +416,7 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 			}
 			// A candidate may still belong to a document in another
 			// workspace (paths are globally unique).
-			existing, err := ix.DB.GetDocumentByPath(p)
-			if err != nil {
-				return err
-			}
-			if existing != nil && existing.ID != doc.ID {
+			if existing := existingByPath[p]; existing != nil && existing.ID != doc.ID {
 				continue
 			}
 			renamePath = p
@@ -398,11 +452,6 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 // entirely outside this transaction (and outside this pipeline) so a slow or
 // unreachable embedder never holds the single SQLite connection.
 func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, workspaceID int64, hash string, sizeBytes int, stats *Stats) error {
-	batchSize := ix.BatchSize
-	if batchSize <= 0 {
-		batchSize = 32
-	}
-
 	// The row is upserted without its content hash: the hash is only recorded
 	// after chunks are committed. Otherwise a failed run would leave a
 	// fresh-looking document that every later run skips as "unchanged".
@@ -443,38 +492,29 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		return ix.DB.UpdateDocumentHash(docID, hash)
 	}
 
-	var storeChunks []*store.Chunk
-
-	for i := 0; i < len(rawChunks); i += batchSize {
-		end := i + batchSize
-		if end > len(rawChunks) {
-			end = len(rawChunks)
+	storeChunks := make([]*store.Chunk, len(rawChunks))
+	for i, c := range rawChunks {
+		storeChunks[i] = &store.Chunk{
+			DocumentID: docID,
+			ChunkIndex: c.Index,
+			Content:    c.Content,
+			StartPos:   c.StartPos,
+			EndPos:     c.EndPos,
 		}
-		batch := rawChunks[i:end]
+	}
 
-		for _, c := range batch {
-			sc := &store.Chunk{
-				DocumentID: docID,
-				ChunkIndex: c.Index,
-				Content:    c.Content,
-				StartPos:   c.StartPos,
-				EndPos:     c.EndPos,
-			}
-			storeChunks = append(storeChunks, sc)
-		}
-
-		batchStoreChunks := storeChunks[len(storeChunks)-len(batch):]
-		if err := ix.DB.InsertChunks(tx, batchStoreChunks); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("insert chunks: %w", err)
-		}
-
-		for _, sc := range batchStoreChunks {
-			if err := ix.DB.UpsertChunkFTS(tx, sc.ID, sc.Content); err != nil {
-				tx.Rollback()
-				return fmt.Errorf("insert fts: %w", err)
-			}
-		}
+	// One prepared statement each for the whole document's chunks (instead
+	// of re-preparing per BatchSize-sized sub-batch): InsertChunks already
+	// prepares once per call, so calling it once here — rather than in a
+	// loop over sub-batches — is enough to satisfy that. UpsertChunksFTS
+	// does the same for the FTS side.
+	if err := ix.DB.InsertChunks(tx, storeChunks); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("insert chunks: %w", err)
+	}
+	if err := ix.DB.UpsertChunksFTS(tx, storeChunks); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("insert fts: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

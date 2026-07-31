@@ -1,5 +1,45 @@
 package rerank
 
+import "unicode/utf8"
+
+// maxRerankContentChars caps how much of a chunk's content is sent to a
+// reranker API per candidate. Relevance scoring doesn't need the full
+// chunk body, and unbounded payloads cost more (latency, and some
+// providers cap request size/tokens) for candidate sets that can run into
+// the dozens. This only bounds the outgoing request payload — the
+// Candidate returned by Rerank (via applyRerankResults, which maps back
+// into the original, untruncated candidates slice) always carries the
+// caller's original full content.
+const maxRerankContentChars = 2000
+
+// docsForRerank builds the "documents" request payload for a rerank API
+// call, truncating each candidate's content so a handful of oversized
+// chunks can't blow up the request.
+func docsForRerank(candidates []Candidate) []string {
+	docs := make([]string, len(candidates))
+	for i, c := range candidates {
+		docs[i] = truncateContent(c.Content, maxRerankContentChars)
+	}
+	return docs
+}
+
+// truncateContent trims s to at most maxChars bytes without splitting a
+// multi-byte UTF-8 rune at the cut point.
+func truncateContent(s string, maxChars int) string {
+	if len(s) <= maxChars {
+		return s
+	}
+	b := s[:maxChars]
+	for len(b) > 0 {
+		r, size := utf8.DecodeLastRuneInString(b)
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
 type apiRerankResult struct {
 	Index          int     `json:"index"`
 	RelevanceScore float64 `json:"relevance_score"`

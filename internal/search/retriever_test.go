@@ -218,6 +218,93 @@ func TestRetriever_ZeroSignalsReturnsEmpty(t *testing.T) {
 	}
 }
 
+// countingChunkStore is a chunkStore stub that counts calls to
+// GetChunksByIDs/GetDocumentsByChunkIDs, used to pin down the fix-1
+// restructuring: hydration must happen exactly once per Search call, even
+// when the keyword and semantic legs return overlapping chunk IDs.
+type countingChunkStore struct {
+	fts    []store.FTSResult
+	chunks []*store.Chunk
+	docs   map[int64]*store.DocWithWorkspace
+
+	getChunksCalls int
+	getDocsCalls   int
+}
+
+func (c *countingChunkStore) SearchFTS(_ string, _ int) ([]store.FTSResult, error) {
+	return c.fts, nil
+}
+
+func (c *countingChunkStore) GetChunksByIDs(_ []int64) ([]*store.Chunk, error) {
+	c.getChunksCalls++
+	return c.chunks, nil
+}
+
+func (c *countingChunkStore) GetDocumentsByChunkIDs(_ []int64) (map[int64]*store.DocWithWorkspace, error) {
+	c.getDocsCalls++
+	return c.docs, nil
+}
+
+func (c *countingChunkStore) CountChunks() (int, error) { return len(c.chunks), nil }
+
+func TestRetriever_HydratesOnceForOverlappingIDs(t *testing.T) {
+	docs := map[int64]*store.DocWithWorkspace{
+		1: {Document: store.Document{ID: 10, Path: "/a.md", Type: "md"}, WorkspaceName: "ws"},
+		2: {Document: store.Document{ID: 10, Path: "/a.md", Type: "md"}, WorkspaceName: "ws"},
+	}
+	chunks := []*store.Chunk{
+		{ID: 1, Content: "billing stripe subscription"},
+		{ID: 2, Content: "gardening tomatoes"},
+	}
+	cs := &countingChunkStore{
+		fts:    []store.FTSResult{{ChunkID: 1, Score: 2.0}, {ChunkID: 2, Score: 1.0}},
+		chunks: chunks,
+		docs:   docs,
+	}
+
+	dir := t.TempDir()
+	vs, err := vectorstore.NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vs.Close()
+
+	// Same two chunk IDs as the FTS leg above — the overlap case fix 1
+	// targets — just in a different score order.
+	items := []vectorstore.VectorItem{
+		{ID: "1", Vector: []float32{1, 0}},
+		{ID: "2", Vector: []float32{0.9, 0.1}},
+	}
+	if err := vs.Add(context.Background(), items); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Retriever{
+		DB:       cs,
+		Vectors:  vs,
+		Embedder: &stubEmbedder{vec: []float32{1, 0}},
+	}
+
+	results, meta, err := r.Search(context.Background(), "billing stripe", RetrieveOptions{
+		TopK: 5, FetchK: 10, Mode: ModeHybrid,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !meta.SemanticUsed || !meta.KeywordUsed {
+		t.Fatalf("expected both signals used, got meta=%+v", meta)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 hydrated results, got %d: %+v", len(results), results)
+	}
+	if cs.getChunksCalls != 1 {
+		t.Errorf("expected GetChunksByIDs called exactly once for the fused set, got %d calls", cs.getChunksCalls)
+	}
+	if cs.getDocsCalls != 1 {
+		t.Errorf("expected GetDocumentsByChunkIDs called exactly once for the fused set, got %d calls", cs.getDocsCalls)
+	}
+}
+
 // TestRetriever_EmptyModeBehavesLikeAuto ensures a zero-value Mode (as
 // produced by structs built without setting it) doesn't hard-fail like
 // semantic/hybrid would when the embedder is unavailable.

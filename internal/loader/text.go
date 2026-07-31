@@ -2,9 +2,6 @@ package loader
 
 import (
 	"context"
-	"crypto/sha256"
-	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -17,13 +14,7 @@ func (t *TextLoader) Supports(path string) bool {
 	return strings.ToLower(filepath.Ext(path)) == ".txt"
 }
 
-func (t *TextLoader) Load(_ context.Context, path string) ([]Document, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+func (t *TextLoader) Load(_ context.Context, path string, data []byte, hash string) ([]Document, error) {
 	content := string(data)
 
 	doc := Document{

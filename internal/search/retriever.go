@@ -57,8 +57,24 @@ type SearchMeta struct {
 	Degraded string `json:"degraded,omitempty"`
 }
 
+// chunkStore is the subset of *store.DB the retriever needs: FTS lookup,
+// chunk content, and document metadata. Declared as an interface (rather
+// than depending on the concrete *store.DB) so tests can substitute a
+// call-counting stub — see TestRetriever_HydratesOnceForOverlappingIDs in
+// retriever_test.go, which pins down the fix-1 restructuring below (hydrate
+// the fused/deduped ID set exactly once, instead of once per search leg).
+// *store.DB satisfies this interface with its existing method set, so
+// callers elsewhere in the codebase that build a Retriever with a
+// *store.DB value need no changes.
+type chunkStore interface {
+	SearchFTS(query string, limit int) ([]store.FTSResult, error)
+	GetChunksByIDs(ids []int64) ([]*store.Chunk, error)
+	GetDocumentsByChunkIDs(chunkIDs []int64) (map[int64]*store.DocWithWorkspace, error)
+	CountChunks() (int, error)
+}
+
 type Retriever struct {
-	DB       *store.DB
+	DB       chunkStore
 	Vectors  vectorstore.VectorStore
 	Embedder embed.Embedder
 	Reranker rerank.Reranker
@@ -76,8 +92,8 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 	if fetchK < 10 {
 		fetchK = 10
 	}
-	// Workspace/path filters are applied after the vector and FTS fetches;
-	// overfetch so filtered-out hits don't starve the final result set.
+	// Workspace/path filters are applied after hydration; overfetch so
+	// filtered-out hits don't starve the final result set.
 	if opts.Workspace != "" || opts.PathPrefix != "" {
 		fetchK *= 4
 	}
@@ -92,9 +108,14 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 	wantKeyword := mode == ModeAuto || mode == ModeKeyword || mode == ModeHybrid
 	wantSemantic := mode == ModeAuto || mode == ModeSemantic || mode == ModeHybrid
 
+	// keywordSearch/semanticSearch return raw (chunk ID, per-leg score)
+	// pairs only — content and document metadata are NOT fetched here.
+	// Hydration is deferred until after fusion (see hydrate below) so a
+	// chunk ID that both legs agree on, or one that gets truncated away by
+	// fetchK, is never pulled from SQLite more than once.
 	var keyword []EnrichedResult
 	if wantKeyword {
-		kw, err := r.keywordSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
+		kw, err := r.keywordSearch(ctx, query, fetchK)
 		if err != nil {
 			// FTS errors never fail the request — record and move on.
 			meta.Degraded = appendDegraded(meta.Degraded, fmt.Sprintf("keyword search failed: %v", err))
@@ -112,7 +133,7 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 			}
 			meta.Degraded = appendDegraded(meta.Degraded, reason)
 		} else {
-			sem, err := r.semanticSearch(ctx, query, fetchK, opts.Workspace, opts.PathPrefix)
+			sem, err := r.semanticSearch(ctx, query, fetchK)
 			if err != nil {
 				if mode == ModeSemantic || mode == ModeHybrid {
 					return nil, meta, fmt.Errorf("semantic search failed: %w", err)
@@ -125,17 +146,37 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 		}
 	}
 
-	var results []EnrichedResult
+	var fused []EnrichedResult
 	switch {
 	case meta.SemanticUsed && meta.KeywordUsed:
-		results = ReciprocalRankFusion(semantic, keyword, defaultRRFK)
+		fused = ReciprocalRankFusion(semantic, keyword, defaultRRFK)
 	case meta.SemanticUsed:
-		results = semantic
+		fused = semantic
 	case meta.KeywordUsed:
-		results = keyword
+		fused = keyword
+	}
+
+	// Truncate to the candidate budget before hydrating: fetchK already
+	// covers what a downstream rerank pass needs (callers size it via
+	// config.FetchK, which factors in RerankTopK) and is inflated above
+	// when workspace/path filters are active, to absorb filter attrition.
+	if len(fused) > fetchK {
+		fused = fused[:fetchK]
+	}
+
+	// Hydrate content + document metadata ONCE for the deduped, ranked ID
+	// set — two SQLite round-trips total for the whole search, regardless
+	// of how many legs ran or how much their candidate sets overlapped.
+	results, err := r.hydrate(fused, opts.Workspace, opts.PathPrefix)
+	if err != nil {
+		return nil, meta, fmt.Errorf("hydrate results: %w", err)
 	}
 
 	if opts.Rerank && r.Reranker != nil && len(results) > 0 {
+		// results is already bounded by fetchK (which itself accounts for
+		// RerankTopK via config.FetchK), so no further candidate cap is
+		// needed here — content truncation for the wire payload happens
+		// inside the reranker implementations (internal/rerank).
 		byID := make(map[int64]EnrichedResult, len(results))
 		for _, res := range results {
 			byID[res.ChunkID] = res
@@ -216,7 +257,10 @@ func appendDegraded(existing, msg string) string {
 	return existing + "; " + msg
 }
 
-func (r *Retriever) semanticSearch(ctx context.Context, query string, fetchK int, workspaceName, pathPrefix string) ([]EnrichedResult, error) {
+// semanticSearch runs the vector-store leg and returns raw (chunk ID,
+// score) pairs — no content or document metadata is fetched here (see
+// hydrate).
+func (r *Retriever) semanticSearch(ctx context.Context, query string, fetchK int) ([]EnrichedResult, error) {
 	vecs, err := r.Embedder.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -230,21 +274,20 @@ func (r *Retriever) semanticSearch(ctx context.Context, query string, fetchK int
 		return nil, fmt.Errorf("vector search: %w", err)
 	}
 
-	chunkIDs := make([]int64, 0, len(rawResults))
-	scoreByID := make(map[int64]float32, len(rawResults))
+	out := make([]EnrichedResult, 0, len(rawResults))
 	for _, res := range rawResults {
 		id, err := strconv.ParseInt(res.ID, 10, 64)
 		if err != nil {
 			continue
 		}
-		chunkIDs = append(chunkIDs, id)
-		scoreByID[id] = res.Score
+		out = append(out, EnrichedResult{ChunkID: id, Score: res.Score})
 	}
-
-	return r.enrichResults(chunkIDs, scoreByID, workspaceName, pathPrefix)
+	return out, nil
 }
 
-func (r *Retriever) keywordSearch(_ context.Context, query string, fetchK int, workspaceName, pathPrefix string) ([]EnrichedResult, error) {
+// keywordSearch runs the FTS leg and returns raw (chunk ID, score) pairs —
+// no content or document metadata is fetched here (see hydrate).
+func (r *Retriever) keywordSearch(_ context.Context, query string, fetchK int) ([]EnrichedResult, error) {
 	ftsResults, err := r.DB.SearchFTS(query, fetchK)
 	if err != nil {
 		return nil, fmt.Errorf("fts search: %w", err)
@@ -253,19 +296,26 @@ func (r *Retriever) keywordSearch(_ context.Context, query string, fetchK int, w
 		return nil, nil
 	}
 
-	chunkIDs := make([]int64, len(ftsResults))
-	scoreByID := make(map[int64]float32, len(ftsResults))
+	out := make([]EnrichedResult, len(ftsResults))
 	for i, fr := range ftsResults {
-		chunkIDs[i] = fr.ChunkID
-		scoreByID[fr.ChunkID] = fr.Score
+		out[i] = EnrichedResult{ChunkID: fr.ChunkID, Score: fr.Score}
 	}
-
-	return r.enrichResults(chunkIDs, scoreByID, workspaceName, pathPrefix)
+	return out, nil
 }
 
-func (r *Retriever) enrichResults(chunkIDs []int64, scoreByID map[int64]float32, workspaceName, pathPrefix string) ([]EnrichedResult, error) {
-	if len(chunkIDs) == 0 {
+// hydrate fetches chunk content and document metadata for scored — in
+// exactly two SQLite round-trips no matter how many search legs
+// contributed IDs or how much they overlapped — then applies
+// workspace/path filtering. The input order (typically post-fusion rank)
+// is preserved in the output, minus anything filtered out or missing.
+func (r *Retriever) hydrate(scored []EnrichedResult, workspaceName, pathPrefix string) ([]EnrichedResult, error) {
+	if len(scored) == 0 {
 		return nil, nil
+	}
+
+	chunkIDs := make([]int64, len(scored))
+	for i, s := range scored {
+		chunkIDs[i] = s.ChunkID
 	}
 
 	docMap, err := r.DB.GetDocumentsByChunkIDs(chunkIDs)
@@ -284,12 +334,12 @@ func (r *Retriever) enrichResults(chunkIDs []int64, scoreByID map[int64]float32,
 	}
 
 	var results []EnrichedResult
-	for _, id := range chunkIDs {
-		c, ok := chunkByID[id]
+	for _, s := range scored {
+		c, ok := chunkByID[s.ChunkID]
 		if !ok {
 			continue
 		}
-		dw, ok := docMap[c.ID]
+		dw, ok := docMap[s.ChunkID]
 		if !ok {
 			continue
 		}
@@ -306,7 +356,7 @@ func (r *Retriever) enrichResults(chunkIDs []int64, scoreByID map[int64]float32,
 			Content:   c.Content,
 			StartPos:  c.StartPos,
 			EndPos:    c.EndPos,
-			Score:     scoreByID[c.ID],
+			Score:     s.Score,
 			Workspace: dw.WorkspaceName,
 		})
 	}

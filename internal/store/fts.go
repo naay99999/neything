@@ -16,6 +16,29 @@ func (d *DB) UpsertChunkFTS(tx *sql.Tx, chunkID int64, content string) error {
 	return err
 }
 
+// UpsertChunksFTS inserts FTS rows for multiple chunks using a single
+// prepared statement, instead of the implicit prepare/exec/close per call
+// that looping UpsertChunkFTS would do. Used by the indexer when writing all
+// of a document's chunks in one transaction; UpsertChunkFTS itself stays for
+// call sites that only ever have one chunk at a time (e.g. BackfillFTS's
+// row-at-a-time scan).
+func (d *DB) UpsertChunksFTS(tx *sql.Tx, chunks []*Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(`INSERT INTO chunks_fts(rowid, content) VALUES(?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, c := range chunks {
+		if _, err := stmt.Exec(c.ID, c.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (d *DB) DeleteChunkFTS(tx *sql.Tx, chunkIDs []int64) error {
 	return d.deleteChunkFTSDirectTx(tx, chunkIDs)
 }
@@ -52,6 +75,19 @@ func (d *DB) deleteChunkFTSDirectTx(tx *sql.Tx, chunkIDs []int64) error {
 		}
 	}
 	return nil
+}
+
+// ChunkExistsForDocument reports whether docID has at least one chunk row,
+// without materializing every chunk ID — used by the indexer's no-op fast
+// path (an unchanged file whose hash already matches) to avoid paying
+// GetChunkIDsByDocument's full row scan just to check len(ids) > 0.
+func (d *DB) ChunkExistsForDocument(docID int64) (bool, error) {
+	var exists int
+	err := d.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM chunks WHERE document_id=? LIMIT 1)`, docID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
 }
 
 func (d *DB) GetChunkIDsByDocument(docID int64) ([]int64, error) {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/naay99999/neything/internal/chunk"
 	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/loader"
@@ -355,5 +356,77 @@ func TestWatcherDisablePruneSkipsTicker(t *testing.T) {
 	// writing b.md. No ticker prunes, no final prune.
 	if callsAfterShutdown != 1 {
 		t.Errorf("expected exactly 1 Serialize call (the flush only), got %d — periodic or final prune must have run despite DisablePrune", callsAfterShutdown)
+	}
+}
+
+// TestAddRecursiveSkipsBuildAndDependencyDirs verifies addRecursive never
+// installs an fsnotify watch on well-known build/dependency directories
+// (node_modules, vendor, dist, build, target, .next, out, __pycache__,
+// .venv, venv) — a real repo's node_modules alone can hold hundreds of
+// thousands of files, each costing a kernel-level watch descriptor for zero
+// indexing value — while still watching ordinary subdirectories.
+func TestAddRecursiveSkipsBuildAndDependencyDirs(t *testing.T) {
+	root := t.TempDir()
+
+	skipped := []string{"node_modules", "vendor", "dist", "build", "target", ".next", "out", "__pycache__", ".venv", "venv"}
+	for _, name := range skipped {
+		dir := filepath.Join(root, name, "nested")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, "file.txt"), "should never be watched")
+	}
+
+	// A normal subdirectory, and one whose name merely contains a skipped
+	// name as a substring (must NOT be skipped — the match is on exact
+	// basename only).
+	normalDir := filepath.Join(root, "docs", "guides")
+	if err := os.MkdirAll(normalDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	notQuiteVendor := filepath.Join(root, "vendored-notes")
+	if err := os.MkdirAll(notQuiteVendor, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsw.Close()
+
+	if err := addRecursive(fsw, root); err != nil {
+		t.Fatal(err)
+	}
+
+	watched := make(map[string]bool)
+	for _, p := range fsw.WatchList() {
+		watched[p] = true
+	}
+
+	if !watched[root] {
+		t.Errorf("expected root %s to be watched", root)
+	}
+	if !watched[normalDir] {
+		t.Errorf("expected ordinary subdirectory %s to be watched", normalDir)
+	}
+	if !watched[notQuiteVendor] {
+		t.Errorf("expected %s to be watched (name only *contains* a skipped name, doesn't match it exactly)", notQuiteVendor)
+	}
+	for _, name := range skipped {
+		dir := filepath.Join(root, name)
+		if watched[dir] {
+			t.Errorf("expected %s to NOT be watched (build/dependency dir)", dir)
+		}
+		if watched[filepath.Join(dir, "nested")] {
+			t.Errorf("expected nested dir under %s to NOT be watched either (never descended into)", dir)
+		}
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
 }

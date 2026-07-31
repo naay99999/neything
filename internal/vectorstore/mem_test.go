@@ -2,8 +2,10 @@ package vectorstore
 
 import (
 	"context"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -98,6 +100,69 @@ func TestBruteForceStoreIDs(t *testing.T) {
 	}
 	if ids := store.IDs(); !sameStringSet(ids, []string{"1", "3"}) {
 		t.Fatalf("expected IDs [1 3] after delete, got %v", ids)
+	}
+}
+
+// TestParallelSearchMatchesSerial covers fix #3: above parallelSearchThreshold,
+// Search shards the scan across goroutines. The sharded top-k must be
+// identical (as a set, and in score order) to the plain serial scan.
+func TestParallelSearchMatchesSerial(t *testing.T) {
+	const (
+		n   = parallelSearchThreshold + 137 // force the parallel path
+		dim = 16
+		k   = 10
+	)
+	rng := rand.New(rand.NewSource(42))
+	items := make([]VectorItem, n)
+	norms := make([]float32, n)
+	for i := range items {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()*2 - 1
+		}
+		items[i] = VectorItem{ID: strconv.Itoa(i), Vector: vec}
+		norms[i] = norm(vec)
+	}
+	query := make([]float32, dim)
+	for j := range query {
+		query[j] = rng.Float32()*2 - 1
+	}
+	qNorm := norm(query)
+
+	serial := searchTopK(items, norms, query, qNorm, k)
+	parallel := parallelSearchTopK(items, norms, query, qNorm, k)
+
+	if len(serial) != len(parallel) {
+		t.Fatalf("result length mismatch: serial=%d parallel=%d", len(serial), len(parallel))
+	}
+	for i := range serial {
+		if serial[i].ID != parallel[i].ID || serial[i].Score != parallel[i].Score {
+			t.Fatalf("mismatch at rank %d: serial=%+v parallel=%+v", i, serial[i], parallel[i])
+		}
+	}
+
+	// Also exercise it end-to-end through BruteForceStore.Search, which
+	// picks the parallel path automatically once len(items) crosses the
+	// threshold.
+	dir := t.TempDir()
+	store, err := NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(context.Background(), items); err != nil {
+		t.Fatal(err)
+	}
+	viaStore, err := store.Search(context.Background(), query, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaStore) != len(serial) {
+		t.Fatalf("store search length mismatch: got %d want %d", len(viaStore), len(serial))
+	}
+	for i := range serial {
+		if viaStore[i].ID != serial[i].ID {
+			t.Fatalf("store search mismatch at rank %d: got %+v want %+v", i, viaStore[i], serial[i])
+		}
 	}
 }
 

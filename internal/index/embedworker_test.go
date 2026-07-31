@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -472,7 +473,71 @@ func TestEmbedWorkerBackoffRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
-func TestEmbedWorkerPermanentFailureAborts(t *testing.T) {
+// TestEmbedWorkerPermanentFailureQuarantines exercises the single-chunk leaf
+// of embedChunksBisect's poison-isolation logic (fix: "poison batch aborts
+// the whole drain" — bisection should isolate a non-systemic failure and let
+// the drain finish cleanly instead of aborting the whole Run). BatchSize: 1
+// forces every batch Run hands to embedChunksBisect down to a single chunk
+// from the start, so this exercises the len(chunks)==1 base case directly
+// without going through the recursive split (that's
+// TestEmbedWorkerBisectionIsolatesPoisonChunk).
+func TestEmbedWorkerPermanentFailureQuarantines(t *testing.T) {
+	ix, db, dir := setupIndexer(t)
+	defer db.Close()
+
+	root := filepath.Join(dir, "corpus")
+	writeFile(t, filepath.Join(root, "a.md"), "alpha document content")
+	stats, err := ix.Index(context.Background(), root, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fail := &alwaysFailEmbedder{}
+	w := &EmbedWorker{
+		DB:          db,
+		Vectors:     ix.Vectors,
+		Embedder:    fail,
+		BatchSize:   1,
+		BackoffBase: time.Millisecond,
+	}
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("expected Run to quarantine every poison chunk and finish cleanly, got: %v", err)
+	}
+	wantCalls := maxConsecutiveFailures * stats.ChunksCreated
+	if fail.calls != wantCalls {
+		t.Fatalf("expected exactly %d attempts (maxConsecutiveFailures * %d chunks) before quarantining, got %d",
+			wantCalls, stats.ChunksCreated, fail.calls)
+	}
+	if got := ix.Vectors.Count(); got != 0 {
+		t.Fatalf("expected no vectors added for the quarantined chunks, got %d", got)
+	}
+
+	// A second Run on the same worker must not retry any quarantined chunk
+	// (whether because they're still in w.quarantined, or because the
+	// short-circuit watermark from the first drain proves nothing changed —
+	// either way, no further embed calls).
+	callsBefore := fail.calls
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if fail.calls != callsBefore {
+		t.Fatalf("expected quarantined chunks not to be retried on a second Run, got %d more calls", fail.calls-callsBefore)
+	}
+}
+
+// authFailEmbedder always fails with an auth-shaped error message, used to
+// verify Run aborts (rather than bisecting/quarantining) on what looks like
+// a systemic failure.
+type authFailEmbedder struct{ calls int }
+
+func (a *authFailEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	a.calls++
+	return nil, fmt.Errorf("401 Unauthorized: invalid api key")
+}
+func (a *authFailEmbedder) Dimensions() int { return testDim }
+func (a *authFailEmbedder) ModelID() string { return "auth-fail" }
+
+func TestEmbedWorkerSystemicErrorAbortsRun(t *testing.T) {
 	ix, db, dir := setupIndexer(t)
 	defer db.Close()
 
@@ -482,7 +547,7 @@ func TestEmbedWorkerPermanentFailureAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fail := &alwaysFailEmbedder{}
+	fail := &authFailEmbedder{}
 	w := &EmbedWorker{
 		DB:          db,
 		Vectors:     ix.Vectors,
@@ -491,13 +556,153 @@ func TestEmbedWorkerPermanentFailureAborts(t *testing.T) {
 	}
 	err := w.Run(context.Background())
 	if err == nil {
-		t.Fatal("expected Run to give up and return an error after repeated failures")
-	}
-	if fail.calls != maxConsecutiveFailures {
-		t.Fatalf("expected exactly %d attempts, got %d", maxConsecutiveFailures, fail.calls)
+		t.Fatal("expected Run to abort on a systemic (auth) error rather than quarantine")
 	}
 	if got := ix.Vectors.Count(); got != 0 {
-		t.Fatalf("expected no vectors added on total failure, got %d", got)
+		t.Fatalf("expected no vectors added, got %d", got)
+	}
+}
+
+// poisonEmbedder fails any batch containing a text with the "bad" marker
+// substring, succeeding (via the wrapped mock) on any batch without it —
+// simulating a single chunk whose content the embedding API can never
+// process, while its batch-mates embed fine.
+type poisonEmbedder struct {
+	mock  *mockEmbedder
+	bad   string
+	calls int
+}
+
+func (p *poisonEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	p.calls++
+	for _, t := range texts {
+		if strings.Contains(t, p.bad) {
+			return nil, fmt.Errorf("simulated poison chunk failure")
+		}
+	}
+	return p.mock.Embed(ctx, texts)
+}
+func (p *poisonEmbedder) Dimensions() int { return p.mock.Dimensions() }
+func (p *poisonEmbedder) ModelID() string { return p.mock.ModelID() }
+
+// TestEmbedWorkerBisectionIsolatesPoisonChunk is the core bisection test:
+// whichever chunk(s) actually contain the "POISON" marker text always fail
+// to embed (poisonEmbedder fails a whole batch if any text in it contains
+// the marker); every other chunk — including any non-marker chunk the
+// chunker may have split poison.md's own content into — must still get
+// embedded. Forcing BatchSize to cover every chunk in one call means
+// embedChunksBisect has to actually split the batch to find the poison
+// chunk(s) — a batch of 1 wouldn't exercise the recursive case at all
+// (that's TestEmbedWorkerPermanentFailureQuarantines).
+func TestEmbedWorkerBisectionIsolatesPoisonChunk(t *testing.T) {
+	ix, db, dir := setupIndexer(t)
+	defer db.Close()
+
+	root := filepath.Join(dir, "corpus")
+	writeFile(t, filepath.Join(root, "a.md"), "alpha short doc")
+	writeFile(t, filepath.Join(root, "b.md"), "beta short doc")
+	writeFile(t, filepath.Join(root, "poison.md"), "POISON marker doc that always fails to embed")
+	writeFile(t, filepath.Join(root, "c.md"), "gamma short doc")
+	writeFile(t, filepath.Join(root, "d.md"), "delta short doc")
+
+	stats, err := ix.Index(context.Background(), root, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ChunksCreated < 2 {
+		t.Fatalf("expected at least 2 chunks to exercise bisection, got %d", stats.ChunksCreated)
+	}
+
+	allChunkIDs, err := db.GetAllChunkIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allChunks, err := db.GetChunksByIDs(allChunkIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var poisonIDs, okIDs []int64
+	for _, c := range allChunks {
+		if strings.Contains(c.Content, "POISON") {
+			poisonIDs = append(poisonIDs, c.ID)
+		} else {
+			okIDs = append(okIDs, c.ID)
+		}
+	}
+	if len(poisonIDs) == 0 {
+		t.Fatal("expected at least one chunk to contain the POISON marker")
+	}
+
+	poison := &poisonEmbedder{mock: &mockEmbedder{}, bad: "POISON"}
+	w := &EmbedWorker{
+		DB:          db,
+		Vectors:     ix.Vectors,
+		Embedder:    poison,
+		BatchSize:   stats.ChunksCreated, // force every chunk into one batch
+		BackoffBase: time.Millisecond,
+		BisectDelay: time.Millisecond,
+	}
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("expected Run to isolate the poison chunk(s) and finish cleanly, got: %v", err)
+	}
+
+	if got := ix.Vectors.Count(); got != len(okIDs) {
+		t.Fatalf("expected %d vectors (every non-poison chunk), got %d", len(okIDs), got)
+	}
+
+	vecIDs := make(map[string]bool)
+	for _, id := range ix.Vectors.IDs() {
+		vecIDs[id] = true
+	}
+	for _, id := range poisonIDs {
+		if vecIDs[strconv.FormatInt(id, 10)] {
+			t.Fatalf("expected poison chunk %d to be quarantined, not embedded", id)
+		}
+	}
+	for _, id := range okIDs {
+		if !vecIDs[strconv.FormatInt(id, 10)] {
+			t.Fatalf("expected non-poison chunk %d to be embedded", id)
+		}
+	}
+}
+
+// --- Batch-size provider capability ------------------------------------------
+
+// capEmbedder implements the batchSizer capability EmbedWorker.batchSize()
+// looks for.
+type capEmbedder struct {
+	mock *mockEmbedder
+	max  int
+}
+
+func (c *capEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return c.mock.Embed(ctx, texts)
+}
+func (c *capEmbedder) Dimensions() int   { return c.mock.Dimensions() }
+func (c *capEmbedder) ModelID() string   { return c.mock.ModelID() }
+func (c *capEmbedder) MaxBatchSize() int { return c.max }
+
+func TestEmbedWorkerBatchSizeUsesProviderCapability(t *testing.T) {
+	if got := (&EmbedWorker{Embedder: &capEmbedder{mock: &mockEmbedder{}, max: 100}}).batchSize(); got != 100 {
+		t.Fatalf("expected provider capability (100) to override the default, got %d", got)
+	}
+
+	if got := (&EmbedWorker{
+		Embedder:  &capEmbedder{mock: &mockEmbedder{}, max: 100},
+		BatchSize: 10,
+	}).batchSize(); got != 10 {
+		t.Fatalf("expected explicit smaller BatchSize (10) to win over provider max, got %d", got)
+	}
+
+	if got := (&EmbedWorker{
+		Embedder:  &capEmbedder{mock: &mockEmbedder{}, max: 100},
+		BatchSize: 500,
+	}).batchSize(); got != 100 {
+		t.Fatalf("expected min(explicit, providerMax) = 100, got %d", got)
+	}
+
+	if got := (&EmbedWorker{Embedder: &mockEmbedder{}}).batchSize(); got != defaultEmbedBatchSize {
+		t.Fatalf("expected default batch size %d for an embedder without the capability, got %d", defaultEmbedBatchSize, got)
 	}
 }
 
