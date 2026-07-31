@@ -11,11 +11,11 @@ go test ./...                # run all tests
 go test ./internal/store -run TestName   # run a single test
 ```
 
-No external runtime dependencies for core indexing — SQLite is bundled via `modernc.org/sqlite` (pure Go, no cgo). Optional OCR uses external `pdftoppm` + `tesseract` when `loaders.ocr.enabled: true`.
+No external runtime dependencies — SQLite is bundled via `modernc.org/sqlite` (pure Go, no cgo).
 
 ## Architecture
 
-Ney is a local-first search engine for local documents, MCP-first: the primary surface is `ney mcp` (AI clients search/read files), with a CLI (`index`/`search`/`watch`) alongside. There is no chat/ask/REPL surface — that was removed in the 2026-07 MCP-first refocus (see docs/roadmap.md). Data lives in `~/.ney/`: `config.yaml`, `index.db` (SQLite), vector files (`vectors.bin` for brute-force, `vectors.hnsw` for HNSW backend), and `writer.lock` (single-writer coordination).
+Ney is a local-first **personal context server for AI**, MCP-first: the primary surface is `ney mcp` (AI clients get layered context — profile, active projects, and document/memory search), with a CLI (`index`/`search`/`watch`) alongside. There is no chat/ask/REPL surface — that was removed in the 2026-07 MCP-first refocus (see docs/roadmap.md). Data lives in `~/.ney/`: `config.yaml`, `index.db` (SQLite), vector files (`vectors.bin` for brute-force, `vectors.hnsw` for HNSW backend), `writer.lock` (single-writer coordination), `profile.md` (user-owned, AI-editable via `update_profile`), and `memory/` (one markdown file per `remember` call, indexed + watched like any workspace).
 
 The embedder is **optional**: `provider: none`/unset in config runs ney in keyword-only (FTS) mode with no API key or local model needed — `ney init` is the upgrade path to semantic search. `config.HasEmbedder()` checks this; `NewEmbedder` returns `(nil, nil)` when unset (not an error).
 
@@ -23,7 +23,7 @@ The embedder is **optional**: `provider: none`/unset in config runs ney in keywo
 
 ```
 Index (Phase A):  Files → pathfilter (deny dotfiles/secrets) → Loader → ChunkResolver
-                   → SQLite chunks + FTS (no embedding; OCR fallback in PDFLoader)
+                   → SQLite chunks + FTS (no embedding)
 Index (Phase B):  EmbedWorker computes pending = chunk IDs − VectorStore IDs, embeds
                    in batches outside any SQL transaction, sweeps orphan vectors
 Search:  Query → FTS (always, if rows exist) + semantic (if embedder configured and
@@ -31,13 +31,20 @@ Search:  Query → FTS (always, if rows exist) + semantic (if embedder configure
          (degrades to keyword-only, never fails, if the embedder is down/unset)
 Watch:   fsnotify → debounced IndexPath / RemovePath / PruneMissing → Phase A only,
          then EmbedWorker.Notify()
+Context: get_context/list_projects → context.ScanRepos(dev_roots) live git scan
+         (union with indexed workspaces) + LoadProfile(profile.md) → Render — no DB
+         table, stateless, never fails. remember/update_profile write plain md files
+         directly (memoryDir()/profile.md) — read-only-safe, no DB/vector writes.
 MCP:     ney mcp → writer lock → Phase A per --root (background) → EmbedWorker loop
-         → watcher per root → serves search_documents/search_folder/read_document/list_workspaces/
-         index_status immediately, before indexing finishes (tier 0 live scan fills
-         the gap — see internal/scan). If the lock is held by another process, it
-         serves READ-ONLY instead of failing: no indexer/worker/watchers, no
-         workspace upserts, index_status reports mode:"read-only", and unindexed
-         --roots are permanently marked Phase-A-running so live scan covers them
+         → watcher per root → serves get_context/list_projects/search_documents/
+         search_folder/read_document/remember/update_profile/index_folder/index_status
+         immediately, before indexing finishes (tier 0 live scan fills the gap — see
+         internal/scan). If the lock is held by another process, it serves READ-ONLY
+         instead of failing: no indexer/worker/watchers, no workspace upserts,
+         index_status reports mode:"read-only", and unindexed --roots are permanently
+         marked Phase-A-running so live scan covers them. The memory workspace
+         (~/.ney/memory) is registered as a served root in BOTH modes; only write mode
+         indexes and watches it (see cmd_mcp.go's runMCP)
 ```
 
 Indexing is split into two phases specifically so a slow/unreachable embedder can never hold the single SQLite connection: Phase A (`internal/index/pipeline.go`) never calls `Embedder.Embed` or `Vectors.Add`; embedding is entirely `EmbedWorker`'s job (`internal/index/embedworker.go`), run outside any transaction. There is no "embedded?" column — pending/orphan state is computed by diffing SQLite chunk IDs against `VectorStore.IDs()` on each worker pass (relies on chunk IDs being `AUTOINCREMENT`, never reused).
@@ -48,10 +55,11 @@ Indexing is split into two phases specifically so a slow/unreachable embedder ca
 |---|---|
 | `cmd/ney/` | Cobra commands; thin wrappers that wire internal packages. `cmd_mcp.go` + `mcp_tools.go` implement `ney mcp` |
 | `internal/config/` | Config loading (viper), validation, and **provider factory functions** (`NewEmbedder`, `NewReranker`, `NewVectorStore`) |
-| `internal/loader/` | File loaders: `.md`/Obsidian/Notion, `.pdf` (+ OCR), `.docx`, `.html`, `.json`, Confluence `.xml` |
-| `internal/chunk/` | `ChunkStrategy` + `Resolver` (auto per doc type): `character`, `sentence`, `paragraph`, `markdown`, `tokenizer`, `page` |
+| `internal/loader/` | File loaders: `.md`/`.markdown` (+ Obsidian wikilink metadata, + Notion-export quirk stripping — both are `.md` variants sniffed by content, not separate formats), plain `.txt`. md-only since the 2026-07-31 layered-context refocus — PDF/OCR/DOCX/HTML/JSON/Confluence (the genuinely separate formats) were deleted |
+| `internal/chunk/` | `ChunkStrategy` + `Resolver` (auto per doc type): `character`, `sentence`, `paragraph`, `markdown`, `tokenizer` |
 | `internal/embed/` | `Embedder` interface + OpenAI, Gemini, Ollama, OpenAI-compatible implementations |
-| `internal/discover/` | Setup-wizard folder scanner: deep-walk Home + iCloud Drive, count indexable docs per folder, surface concentration-based candidates (junk/secret dirs skipped) |
+| `internal/context/` | Layered-context core (`neycontext`): `ScanRepos` (live git scan of `context.dev_roots`), `LoadProfile`/`UpdateProfile` (`profile.md`), `Render` (L1 markdown blob), `WriteMemory` (`remember`'s md file writer). Pure/stateless — no DB table |
+| `internal/discover/` | Setup-wizard repo scanner: thin wrapper over `context.ScanRepos` returning `Candidate{Path, Name, LastCommit, DocCount}` for the wizard's repo picker |
 | `internal/pathfilter/` | Shared file/dir exclusion: built-in always-on deny (dotfiles + secret-name globs) + user `index.exclude` globs; nil `*Filter` is valid (built-ins only). Applied by the indexer walk, live scan, and `read_document` |
 | `internal/index/` | `Indexer` (Phase A: chunk+FTS, hash-based skip, prune, rename detection) + `EmbedWorker` (Phase B: progressive embed, orphan cleanup, backoff, model-consistency check) |
 | `internal/watch/` | File watcher with debounce for `ney watch`; accepts an external ctx + optional `Serialize`/prune-disable so `ney mcp` can run several under one shared mutex |
@@ -77,8 +85,10 @@ Indexing is split into two phases specifically so a slow/unreachable embedder ca
 - Lock-free reads are safe because VectorStore `Flush` no-ops unless something mutated (`unsaved` flag) — a reader that never Add/Deletes can `Close()` without clobbering the writer's file.
 - Security invariant: everything served to an MCP client must pass BOTH containment AND `pathfilter.ExcludedPath` (secret/dotfile deny). Containment is: inside a served root (`resolveAllowedPath`, symlink-resolved on both sides), OR in the session's `serverState.discovered` set — paths surfaced by a user-directed `search_folder` call (itself bounded to $HOME and secret-blind). The same filter must gate the indexer walk and `internal/scan` — never add a file-discovery path that bypasses `pathfilter`.
 - `ney mcp`'s stdout is reserved for the MCP protocol, full stop — every diagnostic goes to stderr. Never call `fmt.Println`/`PrintJSON`/the spinner helpers (which write to stdout) from any code path `runMCP` can reach.
+- The memory workspace (`~/.ney/memory`, target of `remember`) is registered internally by `runMCP` in BOTH read-write and read-only mode — it's always a served root so `read_document`/`search_documents` can reach it, added directly to the `rootSet` rather than through `index_folder`'s home-directory validation. Only write mode indexes and watches it (Phase A + a watcher through the same per-root pipeline as any other root); in read-only mode it's served but not indexed by this process — a live scan or the lock-holder's watcher covers freshness.
+- `get_context`/`list_projects` are stateless: `context.ScanRepos` shells out to `git` live on every call (no DB table, no caching) and any per-repo git error just skips that repo — `get_context` must never return an MCP error. `remember` and `update_profile` (`internal/context`) only ever write plain markdown files (`memoryDir()`, `profile.md`) — no DB/vector writes — so both work correctly when `ney mcp` is running read-only.
 
-**Setup wizard (`cmd/ney/cmd_init.go`, `mcpclients.go`):** bare `ney` on a machine without DB meta `setup_completed` (and zero workspaces) offers the wizard; `ney init` reruns it. Steps: discover folders → index picks → OCR via brew (consent, never blocks) → register AI clients (Claude Desktop JSON merge / `claude mcp add` / Codex TOML section — all take the config path as a parameter, back up `.bak` first, and refuse to overwrite unparseable files) → optional embedder. Clients are registered args-less (`ney mcp`): the workspaces table is the single source of truth for what's served.
+**Setup wizard (`cmd/ney/cmd_init.go`, `mcpclients.go`):** bare `ney` on a machine without DB meta `setup_completed` (and zero workspaces) offers the wizard; `ney init` reruns it. Steps: `[1/4]` scan `context.dev_roots` for git repos (prompt for a root if none configured and no `~/workspace`) → pick + index → `[2/4]` bootstrap `~/.ney/profile.md` from the embedded template, asking 2–3 short questions (skipped if a profile already exists — it's user-owned from then on) → `[3/4]` register AI clients (Claude Desktop JSON merge / `claude mcp add` / Codex TOML section — all take the config path as a parameter, back up `.bak` first, and refuse to overwrite unparseable files) → `[4/4]` optional embedder. Clients are registered args-less (`ney mcp`): the workspaces table is the single source of truth for what's served.
 
 **Dynamic roots:** `ney mcp`'s served roots live in a `rootSet` (cmd_mcp.go) that `index_folder` appends to mid-session — read_document containment and live-scan targeting must always consult `rs.snapshot()`, never a captured slice.
 

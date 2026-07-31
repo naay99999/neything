@@ -34,8 +34,12 @@ as the internal recall mechanism, no longer the product.
 5. **Memory = one markdown file per entry** in `~/.ney/memory/`, written via a
    `remember` tool, with frontmatter (`date`, optional `project`, `tags`).
    Indexed and watched like any workspace, so searchable seconds after write.
-6. **Cut hard to md-only.** Delete PDF (+OCR), DOCX, HTML, JSON, Confluence,
-   Notion loaders. Keep Markdown (+Obsidian wikilinks) and `.txt`.
+6. **Cut hard to md-only.** Delete PDF (+OCR), DOCX, HTML, JSON, Confluence
+   loaders. Keep Markdown (+Obsidian wikilinks, + Notion-export property-table
+   stripping — both are content-sniffed `.md` variants, not separate formats)
+   and `.txt`. (Amended at implementation time: the original wording listed
+   "Notion" among the deletions, but NotionLoader only normalizes `.md`
+   exports and stays.)
 7. **Stateless project awareness** (approach 1 of 3 considered). No new DB
    tables: `get_context` scans git repos live on each call. Disk is the state,
    mirroring the Phase-B "diff, don't record" philosophy. If repo count ever
