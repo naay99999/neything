@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,6 +36,12 @@ func memoryDir() string {
 // multi-GB file under a watched root can't be read into memory whole by an
 // MCP client.
 const maxReadFileSize = 20 * 1024 * 1024
+
+// indexFolderTimeout bounds one synchronous index_folder call. It holds the
+// shared index mutex for its whole duration, so an unbounded run would block
+// every watcher flush and every other index_folder call for the life of the
+// session.
+const indexFolderTimeout = 15 * time.Minute
 
 const (
 	defaultSearchTopK = 8
@@ -127,8 +135,8 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 			"no indexing needed, bounded (~10k files / 2s), secret and hidden files are never returned. " +
 			"Use this as the fallback when search_documents finds nothing: first ASK THE USER where the file " +
 			"might be (e.g. ~/Downloads, ~/Desktop, ~/Documents, or a project folder they name), then call this " +
-			"with that folder — do not guess-scan many folders unprompted. Files found here become readable " +
-			"via read_document for the rest of this session.",
+			"with that folder — do not guess-scan many folders unprompted. Plain-text files found here " +
+			"(.md/.markdown/.txt) become readable via read_document for the rest of this session.",
 	}, searchFolderHandler(state, flt))
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -218,7 +226,9 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 				Source:    "index",
 			}
 		}
-		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, rs.snapshot(), state, flt)
+		roots := rs.snapshot()
+		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state, flt)
+		items = filterExcludedItems(flt, roots, items)
 
 		chunkCount, _ := app.DB.CountChunks()
 		out := searchDocumentsOutput{
@@ -258,6 +268,23 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, out, nil
 	}
+}
+
+// filterExcludedItems drops result items whose path is denied for a client
+// (excludedForClient). Snippets are chunk text straight out of the index, so
+// a workspace that predates the current admission rules — an old install, or
+// a CLI `ney index ~/.ssh` — could otherwise leak secret content through
+// search even though read_document refuses to serve the same file. Capped at
+// maxSearchTopK items per call, so the per-item path check is free.
+func filterExcludedItems(flt *pathfilter.Filter, roots []mcpRoot, items []searchResultItem) []searchResultItem {
+	out := items[:0]
+	for _, it := range items {
+		if excludedForClient(flt, roots, it.Path) {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 // appendLiveScanHits runs a tier-0 filesystem scan (internal/scan) on any
@@ -357,7 +384,7 @@ func searchFolderHandler(state *serverState, flt *pathfilter.Filter) mcp.ToolHan
 			return nil, searchFolderOutput{}, fmt.Errorf("path is required")
 		}
 
-		dir, err := resolveAllowedScanDir(in.Path)
+		dir, err := resolveAllowedScanDir(in.Path, flt)
 		if err != nil {
 			return nil, searchFolderOutput{}, err
 		}
@@ -427,9 +454,19 @@ func indexFolderHandler(deps mcpDeps) mcp.ToolHandlerFor[indexFolderInput, index
 				"this server is read-only (another ney process holds the writer lock) — close it and retry, or use search_folder for a one-off scan")
 		}
 
-		dir, err := resolveAllowedScanDir(in.Path)
+		dir, err := resolveAllowedScanDir(in.Path, deps.flt)
 		if err != nil {
 			return nil, indexFolderOutput{}, err
+		}
+		// $HOME itself passes resolveAllowedScanDir (it's the containment
+		// boundary, not a denied component) but must never become a permanent
+		// workspace: it would drag every folder the user ever creates into the
+		// index and make the whole home directory read_document-reachable.
+		// search_folder on ~ stays allowed — that scan is bounded and
+		// session-scoped.
+		if home, herr := resolvedHomeDir(); herr == nil && dir == home {
+			return nil, indexFolderOutput{}, fmt.Errorf(
+				"indexing the entire home directory is not allowed — pick a specific folder (e.g. ~/Documents, ~/notes)")
 		}
 
 		name := filepath.Base(dir)
@@ -448,14 +485,30 @@ func indexFolderHandler(deps mcpDeps) mcp.ToolHandlerFor[indexFolderInput, index
 			return nil, indexFolderOutput{}, err
 		}
 
+		// index_folder is synchronous (the client waits for the result), and
+		// the same mutex serializes every other indexing path — so an
+		// accidentally huge folder would wedge the whole session indefinitely.
+		// Bound it: past the deadline the client gets an actionable error and
+		// the server stays responsive. Whatever was indexed before the deadline
+		// is already committed (SQLite commits per document), so the CLI rerun
+		// suggested below resumes rather than starting over.
+		ictx, cancel := context.WithTimeout(ctx, indexFolderTimeout)
+		defer cancel()
+
 		deps.state.setPhaseA(name, true)
 		var stats *index.Stats
 		var ierr error
 		deps.serialize(func() {
-			stats, ierr = deps.ix.Index(ctx, dir, name)
+			stats, ierr = deps.ix.Index(ictx, dir, name)
 		})
 		deps.state.setPhaseA(name, false)
 		if ierr != nil {
+			if errors.Is(ictx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil, indexFolderOutput{}, fmt.Errorf(
+					"indexing %s exceeded the %s limit and was stopped (partial progress was saved) — "+
+						"run `ney index %s` from the terminal for very large folders, then retry",
+					dir, indexFolderTimeout, dir)
+			}
 			return nil, indexFolderOutput{}, fmt.Errorf("index %s: %w", dir, ierr)
 		}
 		if deps.worker != nil {
@@ -481,12 +534,76 @@ func indexFolderHandler(deps mcpDeps) mcp.ToolHandlerFor[indexFolderInput, index
 	}
 }
 
+// resolvedHomeDir returns the user's home directory symlink-resolved, so it
+// can be prefix-compared against paths that went through EvalSymlinks (on
+// macOS /var is a symlink to /private/var, which is where temp HOMEs live).
+func resolvedHomeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return resolveRootBestEffort(home), nil
+}
+
+// underDir reports whether p is base itself or nested beneath it. Both must
+// be absolute, cleaned and symlink-resolved for this to mean anything.
+func underDir(base, p string) bool {
+	return p == base || strings.HasPrefix(p, base+string(filepath.Separator))
+}
+
+// excludedForClient is the single deny rule for everything ney hands an MCP
+// client — read_document content and search result items alike.
+//
+// The subtlety it exists for: Filter.ExcludedPath deliberately never checks
+// the root component itself (containment is the caller's job), so evaluating
+// a path relative to its own workspace root means a root that IS a denied
+// directory (~/.config, ~/.ssh — admitted by an older build, or by `ney index
+// ~/.ssh` from the CLI) decapitates the dotfile/secret rule for everything
+// under it. So anything under $HOME is evaluated from $HOME down, which
+// re-examines every component including the root's own.
+//
+// The one exemption is roots ney registers itself (mcpRoot.Internal — today
+// just ~/.ney/memory): those live under a dot-directory on purpose, so they
+// are evaluated from the root down, exactly as before. A path under neither
+// $HOME nor an internal root falls back to its containing root, preserving
+// the old behavior for workspaces elsewhere on disk.
+func excludedForClient(flt *pathfilter.Filter, roots []mcpRoot, p string) bool {
+	p = filepath.Clean(p)
+	base := ""
+	for _, r := range roots {
+		if r.Internal && underDir(r.Path, p) {
+			base = r.Path
+			break
+		}
+	}
+	if base == "" {
+		if home, err := resolvedHomeDir(); err == nil && underDir(home, p) {
+			base = home
+		}
+	}
+	if base == "" {
+		for _, r := range roots {
+			if underDir(r.Path, p) {
+				base = r.Path
+				break
+			}
+		}
+	}
+	if base == "" {
+		return false // not under anything we serve; containment already refused it
+	}
+	return flt.ExcludedPath(base, p)
+}
+
 // resolveAllowedScanDir resolves a client-supplied folder and requires it to
 // be inside the user's home directory (which on macOS includes iCloud Drive,
 // under ~/Library/Mobile Documents) — search_folder/index_folder may roam
 // the user's files when the user directs them there, but never system paths,
-// other users' homes, or mounted volumes.
-func resolveAllowedScanDir(raw string) (string, error) {
+// other users' homes, or mounted volumes. The folder must also survive the
+// pathfilter itself (see below): this is the one admission point for both
+// tools, so rejecting a denied folder here keeps it from ever becoming a
+// served root or a scan target.
+func resolveAllowedScanDir(raw string, flt *pathfilter.Filter) (string, error) {
 	p := expandTilde(raw)
 	if !filepath.IsAbs(p) {
 		abs, err := filepath.Abs(p)
@@ -509,13 +626,21 @@ func resolveAllowedScanDir(raw string) (string, error) {
 		return "", fmt.Errorf("not a folder: %s", raw)
 	}
 
-	home, err := os.UserHomeDir()
+	home, err := resolvedHomeDir()
 	if err != nil {
 		return "", err
 	}
-	home = resolveRootBestEffort(home)
-	if resolved != home && !strings.HasPrefix(resolved, home+string(filepath.Separator)) {
+	if !underDir(home, resolved) {
 		return "", fmt.Errorf("folder outside the home directory is not allowed: %s", raw)
+	}
+	// Apply the deny rule to the target folder's own components, from $HOME
+	// down. Containment alone would happily admit ~/.config or ~/.docker as a
+	// permanent served root, and from then on every per-file check evaluated
+	// relative to that root — which never re-checks the root itself — so the
+	// dotfile/secret protection under it would be gone. $HOME itself is not a
+	// denied component, so scanning ~ stays allowed.
+	if flt.ExcludedPath(home, resolved) {
+		return "", fmt.Errorf("folder is excluded by security policy (hidden or secret path): %s", raw)
 	}
 	return resolved, nil
 }
@@ -541,7 +666,8 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 		if strings.TrimSpace(in.Path) == "" {
 			return nil, readDocumentOutput{}, fmt.Errorf("path is required")
 		}
-		resolved, root, err := resolveAllowedPath(in.Path, rs.snapshot())
+		roots := rs.snapshot()
+		resolved, _, err := resolveAllowedPath(in.Path, roots)
 		if err != nil {
 			// Outside every served root — still allowed IF a user-directed
 			// search_folder call surfaced this exact file earlier in the
@@ -551,14 +677,35 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 			if resolved, derr = resolveDiscoveredPath(in.Path, state); derr != nil {
 				return nil, readDocumentOutput{}, err
 			}
-			home, herr := os.UserHomeDir()
-			if herr != nil {
-				return nil, readDocumentOutput{}, err
-			}
-			root = mcpRoot{Name: "home", Path: resolveRootBestEffort(home)}
 		}
-		if flt.ExcludedPath(root.Path, resolved) {
+		// Deny evaluated from $HOME down (see excludedForClient), not from the
+		// matched root: a root that itself sits under a denied component would
+		// otherwise never have that component re-examined.
+		if excludedForClient(flt, roots, resolved) {
 			return nil, readDocumentOutput{}, fmt.Errorf("path is excluded by security policy (hidden or secret file): %s", in.Path)
+		}
+		// This tool advertises .md/.markdown/.txt and reads whatever it opens
+		// as text; without this guard it doubles as a general-purpose file
+		// reader for any binary/config/data file that happens to live inside a
+		// served root. Same extension set as the indexer walk, so what's
+		// readable matches what's searchable.
+		if !index.IsSupportedExt(resolved) {
+			return nil, readDocumentOutput{}, fmt.Errorf(
+				"unsupported file type %q — read_document serves .md/.markdown/.txt only: %s",
+				filepath.Ext(resolved), in.Path)
+		}
+		// Stat now, compare against the opened descriptor below (os.SameFile):
+		// every check above ran on a path, and a path can be re-pointed between
+		// the check and the open.
+		validated, err := os.Stat(resolved)
+		if err != nil {
+			return nil, readDocumentOutput{}, fmt.Errorf("path not found: %s", in.Path)
+		}
+		if validated.IsDir() {
+			return nil, readDocumentOutput{}, fmt.Errorf("path is a directory: %s", in.Path)
+		}
+		if !validated.Mode().IsRegular() {
+			return nil, readDocumentOutput{}, fmt.Errorf("not a regular file: %s", in.Path)
 		}
 
 		maxChars := in.MaxChars
@@ -569,7 +716,7 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 			maxChars = maxReadChars
 		}
 
-		full, source, err := readPlainTextFile(resolved)
+		full, source, err := readPlainTextFile(resolved, validated)
 		if err != nil {
 			return nil, readDocumentOutput{}, err
 		}
@@ -588,10 +735,28 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 
 // readPlainTextFile reads a file directly off disk — every supported format
 // (.md/.markdown/.txt) is plain text, so this is the only read path.
-func readPlainTextFile(resolved string) (content, source string, err error) {
-	fi, err := os.Stat(resolved)
+//
+// validated is the os.Stat the caller took while the path was still passing
+// the containment/pathfilter checks. Every check up there is name-based, and
+// between the last one and this read a path component can be swapped (a
+// directory replaced by a symlink to /etc, say). So the file is opened ONCE
+// and the open descriptor's own Stat must name the same inode as validated
+// (os.SameFile) — otherwise the thing we're about to read isn't the thing
+// that was approved, and we refuse. Everything after this (size cap, read)
+// goes through that same descriptor, never back through the path.
+func readPlainTextFile(resolved string, validated os.FileInfo) (content, source string, err error) {
+	f, err := os.Open(resolved)
 	if err != nil {
 		return "", "", fmt.Errorf("path not found: %s", resolved)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return "", "", err
+	}
+	if !os.SameFile(fi, validated) {
+		return "", "", fmt.Errorf("file changed on disk during validation, refusing to read: %s", resolved)
 	}
 	if fi.IsDir() {
 		return "", "", fmt.Errorf("path is a directory: %s", resolved)
@@ -599,9 +764,14 @@ func readPlainTextFile(resolved string) (content, source string, err error) {
 	if fi.Size() > maxReadFileSize {
 		return "", "", fmt.Errorf("file too large to read (%d bytes, max %d)", fi.Size(), maxReadFileSize)
 	}
-	data, err := os.ReadFile(resolved)
+	// Read from the descriptor, still capped: Size() is a snapshot and a file
+	// being appended to could otherwise outgrow the check between here and EOF.
+	data, err := io.ReadAll(io.LimitReader(f, maxReadFileSize+1))
 	if err != nil {
 		return "", "", err
+	}
+	if len(data) > maxReadFileSize {
+		return "", "", fmt.Errorf("file too large to read (max %d bytes)", maxReadFileSize)
 	}
 	return string(data), "file", nil
 }

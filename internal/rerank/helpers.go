@@ -1,6 +1,30 @@
 package rerank
 
-import "unicode/utf8"
+import (
+	"net/url"
+	"strings"
+	"unicode/utf8"
+)
+
+// redactURL strips the query string and any userinfo from a request URL so
+// it can be safely formatted into an error message. Credentials leak through
+// both: Go's http.Client blanks the userinfo *password* in the *url.Error it
+// returns, but nothing redacts a `?api-key=…` query param, and we format
+// URLs into errors ourselves. Unparseable input degrades to the bare prefix
+// before the first '?' rather than risking passing the raw string through.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if i := strings.IndexByte(raw, '?'); i >= 0 {
+			return raw[:i]
+		}
+		return raw
+	}
+	u.RawQuery = ""
+	u.User = nil
+	u.Fragment = ""
+	return u.String()
+}
 
 // maxRerankContentChars caps how much of a chunk's content is sent to a
 // reranker API per candidate. Relevance scoring doesn't need the full

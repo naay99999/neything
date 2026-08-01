@@ -23,6 +23,10 @@ type mcpTestEnv struct {
 	app   *AppState
 	state *serverState
 	root  string // resolved (symlink-evaluated) corpus root
+	// rs is the server's live root set, for tests that need to register a root
+	// the way runMCP does internally (see mcp_security_test.go). nil unless the
+	// constructor wired it.
+	rs *rootSet
 }
 
 // newMCPTestEnv sets up an isolated ~/.ney (temp HOME), indexes a small
@@ -863,7 +867,9 @@ func newMCPTestEnvFullLoop(t *testing.T) (*mcpTestEnv, *index.Indexer) {
 		t.Fatal(err)
 	}
 
-	roots := []mcpRoot{{Name: "memory", Path: memPath}}
+	// Internal: true mirrors runMCP — ~/.ney/memory lives under a dot-dir on
+	// purpose, and that bit is what exempts it from the from-$HOME deny.
+	roots := []mcpRoot{{Name: "memory", Path: memPath, Internal: true}}
 	state := newServerState(rootNames(roots), false)
 	var mu sync.Mutex
 	server := newMCPServer(mcpDeps{

@@ -22,14 +22,26 @@ import (
 // are denied unconditionally and independently of this list.
 //
 // Deliberately absent: "*token*" (matches innocent docs like
-// tokenizer-notes.md) and "*.crt" (public certificate material).
+// tokenizer-notes.md), "*.crt" (public certificate material), "*.pub"
+// (public halves of key pairs — id_rsa.pub is already covered by id_rsa*,
+// and the bare glob would swallow innocent files), and "*config*" (far too
+// broad: config-notes.md, configuration.md, ... — only the specific
+// "*.kubeconfig" suffix is denied).
 var DefaultDeny = []string{
 	"*secret*", "*credential*", "*password*", "*passwd*",
 	"*apikey*", "*api_key*", "*api-key*",
 	"*.env", // prod.env etc.; ".env" itself is caught by the dotfile rule
 	"*.key", "*.pem", "*.p12", "*.pfx", "*.jks", "*.keystore",
 	"*.ppk", "*.kdbx", "*.gpg", "*.asc", "*.der",
+	"*.p8",   // Apple/APNs + JWT signing keys
+	"*.ovpn", // OpenVPN profiles: embed inline <key> material
 	"id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+	// SSH/host trust + credential files that are frequently copied out of a
+	// dot-dir (so the dotfile rule alone doesn't cover them) and that leak
+	// either credentials outright or the user's private host inventory.
+	"known_hosts*", "authorized_keys*",
+	"*.netrc",      // machine/login/password triples for curl, ftp, ...
+	"*.kubeconfig", // cluster certs + bearer tokens
 }
 
 // Filter reports whether names/paths are excluded. The zero value is not

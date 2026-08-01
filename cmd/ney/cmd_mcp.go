@@ -42,6 +42,15 @@ func init() {
 type mcpRoot struct {
 	Name string
 	Path string
+	// Internal marks a root ney registers itself rather than one the user
+	// pointed at (today: ~/.ney/memory, the `remember` tool's target). It
+	// only affects where the pathfilter deny is evaluated FROM: everything
+	// under $HOME is normally checked component-by-component from $HOME down
+	// (so a root that got into the DB under a dot-directory can't decapitate
+	// the dotfile rule — see excludedForClient), but ney's own memory root
+	// lives under the dot-directory ~/.ney by design, so its files are
+	// checked from the root itself. Containment is unaffected.
+	Internal bool
 }
 
 // runMCP wires one long-lived server process: acquire the writer lock, open
@@ -95,8 +104,21 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	if err := os.MkdirAll(memPath, 0700); err != nil {
 		return fmt.Errorf("create memory dir: %w", err)
 	}
+	// Symlink-resolve it for the same reason read_document does: containment
+	// compares against the resolved path, and on macOS $HOME itself can sit
+	// behind a symlink (/var -> /private/var).
+	memPath = resolveRootBestEffort(memPath)
 	if !hasRootNamed(roots, "memory") {
-		roots = append(roots, mcpRoot{Name: "memory", Path: memPath})
+		roots = append(roots, mcpRoot{Name: "memory", Path: memPath, Internal: true})
+	}
+	// A prior run persisted ~/.ney/memory as a DB workspace, so resolveMCPRoots
+	// returned it above without the Internal bit. Set it here: that bit is what
+	// exempts memory files from the from-$HOME dotfile evaluation (~/.ney is a
+	// dot-directory, so without it every remembered file becomes unreadable).
+	for i := range roots {
+		if roots[i].Path == memPath {
+			roots[i].Internal = true
+		}
 	}
 
 	state := newServerState(rootNames(roots), readOnly)

@@ -62,7 +62,11 @@ func (r *OllamaReranker) Rerank(ctx context.Context, query string, candidates []
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]any
 		json.NewDecoder(resp.Body).Decode(&errBody)
-		return nil, fmt.Errorf("local rerank HTTP %d at %s: %v", resp.StatusCode, url, errBody)
+		// redactURL, not url: the endpoint is user-configured and some local
+		// gateways/proxies carry credentials in it (`?api-key=…`, userinfo).
+		// This error reaches stderr and MCP client logs, so echo only the
+		// scheme/host/path needed to identify which endpoint failed.
+		return nil, fmt.Errorf("local rerank HTTP %d at %s: %v", resp.StatusCode, redactURL(url), errBody)
 	}
 
 	var out struct {

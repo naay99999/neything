@@ -58,6 +58,42 @@ const (
 	compactMinRecords      = 512
 )
 
+// secureFileMode is the permission every file this package creates gets.
+// Vector files hold the embeddings of the user's indexed documents (and the
+// HNSW graph cache holds the same vectors again) — private content, so the
+// files themselves are owner-only even though ~/.ney is already 0700. The
+// directory mode is a single layer: a restore from backup, an rsync, a
+// container bind-mount or a cloud-sync client can loosen it without anyone
+// noticing, and then everything indexed becomes readable by any local user.
+const secureFileMode os.FileMode = 0o600
+
+// createSecure creates (or truncates) path owner-readable only. os.Create
+// would use 0666 &^ umask — 0644 on the common umask 022 — and, for a file
+// that already exists (a stale .tmp left by a crashed flush), it keeps the
+// existing mode entirely, hence the explicit chmod after open.
+func createSecure(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, secureFileMode)
+	if err != nil {
+		return nil, err
+	}
+	// Best-effort: filesystems without permission bits (FAT, some network
+	// mounts) reject chmod, and the create mode above already covers the
+	// normal case.
+	_ = f.Chmod(secureFileMode)
+	return f, nil
+}
+
+// tightenMode best-effort narrows an already-existing file to 0600. Files
+// written by older ney versions (or by any os.Create before this change)
+// are world-readable on disk; this repairs them in place the next time the
+// store is loaded. Never fatal — a read-only or mode-less filesystem must
+// not stop ney from starting.
+func tightenMode(path string) {
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() != secureFileMode {
+		_ = os.Chmod(path, secureFileMode)
+	}
+}
+
 // flatFile manages incremental persistence of a flat vector file shared by
 // BruteForceStore and HNSWStore. It tracks which item IDs are already
 // durable on disk so Flush can append only what changed instead of
@@ -103,6 +139,11 @@ func (f *flatFile) load() ([]VectorItem, error) {
 		return nil, err
 	}
 	defer file.Close()
+	// Repair vector files created world-readable by an older ney (see
+	// secureFileMode); every later write goes through createSecure or the
+	// 0600 append below, so this is the only place a pre-existing loose mode
+	// gets caught.
+	tightenMode(f.path)
 	br := bufio.NewReaderSize(file, 1<<20)
 
 	head := make([]byte, 4)
@@ -354,7 +395,9 @@ func writeTombstoneRecord(w io.Writer, id string) error {
 // format, via the tmp+rename pattern.
 func writeFlatSnapshot(path string, items []VectorItem) error {
 	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	// createSecure, not os.Create: rename carries the tmp file's mode over to
+	// path, so a 0644 tmp would silently re-loosen the vector file.
+	f, err := createSecure(tmp)
 	if err != nil {
 		return err
 	}
@@ -390,11 +433,14 @@ func writeFlatSnapshot(path string, items []VectorItem) error {
 // if the file is new/empty. The write is fsync'd before returning so a
 // crash can't leave a torn append.
 func appendFlatRecords(path string, items []VectorItem, deletes []string) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, secureFileMode)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// O_CREATE's mode only applies when the file is new; an existing file
+	// keeps whatever mode it had (0644 from an older ney), so tighten too.
+	_ = f.Chmod(secureFileMode)
 
 	offset, err := f.Seek(0, io.SeekEnd)
 	if err != nil {

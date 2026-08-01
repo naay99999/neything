@@ -95,6 +95,8 @@ func (s *HNSWStore) importGraph() *hnsw.Graph[string] {
 		return nil
 	}
 	defer f.Close()
+	// Repair a graph cache written world-readable by an older ney.
+	tightenMode(s.graphPath())
 
 	g := s.newGraph()
 	if err := g.Import(bufio.NewReaderSize(f, 1<<20)); err != nil {
@@ -263,7 +265,10 @@ func (s *HNSWStore) Flush() error {
 
 func (s *HNSWStore) exportGraphLocked() error {
 	tmp := s.graphPath() + ".tmp"
-	f, err := os.Create(tmp)
+	// createSecure, not os.Create: the exported graph embeds every vector, and
+	// rename carries the tmp file's mode over to the final path (see
+	// secureFileMode in flat.go).
+	f, err := createSecure(tmp)
 	if err != nil {
 		return err
 	}

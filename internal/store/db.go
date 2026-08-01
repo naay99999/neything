@@ -58,6 +58,28 @@ type StoreStats struct {
 	ChunkCount     int
 }
 
+// dbFileMode is the permission index.db and its WAL sidecars are held at.
+// The database stores the full text of every indexed document (and -wal /
+// -shm hold recently written pages of that same text), so the files are
+// owner-only even though ~/.ney is already 0700: the directory mode is a
+// single layer that a restore from backup, an rsync, a container
+// bind-mount or a cloud-sync client can loosen without anyone noticing.
+// SQLite itself creates these files with 0644 under the common umask 022.
+const dbFileMode os.FileMode = 0o600
+
+// tightenDBPerms narrows the database file and its WAL sidecars to 0600.
+// Deliberately best-effort and non-fatal: the -wal/-shm files don't exist
+// until SQLite actually enters WAL mode (so a chmod on them legitimately
+// hits ENOENT on a fresh open), and no chmod failure — read-only mount,
+// mode-less filesystem — should ever prevent ney from starting. A chmod is
+// a filesystem call, not a query, so it's safe to make here regardless of
+// the SetMaxOpenConns(1) / open-sql.Rows constraints.
+func tightenDBPerms(dbPath string) {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		_ = os.Chmod(p, dbFileMode)
+	}
+}
+
 func Open(dbPath string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
@@ -78,11 +100,20 @@ func Open(dbPath string) (*DB, error) {
 		sqldb.Close()
 		return nil, fmt.Errorf("set pragmas: %w", err)
 	}
+	// The pragma Exec is what actually opens the connection and creates the
+	// db file (sql.Open alone is lazy), so this is the first moment the file
+	// exists to chmod.
+	tightenDBPerms(dbPath)
 	db := &DB{db: sqldb}
 	if err := db.migrate(); err != nil {
 		sqldb.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// Again after migrate: its schema writes are the first WAL traffic, so
+	// -wal/-shm are guaranteed to exist by now even if they didn't above.
+	// They live as long as this connection does (MaxOpenConns(1) with an
+	// idle conn that the pool never reaps), so one pass here is enough.
+	tightenDBPerms(dbPath)
 	return db, nil
 }
 

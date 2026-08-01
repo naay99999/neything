@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/naay99999/neything/internal/apiretry"
@@ -17,10 +18,17 @@ import (
 // EmbedWorker's provider-aware batching (internal/index/embedworker.go).
 const geminiMaxBatchSize = 100
 
+// geminiDefaultBaseURL is Google's public Generative Language API host. It's
+// overridable via GeminiEmbedder.BaseURL (same shape as OpenAIEmbedder) so
+// tests can point the client at a local server; production callers
+// (config.NewEmbedder) leave it empty and get this.
+const geminiDefaultBaseURL = "https://generativelanguage.googleapis.com"
+
 type GeminiEmbedder struct {
-	APIKey string
-	Model  string
-	client *http.Client
+	APIKey  string
+	Model   string
+	BaseURL string // empty = geminiDefaultBaseURL
+	client  *http.Client
 }
 
 func NewGeminiEmbedder(apiKey, model string) *GeminiEmbedder {
@@ -93,14 +101,22 @@ func (e *GeminiEmbedder) embedBatch(ctx context.Context, texts []string) ([][]fl
 	}
 	body, _ := json.Marshal(map[string]any{"requests": requests})
 
-	url := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s",
-		e.Model, e.APIKey,
-	)
+	base := e.BaseURL
+	if base == "" {
+		base = geminiDefaultBaseURL
+	}
+	url := fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents", strings.TrimRight(base, "/"), e.Model)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+	// The key goes in x-goog-api-key, never the `?key=` query param Google
+	// also accepts: on a transport failure http.Client returns a *url.Error
+	// carrying the FULL request URL (Go redacts userinfo passwords but never
+	// query params), and that error is printed verbatim by `ney index`,
+	// `ney mcp` and `ney doctor` — so a URL-embedded key lands in terminal
+	// output, MCP client logs and crash reports.
+	req.Header.Set("x-goog-api-key", e.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := apiretry.Do(ctx, e.client, req, 5)

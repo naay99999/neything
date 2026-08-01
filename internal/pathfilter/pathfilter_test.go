@@ -22,11 +22,31 @@ func TestExcludedFileDeniesSecrets(t *testing.T) {
 	}
 }
 
+// TestExcludedFileDeniesHighValueSecrets covers the patterns added for L-1:
+// credential/host-trust files that are routinely copied OUT of a dot-dir (so
+// the dotfile rule alone never sees them).
+func TestExcludedFileDeniesHighValueSecrets(t *testing.T) {
+	denied := []string{
+		"known_hosts", "known_hosts.old", "authorized_keys", "authorized_keys2",
+		"work.netrc", "prod.kubeconfig", "AuthKey_ABC123.p8", "office.ovpn",
+	}
+	var f *Filter
+	for _, name := range denied {
+		if !f.ExcludedFile(name) {
+			t.Errorf("ExcludedFile(%q) = false, want true", name)
+		}
+	}
+}
+
 func TestExcludedFileAllowsNormalFiles(t *testing.T) {
 	allowed := []string{
 		"notes.md", "tokenizer.md", "keyboard.md", "README.md",
 		"invoice-1233.pdf", "report.rtf", "data.json", "envelope.md",
 		"monkey.md", // contains "key" but doesn't match *.key or *apikey*
+		// The L-1 additions must not swallow innocent docs: they are anchored
+		// (prefix or extension), never substring matches.
+		"config.md", "configuration.md", "hosts.md", "unknown-hosts-plan.md",
+		"netrc-migration.md", "kubeconfig-notes.md", "keys-of-the-kingdom.md",
 	}
 	var f *Filter
 	for _, name := range allowed {
