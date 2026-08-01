@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/naay99999/neything/internal/pathfilter"
 )
@@ -114,5 +116,105 @@ func writeExcludeTestFile(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestIndexSkipsSymlinks is the regression guard for a confirmed content
+// leak: the walk checked only the entry's *name*, and os.ReadFile then
+// followed the link. A symlink called readme.md pointing at a private key got
+// the key's contents chunked into the index and returned as a search snippet.
+func TestIndexSkipsSymlinks(t *testing.T) {
+	ix, db, dir := setupIndexer(t)
+	defer db.Close()
+
+	secret := filepath.Join(dir, "id_rsa")
+	writeExcludeTestFile(t, secret, "BEGIN PRIVATE KEY SUPERSECRETMATERIAL")
+
+	root := filepath.Join(dir, "notes")
+	writeExcludeTestFile(t, filepath.Join(root, "real.md"), "ordinary note content")
+	if err := os.Symlink(secret, filepath.Join(root, "readme.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	stats, err := ix.Index(context.Background(), root, "ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesScanned != 1 {
+		t.Fatalf("expected only the regular file to be scanned, got %d", stats.FilesScanned)
+	}
+
+	hits, err := db.SearchFTS("SUPERSECRETMATERIAL", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("symlink target was indexed — %d FTS hit(s) for the secret", len(hits))
+	}
+}
+
+// TestIndexPathSkipsNonRegularFiles covers the watcher's entry point, which
+// has no DirEntry and so needs its own Lstat-based check.
+func TestIndexPathSkipsNonRegularFiles(t *testing.T) {
+	ix, db, dir := setupIndexer(t)
+	defer db.Close()
+
+	secret := filepath.Join(dir, "id_rsa")
+	writeExcludeTestFile(t, secret, "BEGIN PRIVATE KEY SUPERSECRETMATERIAL")
+
+	root := filepath.Join(dir, "notes")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "readme.md")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	wsID, err := db.UpsertWorkspace("ws", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := ix.IndexPath(context.Background(), link, wsID, "ws")
+	if err != nil {
+		t.Fatalf("a symlink should be a silent skip, got error: %v", err)
+	}
+	if stats.FilesSkipped != 1 || stats.ChunksCreated != 0 {
+		t.Fatalf("expected skip with no chunks, got %+v", stats)
+	}
+	hits, err := db.SearchFTS("SUPERSECRETMATERIAL", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("symlink target was indexed via IndexPath — %d FTS hit(s)", len(hits))
+	}
+}
+
+// TestIndexDoesNotHangOnNamedPipe: a FIFO with an indexable extension used to
+// reach os.ReadFile, which blocks until a writer appears — wedging the whole
+// indexing pass. The test's own timeout is the assertion.
+func TestIndexDoesNotHangOnNamedPipe(t *testing.T) {
+	ix, db, dir := setupIndexer(t)
+	defer db.Close()
+
+	root := filepath.Join(dir, "notes")
+	writeExcludeTestFile(t, filepath.Join(root, "real.md"), "ordinary note content")
+	if err := syscall.Mkfifo(filepath.Join(root, "pipe.md"), 0o644); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := ix.Index(context.Background(), root, "ws"); err != nil {
+			t.Errorf("index: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("indexing blocked on a named pipe")
 	}
 }

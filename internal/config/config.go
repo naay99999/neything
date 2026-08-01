@@ -6,29 +6,23 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/naay99999/neything/internal/embed"
 	"github.com/naay99999/neything/internal/pathfilter"
-	"github.com/naay99999/neything/internal/rerank"
-	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	Embedder    EmbedderConfig    `mapstructure:"embedder"`
-	Retrieval   RetrievalConfig   `mapstructure:"retrieval"`
-	Index       IndexConfig       `mapstructure:"index"`
-	Reranker    RerankerConfig    `mapstructure:"reranker"`
-	Chunking    ChunkingConfig    `mapstructure:"chunking"`
-	VectorStore VectorStoreConfig `mapstructure:"vector_store"`
-	Context     ContextConfig     `mapstructure:"context"`
-	Telemetry   bool              `mapstructure:"telemetry"`
-}
+	Retrieval RetrievalConfig `mapstructure:"retrieval"`
+	Index     IndexConfig     `mapstructure:"index"`
+	Chunking  ChunkingConfig  `mapstructure:"chunking"`
+	Context   ContextConfig   `mapstructure:"context"`
+	Telemetry bool            `mapstructure:"telemetry"`
 
-type EmbedderConfig struct {
-	Provider string `mapstructure:"provider"`
-	Model    string `mapstructure:"model"`
-	Endpoint string `mapstructure:"endpoint"`
+	// CreatedDefault reports whether this Load call created ~/.ney/config.yaml
+	// from the template. It is not a config key: Load itself is silent (it is
+	// reachable from `ney mcp`, whose stdout is the MCP protocol), so the CLI
+	// reads this to print a one-time hint. json:"-" keeps it out of
+	// `ney config show --json`, which marshals Config directly.
+	CreatedDefault bool `mapstructure:"-" json:"-"`
 }
 
 // IndexConfig controls what the indexer (and live scan / read_document)
@@ -40,27 +34,7 @@ type IndexConfig struct {
 }
 
 type RetrievalConfig struct {
-	TopK       int  `mapstructure:"top_k"`
-	Rerank     bool `mapstructure:"rerank"`
-	RerankTopK int  `mapstructure:"rerank_top_k"`
-	// Mode is the canonical retrieval mode: auto | semantic | keyword |
-	// hybrid. Set by Load() via normalizeRetrievalMode, which also accepts
-	// the legacy "hybrid" YAML key (bool or string) for installs that
-	// predate auto mode. New code should read Mode, not Hybrid.
-	Mode string `mapstructure:"mode"`
-	// Hybrid is a legacy compatibility field derived from Mode (true only
-	// when Mode == "hybrid"). It intentionally excludes "hybrid" from
-	// mapstructure decoding (tag "-") because that YAML key can be either a
-	// bool (legacy) or a string in the wild; normalizeRetrievalMode handles
-	// both by reading the raw value directly. Kept only so existing callers
-	// that still branch on it keep compiling — do not set it directly.
-	Hybrid bool `mapstructure:"-"`
-}
-
-type RerankerConfig struct {
-	Provider string `mapstructure:"provider"`
-	Model    string `mapstructure:"model"`
-	Endpoint string `mapstructure:"endpoint"`
+	TopK int `mapstructure:"top_k"`
 }
 
 type ChunkingConfig struct {
@@ -70,17 +44,6 @@ type ChunkingConfig struct {
 	TargetTokens  int               `mapstructure:"target_tokens"`
 	OverlapTokens int               `mapstructure:"overlap_tokens"`
 	ByFormat      map[string]string `mapstructure:"by_format"`
-}
-
-type VectorStoreConfig struct {
-	Backend string     `mapstructure:"backend"`
-	HNSW    HNSWConfig `mapstructure:"hnsw"`
-}
-
-type HNSWConfig struct {
-	M              int `mapstructure:"m"`
-	EfConstruction int `mapstructure:"ef_construction"`
-	EfSearch       int `mapstructure:"ef_search"`
 }
 
 // ContextConfig controls the "layered context" get_context/list_projects
@@ -98,31 +61,20 @@ type ContextConfig struct {
 }
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
-
-# Recommended: 'ney mcp' plugs ney straight into Claude Code/Desktop/Cursor
-# as an MCP server (get_context/list_projects/search_documents/read_document/
-# remember/update_profile/index_status) and works zero-config — keyword
-# search from the moment it starts, semantic search once an embedder is
-# configured. Indexes markdown (.md/.markdown, + Obsidian/Notion) and plain
-# .txt files. See README.md.
 #
-# Tip: run 'ney init' to enable semantic search. Without an embedder, ney
-# still indexes and searches by keyword (FTS).
-
-# embedder: used to create vectors for semantic search (cannot be claude)
-embedder:
-  provider: none            # none | openai | gemini | ollama | lmstudio
-  # model: bge-m3
-  # endpoint: http://localhost:11434   # ollama / lmstudio (LM Studio default: http://localhost:1234)
+# ney is a local-first personal context server for AI clients (MCP).
+# Search is keyword-only (SQLite FTS5) and runs entirely on your machine —
+# no API key, no model server, no embeddings. 'ney mcp' gives Claude
+# Code/Desktop/Cursor/Codex get_context, list_projects, search_documents,
+# search_folder, read_document, remember, update_profile, index_folder and
+# index_status. Indexes markdown (.md/.markdown, + Obsidian/Notion) and
+# plain .txt files.
+#
+# Run 'ney init' for guided setup. See README.md.
 
 # retrieval settings
 retrieval:
   top_k: 8
-  rerank: false
-  rerank_top_k: 24
-  mode: auto                # auto | semantic | keyword | hybrid
-  # legacy installs may still have "hybrid: true/false" instead of "mode" —
-  # true maps to hybrid, false maps to auto; an explicit "mode" always wins
 
 # indexing — extra exclude patterns (globs matched case-insensitively
 # against file and directory names). These add to the built-in always-on
@@ -132,31 +84,17 @@ index:
   exclude: []
   # exclude: ["*.bak", "drafts-*", "node_modules"]
 
-# reranker: used when retrieval.rerank is true
-reranker:
-  provider: cohere          # cohere | jina | ollama
-  model: rerank-v3.5
-  # endpoint: http://localhost:11434   # ollama/local only
-
 # chunking settings
 chunking:
   strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
   target_chars: 1200
   overlap_chars: 150
-  target_tokens: 300          # tokenizer strategy only (~4 chars/token)
+  target_tokens: 300        # tokenizer strategy only (~4 chars/token)
   overlap_tokens: 50
   # by_format used when strategy: auto
   # by_format:
   #   md: markdown
   #   txt: paragraph
-
-# vector store backend
-vector_store:
-  backend: brute          # brute | hnsw
-  hnsw:
-    m: 16
-    ef_construction: 200
-    ef_search: 50
 
 # layered context (get_context / list_projects): where to look for git repos,
 # and how recent a project's last commit must be to count as "active"
@@ -168,9 +106,6 @@ context:
 
 # privacy — off by default
 telemetry: false
-
-# API keys — set via env vars (recommended) or here:
-# OPENAI_API_KEY, GEMINI_API_KEY
 `
 
 func NeyDir() string {
@@ -178,24 +113,37 @@ func NeyDir() string {
 	return filepath.Join(home, ".ney")
 }
 
-func DBPath() string      { return filepath.Join(NeyDir(), "index.db") }
-func VectorsPath() string { return filepath.Join(NeyDir(), "vectors.bin") }
-func HNSWPath() string    { return filepath.Join(NeyDir(), "vectors.hnsw") }
-func ConfigPath() string  { return filepath.Join(NeyDir(), "config.yaml") }
+func DBPath() string     { return filepath.Join(NeyDir(), "index.db") }
+func ConfigPath() string { return filepath.Join(NeyDir(), "config.yaml") }
 
-const metaVectorStoreBackend = "vector_store_backend"
+// ensureConfigFile creates ~/.ney (0700) and ~/.ney/config.yaml (0600) from
+// the embedded template when the config file does not exist yet. It reports
+// whether it created the file. Shared by Load and SetDevRoots so there is one
+// definition of "a config file exists".
+func ensureConfigFile() (created bool, err error) {
+	cfgPath := ConfigPath()
+	if _, statErr := os.Stat(cfgPath); !os.IsNotExist(statErr) {
+		return false, nil
+	}
+	if err := os.MkdirAll(NeyDir(), 0700); err != nil {
+		return false, fmt.Errorf("create ~/.ney: %w", err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(defaultConfig), 0600); err != nil {
+		return false, fmt.Errorf("write default config: %w", err)
+	}
+	return true, nil
+}
 
+// Load reads ~/.ney/config.yaml, creating it from the template on first run.
+//
+// Load never writes to stdout or stderr: it is reachable from `ney mcp`,
+// whose stdout is reserved for the MCP protocol. First-run hints belong in
+// cmd/ney's loadConfig, gated on Config.CreatedDefault and a TTY.
 func Load() (*Config, error) {
 	cfgPath := ConfigPath()
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		if err := os.MkdirAll(NeyDir(), 0700); err != nil {
-			return nil, fmt.Errorf("create ~/.ney: %w", err)
-		}
-		if err := os.WriteFile(cfgPath, []byte(defaultConfig), 0600); err != nil {
-			return nil, fmt.Errorf("write default config: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Created default config at %s\n", cfgPath)
-		fmt.Fprintf(os.Stderr, "Run `ney init` for interactive setup, or edit the file to configure providers.\n\n")
+	createdDefault, err := ensureConfigFile()
+	if err != nil {
+		return nil, err
 	}
 
 	v := viper.New()
@@ -229,18 +177,6 @@ func Load() (*Config, error) {
 	if cfg.Chunking.OverlapTokens == 0 {
 		cfg.Chunking.OverlapTokens = 50
 	}
-	if cfg.VectorStore.Backend == "" {
-		cfg.VectorStore.Backend = "brute"
-	}
-	if cfg.VectorStore.HNSW.M == 0 {
-		cfg.VectorStore.HNSW.M = 16
-	}
-	if cfg.VectorStore.HNSW.EfConstruction == 0 {
-		cfg.VectorStore.HNSW.EfConstruction = 200
-	}
-	if cfg.VectorStore.HNSW.EfSearch == 0 {
-		cfg.VectorStore.HNSW.EfSearch = 50
-	}
 	if cfg.Context.ActiveDays == 0 {
 		cfg.Context.ActiveDays = 14
 	}
@@ -252,62 +188,18 @@ func Load() (*Config, error) {
 		}
 	}
 
-	cfg.Retrieval.Mode = normalizeRetrievalMode(v)
-	// Legacy compat: some callers still branch on the old bool field.
-	cfg.Retrieval.Hybrid = cfg.Retrieval.Mode == "hybrid"
-
 	if err := Validate(&cfg); err != nil {
 		return nil, err
 	}
+	cfg.CreatedDefault = createdDefault
 	return &cfg, nil
 }
 
-// normalizeRetrievalMode resolves retrieval.mode from either the canonical
-// "mode" string key or the legacy "hybrid" key. Installs from before auto
-// mode existed have "hybrid: false" (the old default) or "hybrid: true"
-// written to their config.yaml — those still need to load. An explicit
-// "mode" always wins over "hybrid". Defaults to "auto" when neither is set.
-func normalizeRetrievalMode(v *viper.Viper) string {
-	if v.IsSet("retrieval.mode") {
-		if m := strings.ToLower(strings.TrimSpace(v.GetString("retrieval.mode"))); m != "" {
-			return m
-		}
-	}
-	if v.IsSet("retrieval.hybrid") {
-		switch val := v.Get("retrieval.hybrid").(type) {
-		case bool:
-			if val {
-				return "hybrid"
-			}
-			return "auto"
-		case string:
-			switch s := strings.ToLower(strings.TrimSpace(val)); s {
-			case "true":
-				return "hybrid"
-			case "false", "":
-				return "auto"
-			default:
-				// Someone wrote a mode name under the legacy key — accept it.
-				return s
-			}
-		}
-	}
-	return "auto"
-}
-
+// Validate checks the settings that have real consequences if wrong. The
+// index.exclude check matters most: a malformed glob makes the caller's
+// pathfilter fall back to built-ins only, which would silently stop honouring
+// the user's exclude patterns.
 func Validate(cfg *Config) error {
-	if cfg.Embedder.Provider == "claude" {
-		return fmt.Errorf("Claude does not provide an embedding API.\nSet embedder.provider to: openai, gemini, ollama, or lmstudio")
-	}
-	if cfg.Embedder.Provider != "" && cfg.Embedder.Provider != "none" {
-		validEmbed := map[string]bool{"openai": true, "gemini": true, "ollama": true, "lmstudio": true}
-		if !validEmbed[cfg.Embedder.Provider] {
-			return fmt.Errorf("unknown embedder provider %q (valid: none, openai, gemini, ollama, lmstudio)", cfg.Embedder.Provider)
-		}
-		if cfg.Embedder.Model == "" {
-			return fmt.Errorf("embedder.model is required")
-		}
-	}
 	if _, err := pathfilter.New(cfg.Index.Exclude); err != nil {
 		return fmt.Errorf("index.exclude: %w", err)
 	}
@@ -327,18 +219,19 @@ func Validate(cfg *Config) error {
 			}
 		}
 	}
-	if cfg.Retrieval.Rerank {
-		validRerank := map[string]bool{"cohere": true, "jina": true, "ollama": true}
-		if !validRerank[cfg.Reranker.Provider] {
-			return fmt.Errorf("unknown reranker provider %q (valid: cohere, jina, ollama)", cfg.Reranker.Provider)
-		}
-		if cfg.Reranker.Model == "" {
-			return fmt.Errorf("reranker.model is required when retrieval.rerank is true")
-		}
+	// An overlap at or above the target leaves no forward progress between
+	// windows: every chunk would start where the previous one did, and the
+	// chunker's "never go backwards" guard degrades to one character per
+	// chunk. Rejecting it here turns a config that silently produces a
+	// useless, enormous index into a startup error. As above, 0 means "unset"
+	// for structs built directly in tests — Load() fills both in first.
+	if cfg.Chunking.TargetChars > 0 && cfg.Chunking.OverlapChars >= cfg.Chunking.TargetChars {
+		return fmt.Errorf("chunking.overlap_chars (%d) must be less than chunking.target_chars (%d)",
+			cfg.Chunking.OverlapChars, cfg.Chunking.TargetChars)
 	}
-	validVectorStore := map[string]bool{"brute": true, "hnsw": true}
-	if !validVectorStore[cfg.VectorStore.Backend] {
-		return fmt.Errorf("unknown vector_store.backend %q (valid: brute, hnsw)", cfg.VectorStore.Backend)
+	if cfg.Chunking.TargetTokens > 0 && cfg.Chunking.OverlapTokens >= cfg.Chunking.TargetTokens {
+		return fmt.Errorf("chunking.overlap_tokens (%d) must be less than chunking.target_tokens (%d)",
+			cfg.Chunking.OverlapTokens, cfg.Chunking.TargetTokens)
 	}
 	// 0 is accepted here (treated as "unset" by structs built directly in
 	// tests without setting Context.ActiveDays); Load() always normalizes it
@@ -346,150 +239,7 @@ func Validate(cfg *Config) error {
 	if cfg.Context.ActiveDays < 0 {
 		return fmt.Errorf("context.active_days must be greater than 0, got %d", cfg.Context.ActiveDays)
 	}
-	// "" is accepted here (treated as "auto" by callers) so structs built
-	// directly in tests without setting Retrieval.Mode don't need to know
-	// about this field. Load() always normalizes it to a concrete value.
-	validMode := map[string]bool{"": true, "auto": true, "semantic": true, "keyword": true, "hybrid": true}
-	if !validMode[cfg.Retrieval.Mode] {
-		return fmt.Errorf("unknown retrieval mode %q (valid: auto, semantic, keyword, hybrid)", cfg.Retrieval.Mode)
-	}
 	return nil
-}
-
-// HasEmbedder reports whether an embedder provider is configured. When
-// false, ney runs in keyword-only (FTS) mode — no semantic search.
-func (c *Config) HasEmbedder() bool {
-	return c.Embedder.Provider != "" && c.Embedder.Provider != "none"
-}
-
-func apiKey(envVar string) string {
-	return os.Getenv(envVar)
-}
-
-// NewEmbedder builds the configured embedder. It returns (nil, nil) when no
-// embedder is configured — that is a normal, supported state, not an error.
-// A provider that IS configured but fails to build (e.g. missing API key)
-// still returns an error.
-func NewEmbedder(cfg *Config) (embed.Embedder, error) {
-	switch cfg.Embedder.Provider {
-	case "", "none":
-		return nil, nil
-	case "openai":
-		key := apiKey("OPENAI_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("OPENAI_API_KEY not set")
-		}
-		return embed.NewOpenAIEmbedder(key, cfg.Embedder.Model), nil
-	case "gemini":
-		key := apiKey("GEMINI_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("GEMINI_API_KEY not set")
-		}
-		return embed.NewGeminiEmbedder(key, cfg.Embedder.Model), nil
-	case "ollama":
-		return embed.NewOllamaEmbedder(cfg.Embedder.Endpoint, cfg.Embedder.Model)
-	case "lmstudio":
-		endpoint := cfg.Embedder.Endpoint
-		if endpoint == "" {
-			endpoint = "http://localhost:1234"
-		}
-		return embed.NewOpenAICompatibleEmbedder(endpoint, cfg.Embedder.Model), nil
-	default:
-		return nil, fmt.Errorf("unknown embedder provider: %s", cfg.Embedder.Provider)
-	}
-}
-
-func NewReranker(cfg *Config) (rerank.Reranker, error) {
-	if !cfg.Retrieval.Rerank {
-		return nil, nil
-	}
-	switch cfg.Reranker.Provider {
-	case "cohere":
-		key := apiKey("COHERE_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("COHERE_API_KEY not set")
-		}
-		return rerank.NewCohereReranker(key, cfg.Reranker.Model), nil
-	case "jina":
-		key := apiKey("JINA_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("JINA_API_KEY not set")
-		}
-		return rerank.NewJinaReranker(key, cfg.Reranker.Model), nil
-	case "ollama":
-		return rerank.NewOllamaReranker(cfg.Reranker.Endpoint, cfg.Reranker.Model), nil
-	default:
-		return nil, fmt.Errorf("unknown reranker provider: %s", cfg.Reranker.Provider)
-	}
-}
-
-func FetchK(cfg *Config, topK int) int {
-	if topK <= 0 {
-		topK = cfg.Retrieval.TopK
-	}
-	fetchK := topK * 3
-	if cfg.Retrieval.RerankTopK > fetchK {
-		fetchK = cfg.Retrieval.RerankTopK
-	}
-	if fetchK < 10 {
-		fetchK = 10
-	}
-	return fetchK
-}
-
-func NewVectorStore(cfg *Config, db *store.DB, migrate bool) (vectorstore.VectorStore, error) {
-	backend := cfg.VectorStore.Backend
-	stored, err := db.GetMeta(metaVectorStoreBackend)
-	if err != nil {
-		return nil, err
-	}
-	if stored != "" && stored != backend {
-		return nil, fmt.Errorf(
-			"vector store backend mismatch: index uses %q, config says %q\nRun: ney reset && ney index <path>",
-			stored, backend,
-		)
-	}
-
-	opts := vectorstore.HNSWOptions{
-		M:              cfg.VectorStore.HNSW.M,
-		EfConstruction: cfg.VectorStore.HNSW.EfConstruction,
-		EfSearch:       cfg.VectorStore.HNSW.EfSearch,
-	}
-
-	switch backend {
-	case "brute":
-		vs, err := vectorstore.NewBruteForceStore(VectorsPath())
-		if err != nil {
-			return nil, err
-		}
-		if stored == "" {
-			_ = db.SetMeta(metaVectorStoreBackend, "brute")
-		}
-		return vs, nil
-	case "hnsw":
-		hnswPath := HNSWPath()
-		brutePath := VectorsPath()
-		if migrate || (fileExists(brutePath) && !fileExists(hnswPath)) {
-			if err := vectorstore.ImportBruteForceToHNSW(brutePath, hnswPath, opts); err != nil {
-				return nil, fmt.Errorf("migrate vectors to hnsw: %w", err)
-			}
-		}
-		vs, err := vectorstore.NewHNSWStore(hnswPath, opts)
-		if err != nil {
-			return nil, err
-		}
-		if stored == "" {
-			_ = db.SetMeta(metaVectorStoreBackend, "hnsw")
-		}
-		return vs, nil
-	default:
-		return nil, fmt.Errorf("unknown vector store backend: %s", backend)
-	}
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 // defaultDevRoots returns ["~/workspace"] (expanded) if that directory

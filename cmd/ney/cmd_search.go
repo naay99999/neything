@@ -16,7 +16,7 @@ import (
 
 var searchCmd = &cobra.Command{
 	Use:   "search \"<query>\"",
-	Short: "Search indexed files (semantic + keyword, auto by default)",
+	Short: "Search indexed files (keyword / FTS5)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runSearch,
 }
@@ -28,13 +28,11 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	applyProviderOverride(cfg)
 	app, err := initAppFromConfig(cfg)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
-	defer app.Vectors.Close()
 
 	if err := requireWorkspace(app.DB, flagWorkspace); err != nil {
 		return err
@@ -72,7 +70,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	printDegradationNote(meta)
+	printSearchNote(meta)
 
 	if len(groups) == 0 {
 		fmt.Println("No results found.")
@@ -125,7 +123,7 @@ func mixedWorkspaces(results []search.EnrichedResult) bool {
 // serverState), a one-shot `ney search` process has no such state to
 // consult, so it falls back to liveScanRoot's path/document-count check.
 // Best-effort and non-fatal: scan errors are swallowed since keyword/
-// semantic search already ran and this is purely additive. Included in
+// the indexed search already ran and this is purely additive. Included in
 // --json output too (tagged source: "live-scan"), not just interactive text.
 func appendLiveScan(ctx context.Context, db *store.DB, groups []search.FileGroup, query string, flt *pathfilter.Filter) []search.FileGroup {
 	root := liveScanRoot(db, flagPath)

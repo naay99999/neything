@@ -1,6 +1,6 @@
 // Package scan implements tier-0 "live scan" search (design §6): a
 // stateless, index-free filesystem search used when a folder hasn't been
-// (fully) indexed yet. It never touches SQLite or a VectorStore — just
+// (fully) indexed yet. It never touches SQLite — just
 // filename token matching plus a bounded content grep for small plain-text
 // files — so it works the instant `ney mcp` starts, before Phase A finishes.
 package scan
@@ -132,6 +132,12 @@ func Scan(ctx context.Context, root, query string, opts Options) (hits []Hit, tr
 			if path != root && opts.Exclude.ExcludedDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Type before name: grepFile opens what a symlink points at, not the
+		// link, so an innocuously-named link would leak its target's contents
+		// through the snippet. See pathfilter.ExcludedMode.
+		if pathfilter.ExcludedMode(d.Type()) {
 			return nil
 		}
 		if opts.Exclude.ExcludedFile(d.Name()) {

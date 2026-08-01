@@ -54,14 +54,14 @@ type mcpRoot struct {
 }
 
 // runMCP wires one long-lived server process: acquire the writer lock, open
-// the DB/Vectors/Embedder once for the process's lifetime, register the 9
+// the DB once for the process's lifetime, register the 9
 // MCP tools, and start serving over stdio immediately — Phase A indexing,
 // background embedding, and filesystem watching all happen in goroutines
 // alongside it, never blocking the first tool call.
 //
 // STDOUT HYGIENE: stdout is reserved for the MCP protocol end to end. This
-// function and everything it calls (loadConfig, initAppWithOptions,
-// newIndexer, the watcher, the embed worker) only ever write diagnostics to
+// function and everything it calls (loadConfig, initApp,
+// newIndexer, the watcher) only ever write diagnostics to
 // os.Stderr — never fmt.Println/PrintJSON/the spinner helpers, all of which
 // write to os.Stdout.
 func runMCP(cmd *cobra.Command, args []string) error {
@@ -76,12 +76,11 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 	defer lock.Release() // nil-safe in read-only mode
 
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		return err
 	}
 	defer app.DB.Close()
-	defer app.Vectors.Close()
 
 	roots, err := resolveMCPRoots(app.DB, flagMCPRoots, readOnly)
 	if err != nil {
@@ -124,11 +123,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	state := newServerState(rootNames(roots), readOnly)
 	rs := newRootSet(roots)
 
-	var worker *index.EmbedWorker
-	if app.Embedder != nil && !readOnly {
-		worker = &index.EmbedWorker{DB: app.DB, Vectors: app.Vectors, Embedder: app.Embedder}
-	}
-
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -164,9 +158,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			DisablePrune: disablePrune,
 			Serialize:    serialize,
 		}
-		if worker != nil {
-			w.OnFlush = worker.Notify
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -181,7 +172,6 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		cfg:          cfg,
 		state:        state,
 		rs:           rs,
-		worker:       worker,
 		flt:          newPathFilter(cfg),
 		ix:           ix,
 		serialize:    serialize,
@@ -236,23 +226,10 @@ func runMCP(cmd *cobra.Command, args []string) error {
 				if ierr != nil && ctx.Err() == nil {
 					fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", r.Name, ierr)
 				}
-				if worker != nil {
-					worker.Notify()
-				}
 			}
 		}()
 
-		// (b) EmbedWorker.RunLoop — global scope (every workspace), notified
-		// after each Phase A root completes and after every watcher flush.
-		if worker != nil {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_ = worker.RunLoop(ctx)
-			}()
-		}
-
-		// (c) one watcher per root.
+		// (b) one watcher per root.
 		for i, r := range roots {
 			wsID, werr := app.DB.UpsertWorkspace(r.Name, r.Path)
 			if werr != nil {
@@ -274,14 +251,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	runErr := server.Run(ctx, &mcp.StdioTransport{})
 
-	// Shutdown: stop background goroutines, then flush + release the lock.
+	// Shutdown: stop background goroutines, then release the lock (deferred).
 	stop()
 	wg.Wait()
-	if !readOnly {
-		if ferr := app.Vectors.Flush(); ferr != nil {
-			fmt.Fprintf(os.Stderr, "warning: flush vectors: %v\n", ferr)
-		}
-	}
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		return runErr
@@ -453,6 +425,49 @@ type serverState struct {
 	// long-running `ney mcp` process (days/weeks of uptime) would grow this
 	// map without bound as search_folder gets called over and over.
 	discoveredOrder []string
+	// readCache holds the most recently read file, so read_document's
+	// offset_chars/max_chars pagination doesn't re-read the whole document
+	// per window. Exactly one entry: pagination walks a single file, so a
+	// second slot buys nothing and each one can hold up to maxReadFileSize.
+	readCache readCacheEntry
+}
+
+// readCacheEntry is the single-file memo behind read_document. info is the
+// stat of the descriptor the content was actually read from — a hit requires
+// os.SameFile against the caller's freshly-validated stat, so the cache can
+// never serve content for a path that has since been re-pointed at a
+// different file.
+type readCacheEntry struct {
+	path    string
+	info    os.FileInfo
+	content string
+}
+
+// cachedFile returns the memoized content for resolved when it is still the
+// same file the caller just validated.
+func (s *serverState) cachedFile(resolved string, validated os.FileInfo) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.readCache
+	if e.info == nil || e.path != resolved {
+		return "", false
+	}
+	// Identity first (same inode), then freshness: a file rewritten in place
+	// keeps its identity but must not be served stale.
+	if !os.SameFile(e.info, validated) {
+		return "", false
+	}
+	if e.info.Size() != validated.Size() || !e.info.ModTime().Equal(validated.ModTime()) {
+		return "", false
+	}
+	return e.content, true
+}
+
+// putCachedFile replaces the memo, dropping whatever file was there before.
+func (s *serverState) putCachedFile(resolved string, info os.FileInfo, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readCache = readCacheEntry{path: resolved, info: info, content: content}
 }
 
 // discoveredCap bounds serverState.discovered so a long-running server's

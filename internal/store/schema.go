@@ -32,15 +32,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 	end_pos     INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS providers (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	role       TEXT NOT NULL,
-	name       TEXT NOT NULL,
-	model      TEXT NOT NULL,
-	dimensions INTEGER NOT NULL DEFAULT 0,
-	version    TEXT NOT NULL DEFAULT '',
-	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 
 CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(workspace_id, hash);

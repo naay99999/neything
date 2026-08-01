@@ -3,12 +3,10 @@ package search
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"path/filepath"
+	"strings"
 
-	"github.com/naay99999/neything/internal/embed"
-	"github.com/naay99999/neything/internal/rerank"
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
 
 type EnrichedResult struct {
@@ -22,38 +20,22 @@ type EnrichedResult struct {
 	Workspace string
 }
 
-// Retrieval modes accepted by RetrieveOptions.Mode. An empty Mode is
-// treated as ModeAuto.
-const (
-	ModeAuto     = "auto"
-	ModeSemantic = "semantic"
-	ModeKeyword  = "keyword"
-	ModeHybrid   = "hybrid"
-)
-
 type RetrieveOptions struct {
-	TopK       int
+	TopK int
+	// FetchK is the overfetch budget before workspace/path filtering.
+	// 0 means max(TopK*3, 10).
 	FetchK     int
 	Workspace  string
 	PathPrefix string
-	// Mode selects which signal(s) to use: auto (default, both when
-	// available, degrades gracefully), semantic (error if unavailable),
-	// keyword (FTS only), hybrid (force both, error if semantic
-	// unavailable). Empty behaves like auto.
-	Mode   string
-	Rerank bool
 }
 
-// SearchMeta reports what actually happened during a Search call, since
-// auto mode can silently fall back to a subset of signals instead of
-// failing outright.
+// SearchMeta reports what actually happened during a Search call. Search is
+// keyword-only (SQLite FTS5), so the only interesting case is a degraded one.
 type SearchMeta struct {
-	SemanticUsed  bool    `json:"semantic_used"`
-	KeywordUsed   bool    `json:"keyword_used"`
-	EmbedCoverage float64 `json:"embed_coverage"`
-	// Degraded is a human-readable note when a requested signal couldn't be
-	// used (e.g. embedder down, no vectors yet). Empty when nothing was
-	// degraded.
+	KeywordUsed bool `json:"keyword_used"`
+	// Degraded is set when the FTS query itself failed. Search still returns
+	// (empty results, nil error) in that case, so an MCP caller's live-scan
+	// supplement can still answer.
 	Degraded string `json:"degraded,omitempty"`
 }
 
@@ -70,14 +52,10 @@ type chunkStore interface {
 	SearchFTS(query string, limit int) ([]store.FTSResult, error)
 	GetChunksByIDs(ids []int64) ([]*store.Chunk, error)
 	GetDocumentsByChunkIDs(chunkIDs []int64) (map[int64]*store.DocWithWorkspace, error)
-	CountChunks() (int, error)
 }
 
 type Retriever struct {
-	DB       chunkStore
-	Vectors  vectorstore.VectorStore
-	Embedder embed.Embedder
-	Reranker rerank.Reranker
+	DB chunkStore
 }
 
 func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptions) ([]EnrichedResult, SearchMeta, error) {
@@ -98,115 +76,34 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 		fetchK *= 4
 	}
 
-	mode := opts.Mode
-	if mode == "" {
-		mode = ModeAuto
-	}
+	var meta SearchMeta
 
-	meta := SearchMeta{EmbedCoverage: r.embedCoverage()}
-
-	wantKeyword := mode == ModeAuto || mode == ModeKeyword || mode == ModeHybrid
-	wantSemantic := mode == ModeAuto || mode == ModeSemantic || mode == ModeHybrid
-
-	// keywordSearch/semanticSearch return raw (chunk ID, per-leg score)
-	// pairs only — content and document metadata are NOT fetched here.
-	// Hydration is deferred until after fusion (see hydrate below) so a
-	// chunk ID that both legs agree on, or one that gets truncated away by
-	// fetchK, is never pulled from SQLite more than once.
-	var keyword []EnrichedResult
-	if wantKeyword {
-		kw, err := r.keywordSearch(ctx, query, fetchK)
-		if err != nil {
-			// FTS errors never fail the request — record and move on.
-			meta.Degraded = appendDegraded(meta.Degraded, fmt.Sprintf("keyword search failed: %v", err))
-		} else if len(kw) > 0 {
-			keyword = kw
-			meta.KeywordUsed = true
-		}
-	}
-
-	var semantic []EnrichedResult
-	if wantSemantic {
-		if reason := r.semanticUnavailableReason(); reason != "" {
-			if mode == ModeSemantic || mode == ModeHybrid {
-				return nil, meta, fmt.Errorf("semantic search unavailable: %s", reason)
-			}
-			meta.Degraded = appendDegraded(meta.Degraded, reason)
-		} else {
-			sem, err := r.semanticSearch(ctx, query, fetchK)
-			if err != nil {
-				if mode == ModeSemantic || mode == ModeHybrid {
-					return nil, meta, fmt.Errorf("semantic search failed: %w", err)
-				}
-				meta.Degraded = appendDegraded(meta.Degraded, fmt.Sprintf("semantic search failed, degraded to keyword-only: %v", err))
-			} else if len(sem) > 0 {
-				semantic = sem
-				meta.SemanticUsed = true
-			}
-		}
-	}
-
+	// keywordSearch returns raw (chunk ID, score) pairs only — content and
+	// document metadata are NOT fetched here. Hydration is deferred (see
+	// below) so a chunk ID truncated away by fetchK is never pulled from
+	// SQLite at all.
 	var fused []EnrichedResult
-	switch {
-	case meta.SemanticUsed && meta.KeywordUsed:
-		fused = ReciprocalRankFusion(semantic, keyword, defaultRRFK)
-	case meta.SemanticUsed:
-		fused = semantic
-	case meta.KeywordUsed:
-		fused = keyword
+	kw, err := r.keywordSearch(ctx, query, fetchK)
+	if err != nil {
+		// FTS errors never fail the request — record and move on.
+		meta.Degraded = fmt.Sprintf("keyword search failed: %v", err)
+	} else if len(kw) > 0 {
+		fused = kw
+		meta.KeywordUsed = true
 	}
 
-	// Truncate to the candidate budget before hydrating: fetchK already
-	// covers what a downstream rerank pass needs (callers size it via
-	// config.FetchK, which factors in RerankTopK) and is inflated above
-	// when workspace/path filters are active, to absorb filter attrition.
+	// Truncate to the candidate budget before hydrating: fetchK is inflated
+	// above when workspace/path filters are active, to absorb filter
+	// attrition.
 	if len(fused) > fetchK {
 		fused = fused[:fetchK]
 	}
 
 	// Hydrate content + document metadata ONCE for the deduped, ranked ID
-	// set — two SQLite round-trips total for the whole search, regardless
-	// of how many legs ran or how much their candidate sets overlapped.
+	// set — two SQLite round-trips total for the whole search.
 	results, err := r.hydrate(fused, opts.Workspace, opts.PathPrefix)
 	if err != nil {
 		return nil, meta, fmt.Errorf("hydrate results: %w", err)
-	}
-
-	if opts.Rerank && r.Reranker != nil && len(results) > 0 {
-		// results is already bounded by fetchK (which itself accounts for
-		// RerankTopK via config.FetchK), so no further candidate cap is
-		// needed here — content truncation for the wire payload happens
-		// inside the reranker implementations (internal/rerank).
-		byID := make(map[int64]EnrichedResult, len(results))
-		for _, res := range results {
-			byID[res.ChunkID] = res
-		}
-
-		candidates := make([]rerank.Candidate, len(results))
-		for i, res := range results {
-			candidates[i] = rerank.Candidate{
-				ChunkID: res.ChunkID,
-				Content: res.Content,
-				Score:   res.Score,
-			}
-		}
-		ranked, err := r.Reranker.Rerank(ctx, query, candidates)
-		if err != nil {
-			return nil, meta, fmt.Errorf("rerank: %w", err)
-		}
-		results = make([]EnrichedResult, len(ranked))
-		for i, c := range ranked {
-			if orig, ok := byID[c.ChunkID]; ok {
-				orig.Score = c.Score
-				results[i] = orig
-			} else {
-				results[i] = EnrichedResult{
-					ChunkID: c.ChunkID,
-					Content: c.Content,
-					Score:   c.Score,
-				}
-			}
-		}
 	}
 
 	if len(results) > topK {
@@ -215,78 +112,6 @@ func (r *Retriever) Search(ctx context.Context, query string, opts RetrieveOptio
 	return results, meta, nil
 }
 
-// semanticUnavailableReason reports why semantic search can't run right
-// now, or "" if it can. It never issues a query while the DB is mid-read
-// (Count() below only touches the in-memory vector store).
-func (r *Retriever) semanticUnavailableReason() string {
-	if r.Embedder == nil {
-		return "no embedder configured"
-	}
-	if r.Vectors == nil || r.Vectors.Count() == 0 {
-		return "no vectors indexed yet"
-	}
-	return ""
-}
-
-// embedCoverage returns Vectors.Count() / total chunk count, or 0 when
-// either isn't available. Best-effort: DB errors are swallowed since
-// coverage is informational, not load-bearing for the search itself.
-func (r *Retriever) embedCoverage() float64 {
-	if r.Vectors == nil || r.DB == nil {
-		return 0
-	}
-	vecCount := r.Vectors.Count()
-	if vecCount == 0 {
-		return 0
-	}
-	chunkCount, err := r.DB.CountChunks()
-	if err != nil || chunkCount == 0 {
-		return 0
-	}
-	coverage := float64(vecCount) / float64(chunkCount)
-	if coverage > 1 {
-		coverage = 1
-	}
-	return coverage
-}
-
-func appendDegraded(existing, msg string) string {
-	if existing == "" {
-		return msg
-	}
-	return existing + "; " + msg
-}
-
-// semanticSearch runs the vector-store leg and returns raw (chunk ID,
-// score) pairs — no content or document metadata is fetched here (see
-// hydrate).
-func (r *Retriever) semanticSearch(ctx context.Context, query string, fetchK int) ([]EnrichedResult, error) {
-	vecs, err := r.Embedder.Embed(ctx, []string{query})
-	if err != nil {
-		return nil, fmt.Errorf("embed query: %w", err)
-	}
-	if len(vecs) == 0 {
-		return nil, fmt.Errorf("no embedding returned")
-	}
-
-	rawResults, err := r.Vectors.Search(ctx, vecs[0], fetchK)
-	if err != nil {
-		return nil, fmt.Errorf("vector search: %w", err)
-	}
-
-	out := make([]EnrichedResult, 0, len(rawResults))
-	for _, res := range rawResults {
-		id, err := strconv.ParseInt(res.ID, 10, 64)
-		if err != nil {
-			continue
-		}
-		out = append(out, EnrichedResult{ChunkID: id, Score: res.Score})
-	}
-	return out, nil
-}
-
-// keywordSearch runs the FTS leg and returns raw (chunk ID, score) pairs —
-// no content or document metadata is fetched here (see hydrate).
 func (r *Retriever) keywordSearch(_ context.Context, query string, fetchK int) ([]EnrichedResult, error) {
 	ftsResults, err := r.DB.SearchFTS(query, fetchK)
 	if err != nil {
@@ -364,6 +189,22 @@ func (r *Retriever) hydrate(scored []EnrichedResult, workspaceName, pathPrefix s
 	return results, nil
 }
 
+// hasPathPrefix reports whether path lies at or under prefix, respecting path
+// component boundaries — so scoping a search to /home/u/proj does not also
+// return /home/u/project-private. A prefix that already ends in a separator
+// is a plain prefix test, since it cannot straddle a component.
 func hasPathPrefix(path, prefix string) bool {
-	return len(path) >= len(prefix) && path[:len(prefix)] == prefix
+	if prefix == "" {
+		return true
+	}
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	if len(path) == len(prefix) {
+		return true
+	}
+	if strings.HasSuffix(prefix, string(filepath.Separator)) {
+		return true
+	}
+	return path[len(prefix)] == filepath.Separator
 }

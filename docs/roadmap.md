@@ -7,7 +7,110 @@
 |---|---|
 | Current version | 0.1 (MVP) |
 | Status | Active |
-| Last updated | 2026-07-31 |
+| Last updated | 2026-08-01 |
+
+---
+
+## 2026-08-01 — Audit fixes: chunker defect, two content leaks, per-call costs
+
+A performance + security audit of the keyword-only tree turned up twelve issues. Every one was
+reproduced before being fixed, and each fix carries the reproduction as a regression test.
+
+**The chunker was producing ~95% garbage.** `CharacterChunker` pinned `end` to the end of the
+document once `idx` passed `total - TargetChars`, so `next := end - OverlapChars` stopped
+advancing and the anti-regression guard walked the tail one rune at a time — emitting roughly
+`OverlapChars` extra chunks per document, each a shrinking suffix of the last real one. It hit
+`character`, `tokenizer` and `markdown`, the default. On a 5,000-file / 39 MB corpus:
+
+| | before | after |
+|---|---|---|
+| chunks | 785,000 | 35,000 |
+| index.db | 262 MB | 101 MB |
+| index time | 8.8 s | 5.6 s |
+| search | 0.53 s | 0.15 s |
+
+Beyond the bloat, every document's tail was indexed ~150 times, inflating bm25 term frequencies
+and flooding result lists with near-identical chunks of the same file. The chunker now stops at
+EOF, and walks byte offsets instead of materializing `[]rune` plus a byte-offset table (~240 MB
+of scratch for a 20 MB file, the `maxIndexFileSize` ceiling).
+
+**Existing indexes rebuild themselves.** Chunk boundaries changed but file contents did not, so
+the hash-based skip would have kept the stale chunks forever with no signal. `chunker_version`
+in `index_meta` (currently `"2"`) blanks `documents.hash` when it doesn't match, and the next
+indexing pass re-chunks everything, replacing each document's rows atomically — search keeps
+working on the old data meanwhile. When the last document is done, `FinishChunkerRebuildIfDone`
+runs an FTS5 `optimize` plus `VACUUM` so the file actually shrinks; without both, a rebuilt
+262 MB index only came back down to 150 MB. **Bump `chunkerVersion` whenever a change to
+`internal/chunk` makes stored chunks wrong or wasteful.**
+
+**Two confirmed content leaks, same root cause.** `index.walkIndexable` and `scan.Scan` applied
+the deny rules to an entry's *name* and then `os.ReadFile`/`os.Open`'d it — following symlinks.
+`DirEntry.Info` reports the link's own size, so the 2 MB content-grep cap didn't help either. A
+symlink called `readme.md` pointing at `id_rsa` got the key indexed into FTS and returned as a
+`search_documents`/`search_folder` snippet. (`read_document` was never affected — it resolves
+symlinks and re-checks — but by then the content had already gone out through the snippet.)
+Both walks, plus `IndexPath` for the watcher, now deny by file *type* via
+`pathfilter.ExcludedMode`: only regular files are ever opened. That also fixes a hang — a FIFO
+named `notes.md` passes the extension check, and `os.ReadFile` on one blocks until a writer
+appears, wedging an indexing pass indefinitely.
+
+**Also fixed:** `update_profile` sanitizes its section name (a newline forged extra `## `
+sections into `profile.md`, which `get_context` re-serves every session); `ScanRepos` hardens
+every `git` invocation with `core.fsmonitor=` / `core.hooksPath=/dev/null` /
+`protocol.ext.allow=never` (a repo controls its own config, and `git status` runs
+`core.fsmonitor`) and sets `GIT_OPTIONAL_LOCKS=0` so it stops rewriting `.git/index` behind the
+user; repo description runs 8-wide instead of 3 sequential git forks per repo; `excludedForClient`
+takes a caller-resolved `$HOME` instead of walking every component of it per search result;
+`read_document` memoizes the last file so pagination doesn't re-read it per window (400 reads of
+a 20 MB file ≈ 8 GB of I/O); `search_documents` truncates to `top_k` *after* the live-scan
+supplement; the watcher's `Stats` and overlapping shutdown flush are properly synchronized;
+`path_prefix` respects path component boundaries; `config.Validate` rejects
+`overlap_chars >= target_chars`; `DB.Stats` returns its errors.
+
+**Upgrading:** nothing to do. The first `ney index` or `ney mcp` after upgrading rebuilds the
+index and reclaims the disk.
+
+---
+
+## 2026-08-01 — Keyword-only search + install/first-run fixes (breaking)
+
+ney is a personal context server; the connected AI client is the intelligence layer. FTS5
+keyword search + tier-0 live scan + layered context is the whole product. No embeddings, no
+vectors, no rerank — ever. Semantic search covered exactly one of the seven use cases in the
+README (paraphrase lookup in a notes vault) while requiring Ollama or a cloud API key, and it
+dragged along the embedding-model-mismatch trap and a quarter of the setup wizard.
+
+**Removed:** `internal/embed`, `internal/vectorstore`, `internal/rerank`, `internal/apiretry`,
+`index.EmbedWorker`, the retriever's semantic leg + RRF fusion + rerank, `ney models`,
+`--provider`, `ney index --no-embed/--migrate-vectors`, config keys `embedder.*` /
+`reranker.*` / `vector_store.*` / `retrieval.{rerank,rerank_top_k,mode,hybrid}`, store
+`{Set,Get}ActiveEmbedder` + the unused `providers` table, and wizard step `[4/4]`.
+`go.mod` loses `coder/hnsw` and its transitive deps (`chewxy/math32`, `viterin/*`,
+`google/renameio`, `sourcegraph/conc`).
+
+**Also fixed (from an install/setup review):**
+- `ney init` no longer overwrites `config.yaml`. It used to rewrite the whole file from a
+  template, silently resetting a working embedder to `none` and dropping `dev_roots`,
+  `index.exclude`, `reranker`, `vector_store.backend` and `active_days` — on the exact path
+  both the README and the wizard's own closing message told users to take. The only config
+  write is now `config.SetDevRoots`, a `yaml.Node` edit that preserves comments and unknown
+  keys, re-parses before committing, and renames atomically.
+- AI-client registration records a stable binary path (`resolveNeyBinary`, never
+  `EvalSymlinks`). A Homebrew cask's `bin/ney` resolves into a versioned Caskroom directory
+  that `brew upgrade` deletes, which broke every registered client on the next upgrade.
+- `search_documents` and `index_status` now return a `next_step` on a fresh install instead
+  of a bare "No results found." (the old note even blamed the embedder when the real cause
+  was that nothing had been indexed).
+- `scripts/install.sh` verifies SHA-256 checksums (fail-closed on all four paths), supports
+  `NEY_VERSION` pinning, hands off to the wizard instead of `ney version`, and names WSL2 for
+  Windows.
+- `config.Load()` is silent — it used to print to stderr on every run, including `ney mcp`.
+- `ney init` refuses a non-TTY stdin, and prompts latch on EOF. `ney init < /dev/null` used
+  to answer "y" to every client-registration prompt with no human present.
+- All remaining Thai user-facing strings translated to English.
+
+**Migration:** none (pre-release). Old config keys are ignored by viper as always. Delete
+leftover `~/.ney/vectors.bin` and `~/.ney/vectors.hnsw*` by hand.
 
 ---
 

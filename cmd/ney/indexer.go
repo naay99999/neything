@@ -39,8 +39,6 @@ func newIndexer(app *AppState, cfg *config.Config) (*index.Indexer, error) {
 
 	return &index.Indexer{
 		DB:            app.DB,
-		Vectors:       app.Vectors,
-		Embedder:      app.Embedder,
 		Loaders:       newLoaderRegistry(cfg),
 		Filter:        newPathFilter(cfg),
 		ChunkResolver: chunkResolver,

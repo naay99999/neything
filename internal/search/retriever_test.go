@@ -2,35 +2,12 @@ package search
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
-
-// stubEmbedder returns a fixed query vector, or an error when errOnEmbed is
-// set — used to simulate an embedder endpoint being down.
-type stubEmbedder struct {
-	vec        []float32
-	errOnEmbed error
-}
-
-func (s *stubEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
-	if s.errOnEmbed != nil {
-		return nil, s.errOnEmbed
-	}
-	out := make([][]float32, len(texts))
-	for i := range texts {
-		out[i] = s.vec
-	}
-	return out, nil
-}
-
-func (s *stubEmbedder) Dimensions() int { return len(s.vec) }
-func (s *stubEmbedder) ModelID() string { return "stub" }
 
 // seedRetrieverDB builds a small two-chunk corpus in a fresh SQLite DB:
 // chunk 1's content overlaps the query tokens strongly (FTS + exact-vector
@@ -82,146 +59,53 @@ func seedRetrieverDB(t *testing.T) (*store.DB, []int64) {
 	return db, []int64{chunks[0].ID, chunks[1].ID}
 }
 
-// TestRetriever_AutoModeMatrix covers {embedder nil, vectors empty, embed
-// error, healthy} x {auto, semantic, keyword, hybrid}.
-func TestRetriever_AutoModeMatrix(t *testing.T) {
-	const query = "billing uses stripe subscriptions for recurring revenue"
-	queryVec := []float32{1, 0, 0, 0}
-	matchVec := []float32{1, 0, 0, 0} // parallel to queryVec -> cosine 1
-	otherVec := []float32{0, 1, 0, 0} // orthogonal -> cosine 0
+// TestRetriever_KeywordSearch covers the one path that exists now: FTS
+// matches rank above unrelated filler, and meta reports keyword_used.
+func TestRetriever_KeywordSearch(t *testing.T) {
+	db, ids := seedRetrieverDB(t)
 
-	type setup struct {
-		name         string
-		embedderNil  bool
-		vectorsEmpty bool
-		embedErr     bool
-	}
-	setups := []setup{
-		{name: "embedder nil", embedderNil: true},
-		{name: "vectors empty", vectorsEmpty: true},
-		{name: "embed error", embedErr: true},
-		{name: "healthy"},
-	}
-
-	modes := []string{ModeAuto, ModeSemantic, ModeKeyword, ModeHybrid}
-
-	for _, s := range setups {
-		for _, mode := range modes {
-			t.Run(s.name+"/"+mode, func(t *testing.T) {
-				db, chunkIDs := seedRetrieverDB(t)
-
-				dir := t.TempDir()
-				vs, err := vectorstore.NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { vs.Close() })
-
-				if !s.vectorsEmpty {
-					items := []vectorstore.VectorItem{
-						{ID: strconv.FormatInt(chunkIDs[0], 10), Vector: matchVec},
-						{ID: strconv.FormatInt(chunkIDs[1], 10), Vector: otherVec},
-					}
-					if err := vs.Add(context.Background(), items); err != nil {
-						t.Fatal(err)
-					}
-				}
-
-				r := &Retriever{DB: db, Vectors: vs}
-				if !s.embedderNil {
-					emb := &stubEmbedder{vec: queryVec}
-					if s.embedErr {
-						emb.errOnEmbed = errors.New("embedder endpoint down")
-					}
-					r.Embedder = emb
-				}
-
-				results, meta, err := r.Search(context.Background(), query, RetrieveOptions{
-					TopK: 5, FetchK: 10, Mode: mode,
-				})
-
-				semanticAvailable := !s.embedderNil && !s.vectorsEmpty
-				wantHardError := (mode == ModeSemantic || mode == ModeHybrid) && (!semanticAvailable || s.embedErr)
-
-				if wantHardError {
-					if err == nil {
-						t.Fatalf("expected error for mode=%s setup=%s, got results=%v meta=%+v", mode, s.name, results, meta)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatalf("unexpected error for mode=%s setup=%s: %v", mode, s.name, err)
-				}
-
-				wantKeywordUsed := mode == ModeAuto || mode == ModeKeyword || mode == ModeHybrid
-				wantSemanticUsed := (mode == ModeAuto || mode == ModeSemantic || mode == ModeHybrid) && semanticAvailable && !s.embedErr
-
-				if meta.KeywordUsed != wantKeywordUsed {
-					t.Errorf("mode=%s setup=%s: KeywordUsed = %v, want %v", mode, s.name, meta.KeywordUsed, wantKeywordUsed)
-				}
-				if meta.SemanticUsed != wantSemanticUsed {
-					t.Errorf("mode=%s setup=%s: SemanticUsed = %v, want %v", mode, s.name, meta.SemanticUsed, wantSemanticUsed)
-				}
-
-				wantDegraded := mode == ModeAuto && (!semanticAvailable || s.embedErr)
-				if wantDegraded && meta.Degraded == "" {
-					t.Errorf("mode=%s setup=%s: expected meta.Degraded to be set, got empty", mode, s.name)
-				}
-				if !wantDegraded && meta.Degraded != "" {
-					t.Errorf("mode=%s setup=%s: expected no degradation, got %q", mode, s.name, meta.Degraded)
-				}
-
-				if len(results) == 0 {
-					t.Fatalf("mode=%s setup=%s: expected results, got none", mode, s.name)
-				}
-				if results[0].ChunkID != chunkIDs[0] {
-					t.Errorf("mode=%s setup=%s: expected top result chunk %d, got %d", mode, s.name, chunkIDs[0], results[0].ChunkID)
-				}
-
-				wantCoverage := 0.0
-				if !s.vectorsEmpty {
-					wantCoverage = 1.0
-				}
-				if meta.EmbedCoverage != wantCoverage {
-					t.Errorf("mode=%s setup=%s: EmbedCoverage = %v, want %v", mode, s.name, meta.EmbedCoverage, wantCoverage)
-				}
-			})
-		}
-	}
-}
-
-// TestRetriever_ZeroSignalsReturnsEmpty covers the "nothing available at
-// all" case explicitly: no embedder, empty FTS index (no chunks).
-func TestRetriever_ZeroSignalsReturnsEmpty(t *testing.T) {
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "index.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	vs, err := vectorstore.NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer vs.Close()
-
-	r := &Retriever{DB: db, Vectors: vs}
-	results, meta, err := r.Search(context.Background(), "anything", RetrieveOptions{Mode: ModeAuto})
+	r := &Retriever{DB: db}
+	results, meta, err := r.Search(context.Background(), "billing stripe subscriptions",
+		RetrieveOptions{TopK: 5, FetchK: 10})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(results) != 0 {
-		t.Fatalf("expected no results, got %d", len(results))
+	if !meta.KeywordUsed {
+		t.Error("expected meta.KeywordUsed")
 	}
-	if meta.SemanticUsed || meta.KeywordUsed {
-		t.Fatalf("expected no signals used, got meta=%+v", meta)
+	if meta.Degraded != "" {
+		t.Errorf("expected no degradation on a healthy FTS index, got %q", meta.Degraded)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected at least one result")
+	}
+	if results[0].ChunkID != ids[0] {
+		t.Errorf("expected the billing chunk (id=%d) first, got id=%d", ids[0], results[0].ChunkID)
+	}
+}
+
+// TestRetriever_NoMatchReturnsEmpty: a query matching nothing is not an
+// error — MCP callers supplement empty results with a live scan.
+func TestRetriever_NoMatchReturnsEmpty(t *testing.T) {
+	db, _ := seedRetrieverDB(t)
+
+	r := &Retriever{DB: db}
+	results, meta, err := r.Search(context.Background(), "zzzznotawordanywhere", RetrieveOptions{TopK: 5})
+	if err != nil {
+		t.Fatalf("expected no error for an empty result set, got %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no results, got %+v", results)
+	}
+	if meta.KeywordUsed {
+		t.Error("expected KeywordUsed=false when FTS returned nothing")
 	}
 }
 
 // countingChunkStore is a chunkStore stub that counts calls to
-// GetChunksByIDs/GetDocumentsByChunkIDs, used to pin down the fix-1
-// restructuring: hydration must happen exactly once per Search call, even
-// when the keyword and semantic legs return overlapping chunk IDs.
+// GetChunksByIDs/GetDocumentsByChunkIDs, pinning down the hydration
+// restructuring: content and document metadata are fetched exactly once for
+// the whole ranked ID set, not once per result.
 type countingChunkStore struct {
 	fts    []store.FTSResult
 	chunks []*store.Chunk
@@ -245,9 +129,7 @@ func (c *countingChunkStore) GetDocumentsByChunkIDs(_ []int64) (map[int64]*store
 	return c.docs, nil
 }
 
-func (c *countingChunkStore) CountChunks() (int, error) { return len(c.chunks), nil }
-
-func TestRetriever_HydratesOnceForOverlappingIDs(t *testing.T) {
+func TestRetriever_HydratesOncePerSearch(t *testing.T) {
 	docs := map[int64]*store.DocWithWorkspace{
 		1: {Document: store.Document{ID: 10, Path: "/a.md", Type: "md"}, WorkspaceName: "ws"},
 		2: {Document: store.Document{ID: 10, Path: "/a.md", Type: "md"}, WorkspaceName: "ws"},
@@ -262,73 +144,51 @@ func TestRetriever_HydratesOnceForOverlappingIDs(t *testing.T) {
 		docs:   docs,
 	}
 
-	dir := t.TempDir()
-	vs, err := vectorstore.NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer vs.Close()
-
-	// Same two chunk IDs as the FTS leg above — the overlap case fix 1
-	// targets — just in a different score order.
-	items := []vectorstore.VectorItem{
-		{ID: "1", Vector: []float32{1, 0}},
-		{ID: "2", Vector: []float32{0.9, 0.1}},
-	}
-	if err := vs.Add(context.Background(), items); err != nil {
-		t.Fatal(err)
-	}
-
-	r := &Retriever{
-		DB:       cs,
-		Vectors:  vs,
-		Embedder: &stubEmbedder{vec: []float32{1, 0}},
-	}
+	r := &Retriever{DB: cs}
 
 	results, meta, err := r.Search(context.Background(), "billing stripe", RetrieveOptions{
-		TopK: 5, FetchK: 10, Mode: ModeHybrid,
+		TopK: 5, FetchK: 10,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !meta.SemanticUsed || !meta.KeywordUsed {
-		t.Fatalf("expected both signals used, got meta=%+v", meta)
+	if !meta.KeywordUsed {
+		t.Fatalf("expected keyword signal used, got meta=%+v", meta)
 	}
 	if len(results) != 2 {
 		t.Fatalf("expected 2 hydrated results, got %d: %+v", len(results), results)
 	}
 	if cs.getChunksCalls != 1 {
-		t.Errorf("expected GetChunksByIDs called exactly once for the fused set, got %d calls", cs.getChunksCalls)
+		t.Errorf("expected GetChunksByIDs called exactly once for the ranked set, got %d calls", cs.getChunksCalls)
 	}
 	if cs.getDocsCalls != 1 {
-		t.Errorf("expected GetDocumentsByChunkIDs called exactly once for the fused set, got %d calls", cs.getDocsCalls)
+		t.Errorf("expected GetDocumentsByChunkIDs called exactly once for the ranked set, got %d calls", cs.getDocsCalls)
 	}
 }
 
-// TestRetriever_EmptyModeBehavesLikeAuto ensures a zero-value Mode (as
-// produced by structs built without setting it) doesn't hard-fail like
-// semantic/hybrid would when the embedder is unavailable.
-func TestRetriever_EmptyModeBehavesLikeAuto(t *testing.T) {
-	db, chunkIDs := seedRetrieverDB(t)
-	dir := t.TempDir()
-	vs, err := vectorstore.NewBruteForceStore(filepath.Join(dir, "vectors.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer vs.Close()
+// TestHasPathPrefixRespectsComponentBoundaries: path_prefix is a scoping
+// filter, and a plain string prefix silently widened it — /a/proj also
+// matched the unrelated /a/project-private.
+func TestHasPathPrefixRespectsComponentBoundaries(t *testing.T) {
+	sep := string(filepath.Separator)
+	join := func(parts ...string) string { return sep + strings.Join(parts, sep) }
 
-	r := &Retriever{DB: db, Vectors: vs} // no embedder, empty Mode
-	results, meta, err := r.Search(context.Background(), "billing stripe", RetrieveOptions{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	cases := []struct {
+		path, prefix string
+		want         bool
+	}{
+		{join("a", "proj", "notes.md"), join("a", "proj"), true},
+		{join("a", "proj"), join("a", "proj"), true},
+		{join("a", "proj", "deep", "x.md"), join("a", "proj"), true},
+		{join("a", "proj", "notes.md"), join("a", "proj") + sep, true},
+		{join("a", "project-private", "secrets.md"), join("a", "proj"), false},
+		{join("a", "projector.md"), join("a", "proj"), false},
+		{join("b", "proj", "notes.md"), join("a", "proj"), false},
+		{join("a", "proj", "notes.md"), "", true},
 	}
-	if !meta.KeywordUsed || meta.SemanticUsed {
-		t.Fatalf("expected keyword-only degrade, got meta=%+v", meta)
-	}
-	if meta.Degraded == "" {
-		t.Fatal("expected degraded note for missing embedder")
-	}
-	if len(results) == 0 || results[0].ChunkID != chunkIDs[0] {
-		t.Fatalf("expected top result chunk %d, got %v", chunkIDs[0], results)
+	for _, tc := range cases {
+		if got := hasPathPrefix(tc.path, tc.prefix); got != tc.want {
+			t.Errorf("hasPathPrefix(%q, %q) = %v, want %v", tc.path, tc.prefix, got, tc.want)
+		}
 	}
 }

@@ -1,9 +1,10 @@
 // Package lockfile implements a cross-process writer lock backed by a
 // kernel advisory lock (flock(2)) on a single file (~/.ney/writer.lock). It
-// exists because both vectorstore backends flush by rewriting their file
-// wholesale from memory: two writer processes (e.g. `ney mcp` and a
-// concurrent `ney index`/`ney reset`) racing that flush would silently
-// clobber each other's work.
+// exists because two writer processes (e.g. `ney mcp` and a concurrent
+// `ney index`/`ney reset`) running Index/PruneMissing against the same
+// index.db would fight over document rows and FTS state. It is also what
+// lets `ney mcp` degrade to read-only instead of failing when another ney
+// already holds the lock.
 //
 // Exclusion comes from the kernel, not from a pid heuristic. An earlier
 // version created the file with O_CREATE|O_EXCL and decided staleness by

@@ -233,3 +233,101 @@ func TestScanRepos_NonexistentRoot(t *testing.T) {
 		t.Fatalf("expected empty slice for nonexistent root, got %d", len(projects))
 	}
 }
+
+// TestScanReposHardensGitInvocation: ScanRepos describes repositories ney did
+// not create, and a repository carries its own config. git honours several
+// keys that name a command to run, so a repo whose .git/config an attacker
+// controls could otherwise execute it. core.fsmonitor is the reachable one
+// here — `git status` runs it.
+func TestScanReposHardensGitInvocation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "hostile")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "initial")
+
+	// The payload: a hook command git would run during `status`.
+	canary := filepath.Join(root, "PWNED")
+	run("config", "core.fsmonitor", "touch "+canary+" && false")
+
+	projects := ScanRepos(context.Background(), []string{root})
+
+	if _, err := os.Stat(canary); err == nil {
+		t.Fatal("core.fsmonitor was executed — git invocations are not hardened")
+	}
+	if len(projects) != 1 {
+		t.Fatalf("expected the repo to still be described, got %d projects", len(projects))
+	}
+	if projects[0].Name != "hostile" {
+		t.Fatalf("unexpected project %+v", projects[0])
+	}
+}
+
+// TestScanReposIsDeterministic: describing repos concurrently must not make
+// the result order depend on which git process finished first.
+func TestScanReposIsDeterministic(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	for _, name := range []string{"alpha", "beta", "gamma", "delta", "epsilon"} {
+		repo := filepath.Join(root, name)
+		if err := os.MkdirAll(repo, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		run := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+			cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+				"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
+				// Identical commit timestamps, so the sort cannot break ties
+				// and any instability comes from the scan itself.
+				"GIT_AUTHOR_DATE=2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2026-01-01T00:00:00Z")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+		}
+		run("init")
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", ".")
+		run("commit", "-m", "initial")
+	}
+
+	first := ScanRepos(context.Background(), []string{root})
+	if len(first) != 5 {
+		t.Fatalf("expected 5 repos, got %d", len(first))
+	}
+	for i := 0; i < 5; i++ {
+		got := ScanRepos(context.Background(), []string{root})
+		if len(got) != len(first) {
+			t.Fatalf("run %d returned %d repos, want %d", i, len(got), len(first))
+		}
+		for j := range got {
+			if got[j].Path != first[j].Path {
+				t.Fatalf("run %d position %d = %s, want %s — order is not deterministic",
+					i, j, got[j].Path, first[j].Path)
+			}
+		}
+	}
+}

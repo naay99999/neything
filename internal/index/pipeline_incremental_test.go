@@ -4,29 +4,27 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
 
-func assertVectorChunkParity(t *testing.T, db *store.DB, vs vectorstore.VectorStore) {
+// ftsHits reports how many FTS rows match query.
+func ftsHits(t *testing.T, db *store.DB, query string) int {
 	t.Helper()
-	chunkIDs, err := db.GetAllChunkIDs()
+	res, err := db.SearchFTS(query, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunkSet := make(map[string]bool, len(chunkIDs))
-	for _, id := range chunkIDs {
-		chunkSet[strconv.FormatInt(id, 10)] = true
-	}
-	if vs.Count() != len(chunkIDs) {
-		t.Fatalf("vector/chunk count mismatch: vectors=%d chunks=%d", vs.Count(), len(chunkIDs))
-	}
+	return len(res)
 }
 
-func TestIndexerReindexPreservesVectorCount(t *testing.T) {
+// TestIndexerReindexReplacesOldChunks is the guard for the chunk+FTS cleanup
+// that DeleteChunksByDocument owns. Its return value has no consumer any more
+// (it used to feed VectorStore.Delete), so it would be easy to drop the call
+// entirely — that leaves the OLD text searchable forever, silently, with no
+// error anywhere.
+func TestIndexerReindexReplacesOldChunks(t *testing.T) {
 	ix, db, dir := setupIndexer(t)
 	defer db.Close()
 
@@ -35,31 +33,41 @@ func TestIndexerReindexPreservesVectorCount(t *testing.T) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("version one content here"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("aardvark version one content here"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
-	runEmbedWorker(t, ix)
-	count1 := ix.Vectors.Count()
-
-	if err := os.WriteFile(path, []byte("version two with different content"), 0644); err != nil {
-		t.Fatal(err)
+	if ftsHits(t, db, "aardvark") == 0 {
+		t.Fatal("expected the original content to be FTS-searchable")
 	}
-	stats, err := ix.Index(context.Background(), root, "test")
+	chunks1, err := db.CountChunks()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.VectorsPruned == 0 {
-		t.Fatal("expected vectors pruned on re-index")
+
+	if err := os.WriteFile(path, []byte("bumblebee version two with different content"), 0644); err != nil {
+		t.Fatal(err)
 	}
-	runEmbedWorker(t, ix)
-	if ix.Vectors.Count() != count1 {
-		t.Fatalf("expected vector count %d after re-index, got %d", count1, ix.Vectors.Count())
+	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
+		t.Fatal(err)
 	}
-	assertVectorChunkParity(t, db, ix.Vectors)
+
+	if n := ftsHits(t, db, "aardvark"); n != 0 {
+		t.Fatalf("stale FTS rows survived a re-index: %d hits for the OLD content", n)
+	}
+	if ftsHits(t, db, "bumblebee") == 0 {
+		t.Fatal("expected the new content to be FTS-searchable")
+	}
+	chunks2, err := db.CountChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunks2 != chunks1 {
+		t.Fatalf("chunk count drifted across re-index: %d then %d (orphaned chunk rows?)", chunks1, chunks2)
+	}
 }
 
 func TestIndexerHashSkip(t *testing.T) {
@@ -110,7 +118,6 @@ func TestIndexerRemovesDeletedFile(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
-	runEmbedWorker(t, ix)
 	if err := os.Remove(remove); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +136,9 @@ func TestIndexerRemovesDeletedFile(t *testing.T) {
 	if doc != nil {
 		t.Fatal("expected removed document gone from db")
 	}
-	assertVectorChunkParity(t, db, ix.Vectors)
+	if n := ftsHits(t, db, "remove"); n != 0 {
+		t.Fatalf("deleted file's FTS rows survived: %d hits", n)
+	}
 }
 
 func TestIndexerRenameByHash(t *testing.T) {
@@ -150,10 +159,9 @@ func TestIndexerRenameByHash(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
-	runEmbedWorker(t, ix)
-	vectorCount := ix.Vectors.Count()
-	if vectorCount == 0 {
-		t.Fatal("expected vectors after embedding")
+	chunksBefore, err := db.CountChunks()
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	if err := os.Rename(oldPath, newPath); err != nil {
@@ -168,7 +176,7 @@ func TestIndexerRenameByHash(t *testing.T) {
 		t.Fatalf("expected rename not removal, files_removed=%d", stats.FilesRemoved)
 	}
 	if stats.ChunksCreated != 0 {
-		t.Fatalf("expected no re-embed on rename, chunks_created=%d", stats.ChunksCreated)
+		t.Fatalf("expected no re-chunk on rename, chunks_created=%d", stats.ChunksCreated)
 	}
 
 	doc, err := db.GetDocumentByPath(newPath)
@@ -185,8 +193,12 @@ func TestIndexerRenameByHash(t *testing.T) {
 	if oldDoc != nil {
 		t.Fatal("expected old path removed from db after rename")
 	}
-	if ix.Vectors.Count() != vectorCount {
-		t.Fatalf("expected vector count unchanged on rename, got %d want %d", ix.Vectors.Count(), vectorCount)
+	chunksAfter, err := db.CountChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunksAfter != chunksBefore {
+		t.Fatalf("expected chunk count unchanged on rename, got %d want %d", chunksAfter, chunksBefore)
 	}
 }
 
@@ -205,9 +217,8 @@ func TestIndexerRemovePath(t *testing.T) {
 	if _, err := ix.Index(context.Background(), root, "test"); err != nil {
 		t.Fatal(err)
 	}
-	runEmbedWorker(t, ix)
-	if ix.Vectors.Count() == 0 {
-		t.Fatal("expected vectors after embedding")
+	if ftsHits(t, db, "remove") == 0 {
+		t.Fatal("expected the document to be FTS-searchable before removal")
 	}
 
 	stats, err := ix.RemovePath(context.Background(), path)
@@ -217,7 +228,10 @@ func TestIndexerRemovePath(t *testing.T) {
 	if stats.FilesRemoved != 1 {
 		t.Fatalf("expected 1 file removed, got %d", stats.FilesRemoved)
 	}
-	if ix.Vectors.Count() != 0 {
-		t.Fatalf("expected 0 vectors, got %d", ix.Vectors.Count())
+	if n := ftsHits(t, db, "remove"); n != 0 {
+		t.Fatalf("RemovePath left %d stale FTS rows", n)
+	}
+	if n, err := db.CountChunks(); err != nil || n != 0 {
+		t.Fatalf("RemovePath left %d orphan chunk rows (err=%v)", n, err)
 	}
 }

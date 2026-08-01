@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,58 +10,14 @@ import (
 	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/search"
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
-
-const testDim = 16
-
-type mockEmbedder struct{}
-
-func (m *mockEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
-	out := make([][]float32, len(texts))
-	for i, text := range texts {
-		out[i] = hashToVector(text, testDim)
-	}
-	return out, nil
-}
-
-func (m *mockEmbedder) Dimensions() int { return testDim }
-func (m *mockEmbedder) ModelID() string { return "mock-embedder" }
-
-func hashToVector(text string, dim int) []float32 {
-	h := fnv.New64a()
-	h.Write([]byte(text))
-	seed := h.Sum64()
-	vec := make([]float32, dim)
-	for i := range vec {
-		seed = seed*6364136223846793005 + 1
-		vec[i] = float32(int(seed>>33)%1000) / 1000
-	}
-	// normalize
-	var sum float32
-	for _, v := range vec {
-		sum += v * v
-	}
-	if sum > 0 {
-		n := float32(1.0 / float32(sum))
-		for i := range vec {
-			vec[i] *= n
-		}
-	}
-	return vec
-}
 
 func setupIndexer(t *testing.T) (*Indexer, *store.DB, string) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "index.db")
-	vecPath := filepath.Join(dir, "vectors.bin")
 
 	db, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vs, err := vectorstore.NewBruteForceStore(vecPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,8 +27,6 @@ func setupIndexer(t *testing.T) (*Indexer, *store.DB, string) {
 	}
 	ix := &Indexer{
 		DB:            db,
-		Vectors:       vs,
-		Embedder:      &mockEmbedder{},
 		Loaders:       loader.NewRegistry(&loader.MarkdownLoader{}),
 		ChunkResolver: chunkResolver,
 		BatchSize:     8,
@@ -108,11 +61,7 @@ func TestIndexerIndexAndSearch(t *testing.T) {
 		t.Fatal("expected chunks created")
 	}
 
-	retriever := &search.Retriever{
-		DB:       db,
-		Vectors:  ix.Vectors,
-		Embedder: &mockEmbedder{},
-	}
+	retriever := &search.Retriever{DB: db}
 	results, _, err := retriever.Search(context.Background(), unique, search.RetrieveOptions{
 		TopK:      3,
 		FetchK:    10,

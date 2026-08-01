@@ -1,12 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
-	"strings"
-	"time"
 
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/store"
@@ -30,7 +25,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	var results []checkResult
 
 	// 1. Config valid
-	cfg, err := config.Load()
+	_, err := config.Load()
 	if err != nil {
 		results = append(results, checkResult{
 			Check:   "config_valid",
@@ -47,210 +42,13 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		Message: fmt.Sprintf("Config file valid (%s)", config.ConfigPath()),
 	})
 
-	if cfg.Retrieval.Rerank {
-		if _, err := config.NewReranker(cfg); err != nil {
-			results = append(results, checkResult{
-				Check:   "rerank_enabled",
-				OK:      false,
-				Message: fmt.Sprintf("Rerank enabled but misconfigured: %v", err),
-				Hint:    "Check reranker settings and API keys in ~/.ney/config.yaml",
-			})
-		} else {
-			results = append(results, checkResult{
-				Check:   "rerank_enabled",
-				OK:      true,
-				Message: fmt.Sprintf("Reranker ready (%s / %s)", cfg.Reranker.Provider, cfg.Reranker.Model),
-			})
-		}
-	} else {
-		results = append(results, checkResult{
-			Check:   "rerank_enabled",
-			OK:      true,
-			Message: "Rerank disabled (default)",
-		})
-	}
-
-	if cfg.Retrieval.Hybrid {
-		results = append(results, checkResult{
-			Check:   "hybrid_search",
-			OK:      true,
-			Message: "Hybrid search enabled (semantic + BM25 FTS)",
-		})
-	} else {
-		results = append(results, checkResult{
-			Check:   "hybrid_search",
-			OK:      true,
-			Message: "Semantic search only (default)",
-		})
-	}
-
-	backend := cfg.VectorStore.Backend
-	if backend == "" {
-		backend = "brute"
-	}
-	results = append(results, checkResult{
-		Check:   "vector_store",
-		OK:      true,
-		Message: fmt.Sprintf("Vector store backend: %s", backend),
-	})
-
 	results = append(results, checkResult{
 		Check:   "loaders",
 		OK:      true,
 		Message: "Supported formats: .md, .markdown, .txt (+ Obsidian/Notion .md)",
 	})
 
-	// 2. Embedder is not Claude, and an informational note when unconfigured
-	switch {
-	case cfg.Embedder.Provider == "claude":
-		results = append(results, checkResult{
-			Check:   "embedder_not_claude",
-			OK:      false,
-			Message: "Claude cannot be used as embedder",
-			Hint:    "Set embedder.provider to: openai, gemini, ollama, or lmstudio",
-		})
-	case !cfg.HasEmbedder():
-		results = append(results, checkResult{
-			Check:   "embedder_configured",
-			OK:      true,
-			Message: "Embedder not configured (keyword-only search)",
-			Hint:    "Run `ney init` to enable semantic search",
-		})
-	default:
-		results = append(results, checkResult{
-			Check:   "embedder_configured",
-			OK:      true,
-			Message: fmt.Sprintf("Embedder provider is %q (not Claude)", cfg.Embedder.Provider),
-		})
-	}
-
-	// 3. API keys
-	needed := map[string]bool{}
-	if cfg.Embedder.Provider == "openai" {
-		needed["OPENAI_API_KEY"] = true
-	}
-	if cfg.Embedder.Provider == "gemini" {
-		needed["GEMINI_API_KEY"] = true
-	}
-	for envVar := range needed {
-		if os.Getenv(envVar) != "" {
-			results = append(results, checkResult{
-				Check:   "api_key_" + strings.ToLower(strings.TrimSuffix(envVar, "_API_KEY")),
-				OK:      true,
-				Message: envVar + " is set",
-			})
-		} else {
-			results = append(results, checkResult{
-				Check:   "api_key_" + strings.ToLower(strings.TrimSuffix(envVar, "_API_KEY")),
-				OK:      false,
-				Message: envVar + " not set",
-				Hint:    fmt.Sprintf("export %s=<your-key>", envVar),
-			})
-		}
-	}
-
-	// 4 & 5. Ollama reachable + model installed
-	if cfg.Embedder.Provider == "ollama" {
-		endpoint := cfg.Embedder.Endpoint
-		if endpoint == "" {
-			endpoint = "http://localhost:11434"
-		}
-		client := &http.Client{Timeout: 3 * time.Second}
-		resp, err := client.Get(endpoint + "/")
-		if err != nil {
-			results = append(results, checkResult{
-				Check:   "ollama_reachable",
-				OK:      false,
-				Message: "Ollama not reachable at " + endpoint,
-				Hint:    "Run: ollama serve",
-			})
-		} else {
-			resp.Body.Close()
-			results = append(results, checkResult{
-				Check:   "ollama_reachable",
-				OK:      true,
-				Message: "Ollama daemon reachable at " + endpoint,
-			})
-
-			// check model installed
-			installed := listOllamaModels(endpoint)
-			installedSet := map[string]bool{}
-			for _, m := range installed {
-				installedSet[m] = true
-				// also check short name without tag
-				if i := strings.Index(m, ":"); i >= 0 {
-					installedSet[m[:i]] = true
-				}
-			}
-			checkModel := func(model, role string) {
-				shortName := model
-				if i := strings.Index(model, ":"); i >= 0 {
-					shortName = model[:i]
-				}
-				if installedSet[model] || installedSet[shortName] {
-					results = append(results, checkResult{
-						Check:   "ollama_model_" + role,
-						OK:      true,
-						Message: fmt.Sprintf("Ollama %s model %q installed", role, model),
-					})
-				} else {
-					results = append(results, checkResult{
-						Check:   "ollama_model_" + role,
-						OK:      false,
-						Message: fmt.Sprintf("Ollama %s model %q not found", role, model),
-						Hint:    "Run: ollama pull " + model,
-					})
-				}
-			}
-			checkModel(cfg.Embedder.Model, "embedder")
-		}
-	}
-
-	// 5b. LM Studio / OpenAI-compatible server reachable + model available
-	if cfg.Embedder.Provider == "lmstudio" {
-		endpoint := cfg.Embedder.Endpoint
-		if endpoint == "" {
-			endpoint = "http://localhost:1234"
-		}
-		available := listOpenAICompatModels(endpoint)
-		if available == nil {
-			results = append(results, checkResult{
-				Check:   "lmstudio_reachable",
-				OK:      false,
-				Message: "LM Studio / OpenAI-compatible server not reachable at " + endpoint,
-				Hint:    "Start the server (LM Studio: Developer tab → Start Server), or fix the endpoint: ney init",
-			})
-		} else {
-			results = append(results, checkResult{
-				Check:   "lmstudio_reachable",
-				OK:      true,
-				Message: fmt.Sprintf("OpenAI-compatible server reachable at %s (%d models)", endpoint, len(available)),
-			})
-			availableSet := map[string]bool{}
-			for _, m := range available {
-				availableSet[m] = true
-			}
-			checkLMModel := func(model, role string) {
-				if availableSet[model] {
-					results = append(results, checkResult{
-						Check:   "lmstudio_model_" + role,
-						OK:      true,
-						Message: fmt.Sprintf("Server %s model %q available", role, model),
-					})
-				} else {
-					results = append(results, checkResult{
-						Check:   "lmstudio_model_" + role,
-						OK:      false,
-						Message: fmt.Sprintf("Server %s model %q not found", role, model),
-						Hint:    "Load the model in LM Studio, or pick another: ney init",
-					})
-				}
-			}
-			checkLMModel(cfg.Embedder.Model, "embedder")
-		}
-	}
-
-	// 6. SQLite writable
+	// 2. SQLite writable
 	db, err := store.Open(config.DBPath())
 	if err != nil {
 		results = append(results, checkResult{
@@ -267,7 +65,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			Message: fmt.Sprintf("SQLite DB writable (%s)", config.DBPath()),
 		})
 
-		// 7. Index has data
+		// 3. Index has data
 		db2, _ := store.Open(config.DBPath())
 		if db2 != nil {
 			defer db2.Close()
@@ -278,79 +76,6 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 					OK:      true,
 					Message: fmt.Sprintf("Index contains %d chunks across %d files", stats.ChunkCount, stats.DocumentCount),
 				})
-
-				vs, vsErr := config.NewVectorStore(cfg, db2, false)
-				if vsErr != nil {
-					results = append(results, checkResult{
-						Check:   "vector_store_open",
-						OK:      false,
-						Message: fmt.Sprintf("Vector store error: %v", vsErr),
-						Hint:    "Check vector_store settings or run: ney reset && ney index <path>",
-					})
-				} else {
-					vecCount := vs.Count()
-					state, coverage := vectorParityState(vecCount, stats.ChunkCount)
-					switch state {
-					case "orphan":
-						results = append(results, checkResult{
-							Check:   "vector_parity",
-							OK:      false,
-							Message: fmt.Sprintf("Orphan vectors detected: %d vectors vs %d chunks", vecCount, stats.ChunkCount),
-							Hint:    "Run: ney index <path> to prune orphans",
-						})
-					case "embedding":
-						results = append(results, checkResult{
-							Check:   "vector_parity",
-							OK:      true,
-							Message: fmt.Sprintf("Embedding in progress (%d/%d chunks embedded, %.0f%%)", vecCount, stats.ChunkCount, coverage*100),
-						})
-					default: // "ok"
-						results = append(results, checkResult{
-							Check:   "vector_parity",
-							OK:      true,
-							Message: fmt.Sprintf("Vector count matches chunks (%d)", vecCount),
-						})
-					}
-				}
-
-				// 8. Embedder consistency — only meaningful when an embedder
-				// is configured. With provider none the old vectors just sit
-				// unused (auto mode never consults them), so a "mismatch"
-				// against the empty model would be a false positive.
-				active, err := db2.GetActiveEmbedder()
-				if err == nil && active != nil && cfg.HasEmbedder() {
-					var storedModel string
-					val := active.Name
-					if i := strings.Index(val, `"model":"`); i >= 0 {
-						rest := val[i+9:]
-						if j := strings.Index(rest, `"`); j >= 0 {
-							storedModel = rest[:j]
-						}
-					}
-					if storedModel == "" {
-						// raw JSON fallback — try to unmarshal
-						var m map[string]any
-						if json.Unmarshal([]byte(val), &m) == nil {
-							if s, ok := m["model"].(string); ok {
-								storedModel = s
-							}
-						}
-					}
-					if storedModel != "" && storedModel != cfg.Embedder.Model {
-						results = append(results, checkResult{
-							Check:   "embedder_consistent",
-							OK:      false,
-							Message: fmt.Sprintf("Embedder mismatch: index built with %q, config says %q", storedModel, cfg.Embedder.Model),
-							Hint:    "Run: ney reset && ney index <path>",
-						})
-					} else {
-						results = append(results, checkResult{
-							Check:   "embedder_consistent",
-							OK:      true,
-							Message: fmt.Sprintf("Embedder consistent (%s)", cfg.Embedder.Model),
-						})
-					}
-				}
 			} else {
 				results = append(results, checkResult{
 					Check:   "index_has_data",
@@ -362,18 +87,16 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 9. MCP readiness — always informational (pass-only): tells the user the
+	// 4. MCP readiness — always informational (pass-only): tells the user the
 	// exact command to wire ney into an MCP client, with the actual resolved
 	// binary path so it works regardless of how `ney` was installed/aliased.
-	mcpBin := "ney"
-	if bin, binErr := os.Executable(); binErr == nil {
-		mcpBin = bin
-	}
 	results = append(results, checkResult{
 		Check:   "mcp",
 		OK:      true,
 		Message: "MCP server available — point an AI client at ney for zero-setup search",
-		Hint:    fmt.Sprintf("claude mcp add ney -- %s mcp --root <path>", mcpBin),
+		// Args-less on purpose: the workspaces table is the single source of
+		// truth for what gets served (see README "MCP — connect your AI").
+		Hint: fmt.Sprintf("claude mcp add --scope user ney -- %s mcp", resolveNeyBinary()),
 	})
 
 	printDoctorResults(results)

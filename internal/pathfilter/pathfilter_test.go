@@ -1,6 +1,7 @@
 package pathfilter
 
 import (
+	"io/fs"
 	"path/filepath"
 	"testing"
 )
@@ -125,5 +126,34 @@ func TestExcludedPath(t *testing.T) {
 	}
 	if f.ExcludedPath(root, "/somewhere/else/.env") {
 		t.Error("paths outside root are not this function's call")
+	}
+}
+
+// TestExcludedMode: only regular files are ever opened. Everything else is
+// denied by type, because a name says nothing about what is behind it — see
+// TestIndexSkipsSymlinks / TestScanDoesNotFollowSymlinks for what that
+// prevents.
+func TestExcludedMode(t *testing.T) {
+	cases := []struct {
+		name string
+		mode fs.FileMode
+		want bool
+	}{
+		{"regular file", 0, false},
+		{"regular file with perms", 0o644, false},
+		{"symlink", fs.ModeSymlink, true},
+		{"directory", fs.ModeDir, true},
+		{"named pipe", fs.ModeNamedPipe, true},
+		{"socket", fs.ModeSocket, true},
+		{"device", fs.ModeDevice, true},
+		{"char device", fs.ModeDevice | fs.ModeCharDevice, true},
+		{"irregular", fs.ModeIrregular, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExcludedMode(tc.mode); got != tc.want {
+				t.Fatalf("ExcludedMode(%v) = %v, want %v", tc.mode, got, tc.want)
+			}
+		})
 	}
 }

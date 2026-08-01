@@ -1,6 +1,7 @@
 package neycontext
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,7 +118,20 @@ func renderSections(preamble string, sections []profileSection) string {
 // (appendMode true). If no section with that name exists, a new "##
 // <section>" block is appended at EOF. The file is created if missing.
 // The write is atomic (temp file + rename).
+//
+// section is emitted as a "## <section>" heading line, so it goes through
+// sanitizeScalar first — the same treatment remember gives its caller-supplied
+// frontmatter values, and for the same reason. This name reaches us from the
+// MCP update_profile tool, i.e. from the LLM, i.e. potentially from
+// attacker-planted text the LLM was reading. A newline in it would close the
+// heading and forge additional "## " sections in profile.md, which get_context
+// re-serves to every connected client at the start of every session.
 func UpdateProfile(path, section, content string, appendMode bool) error {
+	section = sanitizeScalar(section)
+	if section == "" {
+		return fmt.Errorf("section name is empty after sanitization")
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err

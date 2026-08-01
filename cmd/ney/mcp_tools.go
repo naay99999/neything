@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -57,7 +56,6 @@ type mcpDeps struct {
 	cfg          *config.Config
 	state        *serverState
 	rs           *rootSet
-	worker       *index.EmbedWorker
 	flt          *pathfilter.Filter
 	ix           *index.Indexer
 	serialize    func(func())
@@ -77,7 +75,7 @@ type mcpDeps struct {
 // (mcp.NewInMemoryTransports) without going through stdio or the CLI's
 // lockfile/signal-handling — see mcp_test.go.
 func newMCPServer(deps mcpDeps) *mcp.Server {
-	app, cfg, state, worker, flt := deps.app, deps.cfg, deps.state, deps.worker, deps.flt
+	app, cfg, state, flt := deps.app, deps.cfg, deps.state, deps.flt
 	server := mcp.NewServer(&mcp.Implementation{Name: "ney", Version: Version}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -111,20 +109,21 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search_documents",
-		Description: "Search the indexed local documents (hybrid keyword + semantic, mode depends on config). " +
-			"Results may be partial while background indexing/embedding is still in progress — check the " +
-			"returned index_status (phase_a_running, embedding_state) before concluding something isn't indexed. " +
+		Description: "Keyword search (SQLite FTS5) across every indexed workspace, including memory. " +
+			"Results may be partial while background indexing is still in progress — check the returned " +
+			"index_status (phase_a_running) before concluding something isn't indexed. " +
 			"While a root's initial scan is still running, results are supplemented with a live filesystem scan " +
 			"(source: \"live-scan\") so filename/content matches show up even before that root finishes indexing. " +
-			"If nothing relevant is found here, do not give up: ask the user WHERE the file might live " +
-			"(Downloads? Desktop? Documents? a specific project folder?) and then call search_folder on that folder.",
-	}, searchDocumentsHandler(app, cfg, state, worker, deps.rs, flt))
+			"If nothing relevant is found here, do not give up: read the returned next_step, and ask the user " +
+			"WHERE the file might live (Downloads? Desktop? Documents? a specific project folder?) before " +
+			"calling search_folder on that folder.",
+	}, searchDocumentsHandler(app, cfg, state, deps.rs, flt))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "index_folder",
 		Description: "Permanently index ONE folder (under the user's home or iCloud Drive) so its markdown/text " +
 			"contents become fully searchable from now on, for every connected AI client. " +
-			"Use when the user wants a folder searchable long-term (\"index โฟลเดอร์นี้\", deep/recurring " +
+			"Use when the user wants a folder searchable long-term (\"index this folder\", deep/recurring " +
 			"search needs); for a quick one-off lookup use search_folder instead. Indexing runs synchronously " +
 			"and may take a while on large folders. Unavailable while another ney process holds the writer lock.",
 	}, indexFolderHandler(deps))
@@ -149,10 +148,10 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "index_status",
-		Description: "Report global indexing/embedding status: per-workspace counts, whether the embedder is " +
-			"configured, embedding progress/state, which roots are still on their initial scan, and whether " +
-			"filesystem watching is active. Cheap to poll instead of waiting for progress notifications.",
-	}, indexStatusHandler(app, cfg, state, worker))
+		Description: "Report global indexing status: per-workspace document/chunk counts, which roots are " +
+			"still on their initial scan, whether filesystem watching is active, and whether this server is " +
+			"read-only. Cheap to poll instead of waiting for progress notifications.",
+	}, indexStatusHandler(app, state))
 
 	return server
 }
@@ -176,19 +175,20 @@ type searchResultItem struct {
 }
 
 type indexStatusBrief struct {
-	Chunks         int    `json:"chunks"`
-	Vectors        int    `json:"vectors"`
-	EmbeddingState string `json:"embedding_state"`
-	PhaseARunning  bool   `json:"phase_a_running"`
+	Chunks        int  `json:"chunks"`
+	PhaseARunning bool `json:"phase_a_running"`
 }
 
 type searchDocumentsOutput struct {
 	Results     []searchResultItem `json:"results"`
 	Meta        search.SearchMeta  `json:"meta"`
 	IndexStatus indexStatusBrief   `json:"index_status"`
+	// NextStep is set only when Results is empty: a concrete instruction for
+	// the AI client so a fresh install never dead-ends on "No results found."
+	NextStep string `json:"next_step,omitempty"`
 }
 
-func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker, rs *rootSet, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
+func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverState, rs *rootSet, flt *pathfilter.Filter) mcp.ToolHandlerFor[searchDocumentsInput, searchDocumentsOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in searchDocumentsInput) (*mcp.CallToolResult, searchDocumentsOutput, error) {
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, searchDocumentsOutput{}, fmt.Errorf("query is required")
@@ -203,13 +203,10 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 
 		opts := search.RetrieveOptions{
 			TopK:       topK,
-			FetchK:     config.FetchK(cfg, topK),
 			Workspace:  in.Workspace,
 			PathPrefix: in.PathPrefix,
-			Mode:       cfg.Retrieval.Mode,
-			Rerank:     cfg.Retrieval.Rerank,
 		}
-		retriever := &search.Retriever{DB: app.DB, Vectors: app.Vectors, Embedder: app.Embedder, Reranker: app.Reranker}
+		retriever := &search.Retriever{DB: app.DB}
 		results, meta, err := retriever.Search(ctx, in.Query, opts)
 		if err != nil {
 			return nil, searchDocumentsOutput{}, err
@@ -229,22 +226,33 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 		roots := rs.snapshot()
 		items = appendLiveScanHits(ctx, items, in.Query, in.Workspace, roots, state, flt)
 		items = filterExcludedItems(flt, roots, items)
+		// Truncate last. The retriever already capped its own leg at topK, but
+		// the live-scan supplement appends up to MaxHits more per still-indexing
+		// root on top of that — so without this the tool can return several
+		// times the top_k the client asked for.
+		if len(items) > topK {
+			items = items[:topK]
+		}
 
 		chunkCount, _ := app.DB.CountChunks()
+		phaseARunning := state.anyPhaseARunning()
 		out := searchDocumentsOutput{
 			Results: items,
 			Meta:    meta,
 			IndexStatus: indexStatusBrief{
-				Chunks:         chunkCount,
-				Vectors:        app.Vectors.Count(),
-				EmbeddingState: embeddingStatusFor(cfg, worker).State,
-				PhaseARunning:  state.anyPhaseARunning(),
+				Chunks:        chunkCount,
+				PhaseARunning: phaseARunning,
 			},
+		}
+		if len(items) == 0 {
+			out.NextStep = noResultsGuidance(chunkCount, userRootCount(roots), phaseARunning)
 		}
 
 		var b strings.Builder
 		if len(items) == 0 {
-			b.WriteString("No results found.")
+			b.WriteString("No results found.\n")
+			b.WriteString(out.NextStep)
+			b.WriteString("\n")
 		} else {
 			fmt.Fprintf(&b, "%d result(s):\n", len(items))
 			for i, it := range items {
@@ -262,7 +270,7 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 		if meta.Degraded != "" {
 			fmt.Fprintf(&b, "\nnote: %s\n", meta.Degraded)
 		}
-		if out.IndexStatus.PhaseARunning {
+		if len(items) > 0 && phaseARunning {
 			b.WriteString("\nnote: indexing is still in progress — results may be partial.\n")
 		}
 
@@ -276,10 +284,52 @@ func searchDocumentsHandler(app *AppState, cfg *config.Config, state *serverStat
 // a CLI `ney index ~/.ssh` — could otherwise leak secret content through
 // search even though read_document refuses to serve the same file. Capped at
 // maxSearchTopK items per call, so the per-item path check is free.
+// userRootCount counts the roots the user actually chose. ney always
+// registers ~/.ney/memory itself (in both read-write and read-only mode), so
+// len(roots) is never zero and can't be used to detect a fresh install.
+func userRootCount(roots []mcpRoot) int {
+	n := 0
+	for _, r := range roots {
+		if !r.Internal {
+			n++
+		}
+	}
+	return n
+}
+
+// noResultsGuidance turns an empty search into a concrete next action for the
+// AI client. Without it, a fresh install answers "No results found." with no
+// way forward — the single worst first-run experience ney can produce, since
+// the most common cause is simply that nothing has been indexed yet.
+//
+// Pure and total: every input combination yields a non-empty instruction.
+func noResultsGuidance(chunkCount, userRoots int, phaseARunning bool) string {
+	switch {
+	case phaseARunning:
+		return "Indexing is still running — retry in a few seconds, or poll index_status to see when it finishes."
+	case chunkCount == 0 && userRoots == 0:
+		return "Nothing is indexed on this machine yet. Ask the user which folder holds the notes " +
+			"they want searchable, then call index_folder on it. For a one-off lookup elsewhere, " +
+			"call search_folder instead. They can also run `ney init` in a terminal for guided setup."
+	case chunkCount == 0:
+		return "The served folders contain no indexable files yet (ney indexes .md, .markdown and .txt only). " +
+			"Ask the user where their notes actually live, then call index_folder or search_folder on that folder."
+	default:
+		return fmt.Sprintf("No match in the %d indexed folder(s). Ask the user WHERE the file might be "+
+			"(Downloads? Desktop? Documents? a project folder?) and call search_folder on that folder.", userRoots)
+	}
+}
+
 func filterExcludedItems(flt *pathfilter.Filter, roots []mcpRoot, items []searchResultItem) []searchResultItem {
+	// Resolved once for the whole result set, not once per item — see
+	// excludedForClient. An unresolvable home is passed through as "".
+	home, err := resolvedHomeDir()
+	if err != nil {
+		home = ""
+	}
 	out := items[:0]
 	for _, it := range items {
-		if excludedForClient(flt, roots, it.Path) {
+		if excludedForClient(flt, roots, home, it.Path) {
 			continue
 		}
 		out = append(out, it)
@@ -511,10 +561,6 @@ func indexFolderHandler(deps mcpDeps) mcp.ToolHandlerFor[indexFolderInput, index
 			}
 			return nil, indexFolderOutput{}, fmt.Errorf("index %s: %w", dir, ierr)
 		}
-		if deps.worker != nil {
-			deps.worker.Notify()
-		}
-
 		root := mcpRoot{Name: name, Path: dir}
 		deps.rs.add(root)
 		if deps.startWatcher != nil {
@@ -567,7 +613,15 @@ func underDir(base, p string) bool {
 // are evaluated from the root down, exactly as before. A path under neither
 // $HOME nor an internal root falls back to its containing root, preserving
 // the old behavior for workspaces elsewhere on disk.
-func excludedForClient(flt *pathfilter.Filter, roots []mcpRoot, p string) bool {
+//
+// home is the caller's already-resolved home directory ("" if it could not be
+// resolved, which just drops the from-$HOME base). It is a parameter rather
+// than something resolved here because this is called once per search result:
+// resolvedHomeDir walks every component of $HOME through EvalSymlinks, and
+// paying that up to maxSearchTopK times per query — plus once per live-scan
+// hit — is pure waste. A package-level cache would be the other option, but
+// tests set a fake HOME per test in one process and it would poison them.
+func excludedForClient(flt *pathfilter.Filter, roots []mcpRoot, home, p string) bool {
 	p = filepath.Clean(p)
 	base := ""
 	for _, r := range roots {
@@ -577,7 +631,7 @@ func excludedForClient(flt *pathfilter.Filter, roots []mcpRoot, p string) bool {
 		}
 	}
 	if base == "" {
-		if home, err := resolvedHomeDir(); err == nil && underDir(home, p) {
+		if home != "" && underDir(home, p) {
 			base = home
 		}
 	}
@@ -681,7 +735,11 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 		// Deny evaluated from $HOME down (see excludedForClient), not from the
 		// matched root: a root that itself sits under a denied component would
 		// otherwise never have that component re-examined.
-		if excludedForClient(flt, roots, resolved) {
+		home, herr := resolvedHomeDir()
+		if herr != nil {
+			home = ""
+		}
+		if excludedForClient(flt, roots, home, resolved) {
 			return nil, readDocumentOutput{}, fmt.Errorf("path is excluded by security policy (hidden or secret file): %s", in.Path)
 		}
 		// This tool advertises .md/.markdown/.txt and reads whatever it opens
@@ -716,7 +774,7 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 			maxChars = maxReadChars
 		}
 
-		full, source, err := readPlainTextFile(resolved, validated)
+		full, source, err := readPlainTextFile(resolved, validated, state)
 		if err != nil {
 			return nil, readDocumentOutput{}, err
 		}
@@ -744,7 +802,19 @@ func readDocumentHandler(app *AppState, rs *rootSet, flt *pathfilter.Filter, sta
 // (os.SameFile) — otherwise the thing we're about to read isn't the thing
 // that was approved, and we refuse. Everything after this (size cap, read)
 // goes through that same descriptor, never back through the path.
-func readPlainTextFile(resolved string, validated os.FileInfo) (content, source string, err error) {
+// cache, when non-nil, memoizes the last file read so a client paginating
+// through one document with offset_chars/max_chars doesn't re-read (and
+// re-scan) the whole thing on every window: a 20 MB file walked at the 50k
+// default is 400 calls, i.e. ~8 GB of I/O for one document. The cached entry
+// is only used when it names the same inode as validated, which is exactly
+// the check the uncached path performs below — so this trades no safety.
+func readPlainTextFile(resolved string, validated os.FileInfo, cache *serverState) (content, source string, err error) {
+	if cache != nil {
+		if data, ok := cache.cachedFile(resolved, validated); ok {
+			return data, "file", nil
+		}
+	}
+
 	f, err := os.Open(resolved)
 	if err != nil {
 		return "", "", fmt.Errorf("path not found: %s", resolved)
@@ -773,7 +843,13 @@ func readPlainTextFile(resolved string, validated os.FileInfo) (content, source 
 	if len(data) > maxReadFileSize {
 		return "", "", fmt.Errorf("file too large to read (max %d bytes)", maxReadFileSize)
 	}
-	return string(data), "file", nil
+
+	content = string(data)
+	if cache != nil {
+		// fi, not validated: it came from the descriptor actually read.
+		cache.putCachedFile(resolved, fi, content)
+	}
+	return content, "file", nil
 }
 
 // resolveDiscoveredPath resolves rawPath and returns it only if it is in the
@@ -891,11 +967,10 @@ func windowContent(full string, offset, maxChars int) (content string, total int
 // --- get_context / list_projects: shared project-set assembly ------------------
 
 type workspaceInfo struct {
-	Name          string  `json:"name"`
-	RootPath      string  `json:"root_path"`
-	Documents     int     `json:"documents"`
-	Chunks        int     `json:"chunks"`
-	EmbedCoverage float64 `json:"embed_coverage"`
+	Name      string `json:"name"`
+	RootPath  string `json:"root_path"`
+	Documents int    `json:"documents"`
+	Chunks    int    `json:"chunks"`
 }
 
 // buildProjects assembles the project set both get_context and list_projects
@@ -1042,8 +1117,7 @@ func listProjectsHandler(deps mcpDeps) mcp.ToolHandlerFor[listProjectsInput, lis
 		}
 		// list_projects doesn't surface EmbedCoverage (only Documents/Chunks
 		// are read below), so skip building the vector-ID set entirely — see
-		// computeWorkspaceInfo's withCoverage param.
-		wsInfo, err := computeWorkspaceInfo(deps.app, false)
+		wsInfo, err := computeWorkspaceInfo(deps.app)
 		if err != nil {
 			return nil, listProjectsOutput{}, err
 		}
@@ -1173,30 +1247,12 @@ func updateProfileHandler() mcp.ToolHandlerFor[updateProfileInput, updateProfile
 }
 
 // computeWorkspaceInfo builds document/chunk counts per workspace via
-// SELECT COUNT(*) (internal/store/counts.go) instead of loading full
-// document rows or chunk-ID slices just to take len() of them.
-//
-// When withCoverage is false (list_projects, which never reads
-// EmbedCoverage from its output), counting is all that happens — no vector
-// IDs are touched. When withCoverage is true (index_status, which reports
-// "N% embedded"), app.Vectors.IDs() is fetched exactly once and reused as an
-// in-memory set for every workspace's diff against its chunk IDs, per the
-// design's "build vector ID set once per call; fine at current scale" note —
-// avoiding an O(workspaces) number of full vector-store scans. Computing
-// exact coverage still needs the actual chunk IDs (to diff against vector
-// IDs), so that part falls back to GetChunkIDsByWorkspace regardless.
-func computeWorkspaceInfo(app *AppState, withCoverage bool) ([]workspaceInfo, error) {
+// aggregate COUNT queries, so neither caller materializes document rows or
+// chunk-ID slices just to take len() of them.
+func computeWorkspaceInfo(app *AppState) ([]workspaceInfo, error) {
 	workspaces, err := app.DB.ListWorkspaces()
 	if err != nil {
 		return nil, err
-	}
-
-	var vecIDs map[string]bool
-	if withCoverage {
-		vecIDs = make(map[string]bool, app.Vectors.Count())
-		for _, id := range app.Vectors.IDs() {
-			vecIDs[id] = true
-		}
 	}
 
 	out := make([]workspaceInfo, 0, len(workspaces))
@@ -1205,33 +1261,16 @@ func computeWorkspaceInfo(app *AppState, withCoverage bool) ([]workspaceInfo, er
 		if err != nil {
 			return nil, err
 		}
-
-		info := workspaceInfo{Name: ws.Name, RootPath: ws.RootPath, Documents: docCount}
-		if withCoverage {
-			chunkIDs, err := app.DB.GetChunkIDsByWorkspace(ws.ID)
-			if err != nil {
-				return nil, err
-			}
-			coverage := 0.0
-			if len(chunkIDs) > 0 {
-				embedded := 0
-				for _, id := range chunkIDs {
-					if vecIDs[strconv.FormatInt(id, 10)] {
-						embedded++
-					}
-				}
-				coverage = float64(embedded) / float64(len(chunkIDs))
-			}
-			info.Chunks = len(chunkIDs)
-			info.EmbedCoverage = coverage
-		} else {
-			chunkCount, err := app.DB.CountChunksByWorkspace(ws.ID)
-			if err != nil {
-				return nil, err
-			}
-			info.Chunks = chunkCount
+		chunkCount, err := app.DB.CountChunksByWorkspace(ws.ID)
+		if err != nil {
+			return nil, err
 		}
-		out = append(out, info)
+		out = append(out, workspaceInfo{
+			Name:      ws.Name,
+			RootPath:  ws.RootPath,
+			Documents: docCount,
+			Chunks:    chunkCount,
+		})
 	}
 	return out, nil
 }
@@ -1240,39 +1279,24 @@ func computeWorkspaceInfo(app *AppState, withCoverage bool) ([]workspaceInfo, er
 
 type indexStatusInput struct{}
 
-type embedderStatus struct {
-	Configured bool   `json:"configured"`
-	Model      string `json:"model,omitempty"`
-}
-
-type embeddingStatus struct {
-	State string `json:"state"` // idle | running | backoff | blocked_mismatch | disabled
-	Done  int    `json:"done"`
-	Total int    `json:"total"`
-}
-
 type indexStatusOutput struct {
 	// Mode is "read-write" normally, or "read-only" when another ney process
 	// held the writer lock at startup — in read-only mode this server never
-	// indexes, embeds, or watches, and serves the index as of startup.
+	// indexes or watches, and serves the index as of startup.
 	Mode          string          `json:"mode"`
 	Workspaces    []workspaceInfo `json:"workspaces"`
-	Embedder      embedderStatus  `json:"embedder"`
-	Embedding     embeddingStatus `json:"embedding"`
 	PhaseARunning []string        `json:"phase_a_running"`
 	Watching      bool            `json:"watching"`
+	// NextStep is set only when no folder is indexed yet, so a client that
+	// polls index_status on a fresh install learns what to do about it.
+	NextStep string `json:"next_step,omitempty"`
 }
 
-func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, worker *index.EmbedWorker) mcp.ToolHandlerFor[indexStatusInput, indexStatusOutput] {
+func indexStatusHandler(app *AppState, state *serverState) mcp.ToolHandlerFor[indexStatusInput, indexStatusOutput] {
 	return func(_ context.Context, _ *mcp.CallToolRequest, _ indexStatusInput) (*mcp.CallToolResult, indexStatusOutput, error) {
-		infos, err := computeWorkspaceInfo(app, true)
+		infos, err := computeWorkspaceInfo(app)
 		if err != nil {
 			return nil, indexStatusOutput{}, err
-		}
-
-		embed := embedderStatus{Configured: cfg.HasEmbedder()}
-		if embed.Configured {
-			embed.Model = cfg.Embedder.Model
 		}
 
 		mode := "read-write"
@@ -1282,42 +1306,35 @@ func indexStatusHandler(app *AppState, cfg *config.Config, state *serverState, w
 		out := indexStatusOutput{
 			Mode:          mode,
 			Workspaces:    infos,
-			Embedder:      embed,
-			Embedding:     embeddingStatusFor(cfg, worker),
 			PhaseARunning: state.runningRoots(),
 			Watching:      state.isWatching(),
+		}
+		// Not len(infos) == 0: runMCP always registers ~/.ney/memory as a
+		// workspace, so there is never zero. "Nothing indexed" means no
+		// chunks anywhere.
+		totalChunks := 0
+		for _, w := range infos {
+			totalChunks += w.Chunks
+		}
+		if totalChunks == 0 {
+			out.NextStep = "No folders are indexed yet. Ask the user which folder to make searchable and " +
+				"call index_folder on it, or use search_folder for a one-off lookup. They can also run " +
+				"`ney init` in a terminal for guided setup."
 		}
 
 		var b strings.Builder
 		fmt.Fprintf(&b, "mode: %s\n", mode)
-		fmt.Fprintf(&b, "embedder: configured=%v", embed.Configured)
-		if embed.Model != "" {
-			fmt.Fprintf(&b, " model=%s", embed.Model)
-		}
-		fmt.Fprintf(&b, "\nembedding: state=%s done=%d total=%d\n", out.Embedding.State, out.Embedding.Done, out.Embedding.Total)
 		fmt.Fprintf(&b, "watching: %v\n", out.Watching)
 		if len(out.PhaseARunning) > 0 {
 			fmt.Fprintf(&b, "phase A still running for: %s\n", strings.Join(out.PhaseARunning, ", "))
 		}
 		for _, w := range infos {
-			fmt.Fprintf(&b, "- %s: %d documents, %d chunks, %.0f%% embedded\n", w.Name, w.Documents, w.Chunks, w.EmbedCoverage*100)
+			fmt.Fprintf(&b, "- %s: %d documents, %d chunks\n", w.Name, w.Documents, w.Chunks)
+		}
+		if out.NextStep != "" {
+			b.WriteString(out.NextStep + "\n")
 		}
 
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, out, nil
 	}
-}
-
-// embeddingStatusFor reports the embed worker's state, or a fixed "disabled"
-// (0/0) status when no embedder is configured at all — in that case there is
-// no worker instance to poll (runMCP never constructs one).
-func embeddingStatusFor(cfg *config.Config, worker *index.EmbedWorker) embeddingStatus {
-	if worker == nil || !cfg.HasEmbedder() {
-		return embeddingStatus{State: index.WorkerStateDisabled}
-	}
-	s := worker.Status()
-	state := s.State
-	if state == "" {
-		state = index.WorkerStateIdle
-	}
-	return embeddingStatus{State: state, Done: s.Done, Total: s.Total}
 }

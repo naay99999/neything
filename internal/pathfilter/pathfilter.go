@@ -12,6 +12,7 @@
 package pathfilter
 
 import (
+	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,25 @@ func (f *Filter) matches(name string) bool {
 		}
 	}
 	return false
+}
+
+// ExcludedMode reports whether a directory entry's file *type* is denied,
+// independently of its name. Only regular files are ever opened.
+//
+// Every other rule in this package matches on a name, and a name says nothing
+// about what is actually behind it. A symlink called readme.md passes
+// ExcludedFile, passes the supported-extension check, and reports the link's
+// own (tiny) size via DirEntry.Info — and then os.ReadFile follows it. That is
+// enough to get ~/.ssh/id_rsa chunked into the index and returned as a search
+// snippet. A named pipe is the other half of the problem: opening one for
+// reading blocks until some process opens it for writing, so a FIFO called
+// notes.md inside a watched folder wedges an indexing pass indefinitely.
+// Sockets and devices are equally meaningless to index.
+//
+// Callers must apply this only to non-directory entries — directories are not
+// regular files either, and their traversal is governed by ExcludedDir.
+func ExcludedMode(mode fs.FileMode) bool {
+	return !mode.IsRegular()
 }
 
 // ExcludedFile reports whether a file with this basename is denied:

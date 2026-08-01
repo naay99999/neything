@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/discover"
@@ -25,14 +26,8 @@ var initCmd = &cobra.Command{
 	},
 }
 
-const (
-	defaultOllamaEndpoint   = "http://localhost:11434"
-	defaultLMStudioEndpoint = "http://localhost:1234"
-)
-
-type wizardChoice struct {
-	embedProvider, embedModel, embedEndpoint string
-}
+// isInteractive is a var so tests can drive the wizard's TTY guard.
+var isInteractive = func() bool { return isatty.IsTerminal(os.Stdin.Fd()) }
 
 // setupCompleted reports whether this machine has been through setup: either
 // the wizard finished once (meta key) or workspaces already exist (installs
@@ -55,12 +50,20 @@ func setupCompleted() bool {
 // is idempotent and skippable; setup_completed is recorded only at the end,
 // so an interrupted run simply offers itself again next time.
 func runSetupWizard(ctx context.Context) error {
-	fmt.Println(Bold("Ney setup — ให้ AI ของคุณรู้จักโปรเจกต์และค้นเอกสารในเครื่องได้อย่างปลอดภัย"))
-	fmt.Println(Dim("Enter = ค่าเริ่มต้น, Ctrl+C = ยกเลิก (รัน `ney init` ซ้ำได้เสมอ)"))
+	// Every step of the wizard is a prompt, so there is no useful
+	// non-interactive behaviour. Refusing outright also means an EOF stdin
+	// can never accept a default that writes to an AI client's config.
+	if !isInteractive() {
+		return fmt.Errorf("`ney init` is interactive — run it from a terminal (stdin is not a TTY).\n" +
+			"To index a folder non-interactively, use: ney index <path>")
+	}
+
+	fmt.Println(Bold("Ney setup — let your AI know your projects and search your local documents, safely"))
+	fmt.Println(Dim("Enter = accept the default, Ctrl+C = cancel (you can rerun `ney init` any time)"))
 	fmt.Println()
 
-	// Loaded early (and reloaded after writeSetupConfig) because step 1
-	// needs cfg.Context.DevRoots to know where to scan for repos.
+	// Loaded early because step 1 needs cfg.Context.DevRoots to know where to
+	// scan for repos.
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -72,18 +75,15 @@ func runSetupWizard(ctx context.Context) error {
 
 	stepClients()
 
-	w := stepEmbedder()
-
-	if err := writeSetupConfig(w, devRoot); err != nil {
-		return err
-	}
-	cfg, err = config.Load()
-	if err != nil {
-		return err
-	}
-	if w != nil {
-		testEmbedder(cfg)
-		offerResetOnModelChange(ctx, cfg, w)
+	// The only config.yaml write the wizard makes. Non-fatal: the user has
+	// already picked their repos, and a failed config write shouldn't throw
+	// that away.
+	if devRoot != "" {
+		if err := config.SetDevRoots([]string{devRoot}); err != nil {
+			fmt.Println(Yellow("  Could not save that folder to config.yaml: " + err.Error()))
+		} else if cfg, err = config.Load(); err != nil {
+			return err
+		}
 	}
 
 	indexed := indexSelected(ctx, cfg, selected)
@@ -94,13 +94,15 @@ func runSetupWizard(ctx context.Context) error {
 	}
 
 	fmt.Println()
-	fmt.Println(Bold("✓ Setup เสร็จแล้ว"))
+	fmt.Println(Bold("✓ Setup complete"))
 	if indexed > 0 {
-		fmt.Printf("  index แล้ว %d repo — เปิด Claude/Codex แล้วถามหาไฟล์หรือถามความคืบหน้าโปรเจกต์ได้เลย\n", indexed)
+		fmt.Printf("  Indexed %d folder(s) — open Claude or Codex and ask about your files, or ask what you were working on.\n", indexed)
 	}
-	fmt.Println(Dim("  เพิ่ม/แก้ทีหลัง: รัน `ney init` อีกครั้ง หรือบอก AI ว่า \"index โฟลเดอร์นี้ให้หน่อย\""))
+	fmt.Println(Dim("  Add or change folders later: rerun `ney init`, or just tell your AI \"index this folder\"."))
 	fmt.Println()
-	fmt.Println(Dim("  Memory: บอก AI ว่า \"จำไว้ว่า...\" แล้วมันจะเซฟเป็นไฟล์ที่ " + displayPath(memoryDir()) + " — ค้นเจอผ่าน search_documents ได้ในไม่กี่วินาที (แก้ profile ได้ตรงๆ ที่ " + displayPath(filepath.Join(config.NeyDir(), "profile.md")) + " เมื่อไหร่ก็ได้)"))
+	fmt.Println(Dim("  Memory: tell your AI \"remember that ...\" and it saves a file under " + displayPath(memoryDir()) +
+		" — searchable via search_documents within seconds. Edit your profile any time at " +
+		displayPath(filepath.Join(config.NeyDir(), "profile.md")) + "."))
 	return nil
 }
 
@@ -112,18 +114,18 @@ func runSetupWizard(ctx context.Context) error {
 // user provides one, devRootToPersist is returned non-empty so the caller
 // writes it into config.yaml (otherwise it would be re-asked every run).
 func stepRepos(ctx context.Context, cfg *config.Config) (selected []string, devRootToPersist string) {
-	fmt.Println(Bold("[1/4] สแกนหา repo ในเครื่อง (git repositories)"))
+	fmt.Println(Bold("[1/3] Scanning for git repositories on this machine"))
 
 	roots := cfg.Context.DevRoots
 	if len(roots) == 0 {
-		fmt.Println(Dim("      ยังไม่ได้ตั้งค่าโฟลเดอร์เก็บโปรเจกต์ (context.dev_roots) และไม่พบ ~/workspace"))
-		line := promptLine(Cyan("      พิมพ์ path โฟลเดอร์ที่เก็บ repo ต่างๆ (เช่น ~/code, Enter=ข้าม): "))
+		fmt.Println(Dim("      No project folder configured (context.dev_roots), and no ~/workspace found."))
+		line := promptLine(Cyan("      Path to the folder holding your repos (e.g. ~/code, Enter to skip): "))
 		if line = strings.TrimSpace(line); line != "" {
 			abs, err := filepath.Abs(expandTilde(line))
 			if err != nil {
-				fmt.Println(Yellow("      ข้าม: path ไม่ถูกต้อง"))
+				fmt.Println(Yellow("      Skipped: not a valid path"))
 			} else if fi, statErr := os.Stat(abs); statErr != nil || !fi.IsDir() {
-				fmt.Println(Yellow("      ข้าม: ไม่พบโฟลเดอร์นี้"))
+				fmt.Println(Yellow("      Skipped: no such folder"))
 			} else {
 				roots = []string{abs}
 				devRootToPersist = abs
@@ -131,30 +133,30 @@ func stepRepos(ctx context.Context, cfg *config.Config) (selected []string, devR
 		}
 	}
 	if len(roots) == 0 {
-		fmt.Println(Dim("      ข้ามการสแกน repo — ตั้งค่า context.dev_roots ใน config.yaml แล้วรัน `ney init` ใหม่ได้ทีหลัง"))
+		fmt.Println(Dim("      Skipping the repo scan — set context.dev_roots in config.yaml and rerun `ney init` later."))
 		return nil, devRootToPersist
 	}
 
 	cands, err := discover.Discover(ctx, discover.Options{Roots: roots}, func(scanned int) {
-		fmt.Fprintf(os.Stderr, "\r      สแกนแล้ว %d repo...", scanned)
+		fmt.Fprintf(os.Stderr, "\r      scanned %d repo(s)...", scanned)
 	})
 	fmt.Fprint(os.Stderr, "\r\033[K")
 	if err != nil {
-		fmt.Println(Yellow("      สแกน repo ไม่สำเร็จ: " + err.Error()))
+		fmt.Println(Yellow("      Repo scan failed: " + err.Error()))
 		return nil, devRootToPersist
 	}
 
 	if len(cands) == 0 {
-		fmt.Println("      ไม่พบ git repo ใน " + strings.Join(displayPaths(roots), ", ") + " — พิมพ์ path เองได้ด้านล่าง")
+		fmt.Println("      No git repos found in " + strings.Join(displayPaths(roots), ", ") + " — you can type a path below.")
 	} else {
-		fmt.Println("      พบ repo:")
+		fmt.Println("      Found:")
 		for i, c := range cands {
 			fmt.Printf("      [%d] %-24s %-40s %s\n", i+1, c.Name, Dim(displayPath(c.Path)),
-				Dim(fmt.Sprintf("%d ไฟล์ · commit ล่าสุด %s", c.DocCount, relativeAge(c.LastCommit))))
+				Dim(fmt.Sprintf("%d files · last commit %s", c.DocCount, relativeAge(c.LastCommit))))
 		}
 	}
-	fmt.Println(Dim("      เลือกที่จะให้ AI ค้นได้ เช่น 1,3 / a=ทั้งหมด / พิมพ์ path เพิ่มเองก็ได้ / Enter=ข้าม"))
-	line := promptLine(Cyan("      เลือก: "))
+	fmt.Println(Dim("      Pick what your AI may search, e.g. 1,3 / a=all / type a path to add one / Enter=skip"))
+	line := promptLine(Cyan("      Select: "))
 
 	indices, unknown := parseSelection(line, len(cands))
 	for _, idx := range indices {
@@ -163,16 +165,16 @@ func stepRepos(ctx context.Context, cfg *config.Config) (selected []string, devR
 	for _, raw := range unknown {
 		abs, err := filepath.Abs(expandTilde(raw))
 		if err != nil {
-			fmt.Println(Yellow("      ข้าม " + raw + ": path ไม่ถูกต้อง"))
+			fmt.Println(Yellow("      Skipped " + raw + ": not a valid path"))
 			continue
 		}
 		fi, err := os.Stat(abs)
 		if err != nil || !fi.IsDir() {
-			fmt.Println(Yellow("      ข้าม " + raw + ": ไม่พบโฟลเดอร์นี้"))
+			fmt.Println(Yellow("      Skipped " + raw + ": no such folder"))
 			continue
 		}
 		if strings.HasPrefix(abs, "/Volumes/") {
-			fmt.Println(Yellow("      หมายเหตุ: " + raw + " อยู่บน external drive — ถ้าถอดไดรฟ์ ไฟล์ชุดนี้จะหายจากผลค้นจนกว่าจะเสียบและ index ใหม่"))
+			fmt.Println(Yellow("      Note: " + raw + " is on an external drive — unplug it and these files drop out of search results until it's reconnected and re-indexed."))
 		}
 		selected = append(selected, abs)
 	}
@@ -223,32 +225,32 @@ func relativeAge(t time.Time) string {
 // file is user-owned from then on (AI edits it via update_profile).
 func stepProfile() {
 	fmt.Println()
-	fmt.Println(Bold("[2/4] ตั้งค่า profile (~/.ney/profile.md)"))
+	fmt.Println(Bold("[2/3] Setting up your profile (~/.ney/profile.md)"))
 
 	profilePath := filepath.Join(config.NeyDir(), "profile.md")
 	if _, err := os.Stat(profilePath); err == nil {
-		fmt.Println(Dim("      พบ profile.md อยู่แล้ว — ข้าม (แก้เองได้ตรงๆ หรือให้ AI แก้ผ่าน update_profile)"))
+		fmt.Println(Dim("      profile.md already exists — skipping (edit it directly, or let your AI update it via update_profile)"))
 		return
 	}
 
 	if _, _, err := neycontext.LoadProfile(profilePath); err != nil {
-		fmt.Println(Yellow("      สร้าง profile.md ไม่สำเร็จ: " + err.Error()))
+		fmt.Println(Yellow("      Could not create profile.md: " + err.Error()))
 		return
 	}
 
-	fmt.Println(Dim("      ตอบสั้นๆ ได้เลย (Enter = ข้ามข้อนั้น) — แก้เพิ่มทีหลังได้ที่ " + displayPath(profilePath)))
+	fmt.Println(Dim("      Short answers are fine (Enter skips a question) — edit later at " + displayPath(profilePath)))
 
-	if ans := promptLine(Cyan("      คุณเป็นใคร ทำงานอะไร: ")); strings.TrimSpace(ans) != "" {
+	if ans := promptLine(Cyan("      Who are you, and what do you do? ")); strings.TrimSpace(ans) != "" {
 		_ = neycontext.UpdateProfile(profilePath, "Name & role", ans, false)
 	}
-	if ans := promptLine(Cyan("      ตอนนี้กำลังโฟกัสอะไรอยู่: ")); strings.TrimSpace(ans) != "" {
+	if ans := promptLine(Cyan("      What are you focused on right now? ")); strings.TrimSpace(ans) != "" {
 		_ = neycontext.UpdateProfile(profilePath, "Current focus", ans, false)
 	}
-	if ans := promptLine(Cyan("      สไตล์การทำงาน/สิ่งที่อยากให้ AI รู้ไว้: ")); strings.TrimSpace(ans) != "" {
+	if ans := promptLine(Cyan("      Working style / anything your AI should know? ")); strings.TrimSpace(ans) != "" {
 		_ = neycontext.UpdateProfile(profilePath, "Working style", ans, false)
 	}
 
-	fmt.Println(Green("      ✓ บันทึก profile.md แล้ว"))
+	fmt.Println(Green("      ✓ Saved profile.md"))
 }
 
 // parseSelection parses the folder-picker input: comma/space-separated
@@ -286,32 +288,26 @@ func parseSelection(line string, n int) (indices []int, paths []string) {
 
 func stepClients() {
 	fmt.Println()
-	fmt.Println(Bold("[3/4] เชื่อมกับ AI clients"))
+	fmt.Println(Bold("[3/3] Connecting your AI clients"))
 
-	neyBin, err := os.Executable()
-	if err == nil {
-		neyBin, _ = filepath.EvalSymlinks(neyBin)
-	}
-	if neyBin == "" {
-		neyBin = "ney"
-	}
+	neyBin := resolveNeyBinary()
 
 	for _, c := range detectClients(neyBin) {
 		if !c.Detected {
-			fmt.Printf("      ✗ %s — ไม่พบในเครื่อง (วิธีเพิ่มเองทีหลัง:)\n", c.Name)
+			fmt.Printf("      ✗ %s — not found (to add it yourself later:)\n", c.Name)
 			fmt.Println(Dim(indentLines(c.Manual, "        ")))
 			continue
 		}
-		ans := strings.ToLower(promptDefault(fmt.Sprintf("      ✓ พบ %s — ลงทะเบียน ney ไหม? (y/n)", c.Name), "y"))
+		ans := strings.ToLower(promptDefault(fmt.Sprintf("      ✓ Found %s — register ney with it? (y/n)", c.Name), "y"))
 		if !strings.HasPrefix(ans, "y") {
-			fmt.Println(Dim("        ข้าม"))
+			fmt.Println(Dim("        Skipped"))
 			continue
 		}
 		if err := c.Register(); err != nil {
-			fmt.Println(Yellow("        ลงทะเบียนไม่สำเร็จ: " + err.Error()))
+			fmt.Println(Yellow("        Registration failed: " + err.Error()))
 			continue
 		}
-		fmt.Println(Green("        ✓ ลงทะเบียนแล้ว (restart " + c.Name + " เพื่อให้มีผล)"))
+		fmt.Println(Green("        ✓ Registered (restart " + c.Name + " to apply)"))
 	}
 }
 
@@ -323,242 +319,27 @@ func indentLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-// --- step 4: optional embedder --------------------------------------------------
+// --- prompt helpers -------------------------------------------------------------
 
-func stepEmbedder() *wizardChoice {
-	fmt.Println()
-	fmt.Println(Bold("[4/4] Semantic search (optional)"))
-	fmt.Println(Dim("      ค้นเชิงความหมายด้วย embedding model ในเครื่อง (Ollama/LM Studio) หรือ cloud"))
-	fmt.Println(Dim("      ไม่ตั้งก็ใช้ได้เต็มรูปแบบ — ค้นแบบ keyword ทำงานในเครื่อง 100%"))
-	ans := promptLine(Cyan("      ตั้งค่าเลยไหม? [Enter=ข้าม / y=ตั้งค่า] "))
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ans)), "y") {
-		return nil
-	}
-
-	ollamaModels := listOllamaModels(defaultOllamaEndpoint)
-	lmModels := listOpenAICompatModels(defaultLMStudioEndpoint)
-
-	fmt.Printf("      [1] Ollama on this machine%s\n", detectedNote(len(ollamaModels)))
-	fmt.Printf("      [2] LM Studio / OpenAI-compatible server (local or remote)%s\n", detectedNote(len(lmModels)))
-	fmt.Printf("      [3] Cloud APIs (OpenAI, Gemini)\n")
-
-	def := "3"
-	switch {
-	case len(ollamaModels) > 0:
-		def = "1"
-	case len(lmModels) > 0:
-		def = "2"
-	}
-
-	var w wizardChoice
-	var err error
-	switch promptDefault("      Choice", def) {
-	case "1":
-		err = wizardOllama(&w, ollamaModels)
-	case "2":
-		err = wizardLMStudio(&w, lmModels)
-	case "3":
-		err = wizardCloud(&w)
-	default:
-		err = fmt.Errorf("pick 1, 2, or 3")
-	}
-	if err != nil {
-		fmt.Println(Yellow("      ข้าม semantic search: " + err.Error()))
-		return nil
-	}
-	return &w
-}
-
-func detectedNote(n int) string {
-	if n == 0 {
-		return ""
-	}
-	return Green(fmt.Sprintf("   ← detected, %d model(s)", n))
-}
-
-func wizardOllama(w *wizardChoice, models []string) error {
-	endpoint := defaultOllamaEndpoint
-	if len(models) == 0 {
-		endpoint = normalizeEndpoint(promptDefault("Ollama URL", defaultOllamaEndpoint))
-		models = listOllamaModels(endpoint)
-		if len(models) == 0 {
-			return fmt.Errorf("no Ollama server (or no models) at %s — run `ollama serve` and `ollama pull bge-m3`, then rerun ney init", endpoint)
-		}
-	}
-
-	embedModel, err := pickModels(models)
-	if err != nil {
-		return err
-	}
-	w.embedProvider, w.embedModel, w.embedEndpoint = "ollama", embedModel, endpoint
-	return nil
-}
-
-func wizardLMStudio(w *wizardChoice, localModels []string) error {
-	def := defaultLMStudioEndpoint
-	endpoint := normalizeEndpoint(promptDefault("Server URL (e.g. http://192.168.1.150:1234)", def))
-
-	models := localModels
-	if endpoint != defaultLMStudioEndpoint || len(models) == 0 {
-		sp := startSpinner("checking " + endpoint)
-		models = listOpenAICompatModels(endpoint)
-		sp.Stop()
-	}
-	if len(models) == 0 {
-		return fmt.Errorf("no OpenAI-compatible server responding at %s/v1/models — is LM Studio running with its server enabled?", endpoint)
-	}
-	fmt.Printf("%s reachable, %d model(s)\n", Green("✓ "+endpoint), len(models))
-
-	embedModel, err := pickModels(models)
-	if err != nil {
-		return err
-	}
-	w.embedProvider, w.embedModel, w.embedEndpoint = "lmstudio", embedModel, endpoint
-	return nil
-}
-
-// pickModels lists the server's models and lets the user pick an embedding
-// model, preselecting a sensible default by name.
-func pickModels(models []string) (embedModel string, err error) {
-	fmt.Println("\nModels on the server:")
-	for i, m := range models {
-		fmt.Printf("  [%d] %s\n", i+1, m)
-	}
-
-	embedDef := ""
-	for _, m := range models {
-		if looksLikeEmbedder(m) {
-			embedDef = m
-			break
-		}
-	}
-
-	if embedDef == "" {
-		fmt.Println(Yellow("⚠ No embedding model detected — load one (e.g. nomic-embed-text / bge-m3) and pick it below."))
-	}
-	embedModel = promptModel("Embedding model (number or name)", models, embedDef)
-	if embedModel == "" {
-		return "", fmt.Errorf("an embedding model is required")
-	}
-	return embedModel, nil
-}
-
-func wizardCloud(w *wizardChoice) error {
-	fmt.Println("\nEmbedding provider (Claude has no embedding API):")
-	fmt.Println("  [1] OpenAI  (text-embedding-3-small)")
-	fmt.Println("  [2] Gemini  (text-embedding-004)")
-	switch promptDefault("Choice", "1") {
-	case "2":
-		w.embedProvider, w.embedModel = "gemini", "text-embedding-004"
-		warnMissingKey("GEMINI_API_KEY")
-	default:
-		w.embedProvider, w.embedModel = "openai", "text-embedding-3-small"
-		warnMissingKey("OPENAI_API_KEY")
-	}
-	return nil
-}
-
-func warnMissingKey(envVar string) {
-	if os.Getenv(envVar) == "" {
-		fmt.Println(Yellow(fmt.Sprintf("⚠ %s is not set — export it before indexing.", envVar)))
-	}
-}
-
-func looksLikeEmbedder(model string) bool {
-	m := strings.ToLower(model)
-	for _, marker := range []string{"embed", "bge", "minilm", "e5-", "gte-"} {
-		if strings.Contains(m, marker) {
-			return true
-		}
-	}
-	return false
-}
-
+// promptDefault asks question, falling back to def when the user just presses
+// Enter. At EOF it returns "" rather than def: an exhausted stdin is not
+// consent, and this function gates writes into AI-client config files.
 func promptDefault(question, def string) string {
 	label := question
 	if def != "" {
 		label += " [" + def + "]"
 	}
 	ans := promptLine(Cyan(label + ": "))
+	if stdinEOF {
+		return ""
+	}
 	if ans == "" {
 		return def
 	}
 	return ans
 }
 
-func promptModel(question string, models []string, def string) string {
-	ans := promptDefault(question, def)
-	if n, err := strconv.Atoi(ans); err == nil && n >= 1 && n <= len(models) {
-		return models[n-1]
-	}
-	return ans
-}
-
-func normalizeEndpoint(s string) string {
-	s = strings.TrimRight(strings.TrimSpace(s), "/")
-	if s != "" && !strings.Contains(s, "://") {
-		s = "http://" + s
-	}
-	return s
-}
-
 // --- config write + final indexing ---------------------------------------------
-
-// writeSetupConfig writes ~/.ney/config.yaml from the wizard's choices,
-// backing up any existing config first. embedder may be nil (keyword-only).
-// devRoot, when non-empty, is a dev root the user typed during step 1
-// (because context.dev_roots was unset and ~/workspace didn't exist) — it
-// is persisted as context.dev_roots so the wizard doesn't ask again and
-// get_context/list_projects pick it up.
-func writeSetupConfig(w *wizardChoice, devRoot string) error {
-	if err := os.MkdirAll(config.NeyDir(), 0o700); err != nil {
-		return err
-	}
-	cfgPath := config.ConfigPath()
-	if data, err := os.ReadFile(cfgPath); err == nil {
-		if err := os.WriteFile(cfgPath+".bak", data, 0o600); err != nil {
-			return fmt.Errorf("backup existing config: %w", err)
-		}
-		fmt.Println(Dim("(previous config saved as config.yaml.bak)"))
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "# Ney configuration — generated by `ney init` on %s\n\n", time.Now().Format("2006-01-02"))
-	fmt.Fprintf(&b, "# embedder: creates vectors for semantic search (openai | gemini | ollama | lmstudio — never claude)\n")
-	if w != nil {
-		fmt.Fprintf(&b, "embedder:\n  provider: %s\n  model: %s\n", w.embedProvider, w.embedModel)
-		if w.embedEndpoint != "" {
-			fmt.Fprintf(&b, "  endpoint: %s\n", w.embedEndpoint)
-		}
-	} else {
-		b.WriteString("embedder:\n  provider: none            # keyword-only — run `ney init` to enable semantic search\n")
-	}
-	b.WriteString(`
-retrieval:
-  top_k: 8
-  rerank: false
-  mode: auto                # auto | semantic | keyword | hybrid
-
-# indexing — extra exclude patterns on top of the built-in secret/dotfile deny
-index:
-  exclude: []
-
-chunking:
-  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
-  target_chars: 1200
-  overlap_chars: 150
-`)
-	if devRoot != "" {
-		fmt.Fprintf(&b, "\n# layered context (get_context / list_projects): where to look for git repos\ncontext:\n  dev_roots: [%q]\n", devRoot)
-	}
-	b.WriteString("\n# privacy — off by default\ntelemetry: false\n")
-
-	if err := os.WriteFile(cfgPath, []byte(b.String()), 0o600); err != nil {
-		return err
-	}
-	fmt.Println(Green("✓ Config written to " + displayPath(cfgPath)))
-	return nil
-}
 
 // indexSelected indexes each chosen folder as a workspace (Phase A). Returns
 // how many were indexed. A held writer lock (e.g. an AI client's `ney mcp`
@@ -577,13 +358,12 @@ func indexSelected(ctx context.Context, cfg *config.Config, folders []string) in
 	}
 	defer lock.Release()
 
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		printCLIError(err)
 		return 0
 	}
 	defer app.DB.Close()
-	defer app.Vectors.Close()
 
 	ix, err := newIndexer(app, cfg)
 	if err != nil {
@@ -616,60 +396,4 @@ func workspaceNameFor(db *store.DB, resolvedRoot string) string {
 		name = name + "-" + filepath.Base(filepath.Dir(resolvedRoot))
 	}
 	return name
-}
-
-func testEmbedder(cfg *config.Config) {
-	sp := startSpinner("testing embedder")
-	emb, err := config.NewEmbedder(cfg)
-	var dims int
-	if err == nil {
-		var vecs [][]float32
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		vecs, err = emb.Embed(ctx, []string{"ney setup probe"})
-		if err == nil && len(vecs) > 0 {
-			dims = len(vecs[0])
-		}
-	}
-	sp.Stop()
-	if err != nil {
-		printCLIError(fmt.Errorf("embedder test failed: %w", err))
-		fmt.Println(Yellow("Config was written anyway — fix the issue and check with: ney doctor"))
-		return
-	}
-	fmt.Println(Green(fmt.Sprintf("✓ Embedder works (%d dimensions)", dims)))
-}
-
-// offerResetOnModelChange catches the switch-embedder trap: an existing index
-// built with a different model would make the next `ney index` refuse to run.
-func offerResetOnModelChange(ctx context.Context, cfg *config.Config, w *wizardChoice) {
-	db, err := store.Open(config.DBPath())
-	if err != nil {
-		return
-	}
-	defer db.Close()
-	stats, err := db.Stats()
-	if err != nil || stats == nil || stats.ChunkCount == 0 {
-		return
-	}
-	active, err := db.GetActiveEmbedder()
-	if err != nil || active == nil {
-		return
-	}
-	if !strings.Contains(active.Name, w.embedModel) {
-		fmt.Println(Yellow("⚠ Your existing index was built with a different embedding model."))
-		ans := strings.ToLower(promptDefault("Reset the index now (re-index afterwards)? (y/n)", "y"))
-		if ans == "" || strings.HasPrefix(ans, "y") {
-			if err := db.DeleteAllData(); err != nil {
-				printCLIError(err)
-				return
-			}
-			os.Remove(config.VectorsPath())
-			os.Remove(config.HNSWPath())
-			os.Remove(config.HNSWPath() + ".graph")
-			fmt.Println(Green("✓ Index cleared — run: ney index <path>"))
-		} else {
-			fmt.Println(Dim("Left as-is. `ney index` will refuse until you run: ney reset"))
-		}
-	}
 }

@@ -8,7 +8,7 @@ The daily loop: at the start of a session, your AI calls `get_context` and insta
 claude mcp add ney -- ney mcp
 ```
 
-Or better: just install and type `ney` — the **setup wizard** scans your dev folders for git repos, lets you pick which to index, bootstraps your profile (`~/.ney/profile.md`) with a couple of quick questions, and registers ney with your AI clients (Claude Desktop, Claude Code, Codex) automatically. Zero configuration required: no model server, no API key. Keyword search works the moment the server starts; add a local embedder later (`ney init`) for semantic search.
+Or better: just install and type `ney` — the **setup wizard** scans your dev folders for git repos, lets you pick which to index, bootstraps your profile (`~/.ney/profile.md`) with a couple of quick questions, and registers ney with your AI clients (Claude Desktop, Claude Code, Codex) automatically. Zero configuration, permanently: no model server, no API key, nothing to tune. Search is keyword (SQLite FTS5) and runs the moment the server starts.
 
 ---
 
@@ -30,11 +30,11 @@ No "let me look around the repo first", no re-pasting context you already gave i
 
 > **You:** how much did we charge for invoice order-1233?
 >
-> *AI calls `search_documents("order-1233")` → hybrid keyword + semantic across every indexed workspace*
+> *AI calls `search_documents("order-1233")` → keyword search (FTS5) across every indexed workspace*
 >
 > **AI:** 4,200 THB, paid by Alice — from `billing/2024-invoices.md:31`.
 
-Exact-token lookups (order numbers, error codes, names) work with **zero setup** — the keyword index needs no embedder and no API key.
+Exact-token lookups (order numbers, error codes, names) work with **zero setup** — the keyword index needs no API key and no model server.
 
 **3. Decide something in one AI client, have another one know it**
 
@@ -102,6 +102,9 @@ Next session, `get_context` leads with the new focus. The file is yours — plai
 ```bash
 curl -sSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.sh | sh
 ```
+The installer verifies the release SHA-256 before installing and offers to run `ney init` for you.
+Pin a version with `NEY_VERSION=v0.1.0`, change the target with `NEY_INSTALL_DIR=~/bin`, or skip the
+setup prompt with `NEY_NO_INIT=1`. There is no Windows build — use WSL2 or `go install`.
 
 **macOS — Homebrew:**
 ```bash
@@ -124,7 +127,7 @@ cd neything
 go build -o ney ./cmd/ney
 ```
 
-Single binary, no runtime dependencies.
+Single binary, no runtime dependencies. Then run `ney init` for guided setup.
 
 ---
 
@@ -133,8 +136,7 @@ Single binary, no runtime dependencies.
 `ney mcp` starts answering the moment it starts up, and layers in better results as indexing catches up in the background:
 
 - **Tier 0 (live scan)** — instantly, before anything is indexed: filename + content grep straight off disk.
-- **Tier 1 (keyword/FTS)** — seconds after startup, once the initial parse → chunk → SQLite FTS5 pass finishes for a root. No embedder required.
-- **Tier 2 (semantic)** — fills in progressively once you've run `ney init` and configured an embedder; `index_status` reports embedding progress so a client can tell partial results from final ones.
+- **Tier 1 (keyword/FTS)** — seconds after startup, once the initial parse → chunk → SQLite FTS5 pass finishes for a root. `index_status` reports which roots are still scanning, so a client can tell partial results from final ones.
 
 **Claude Code:**
 ```bash
@@ -175,11 +177,11 @@ Clients are registered args-less: what gets served comes from the workspaces tab
 | L1.5 | `list_projects` | Full detail per project: path, branch, dirty state, last commit, indexed?, doc/chunk counts. Use when `get_context`'s one-liner isn't enough. |
 | Write | `remember` | Save a fact or decision — `{title, content, project?, tags?}` — as a markdown file in `~/.ney/memory`. Ney derives the filename; no path argument. Searchable within moments via `search_documents`, even in read-only mode. |
 | Write | `update_profile` | Edit one section of `~/.ney/profile.md` (replace or append), so `get_context` reflects it next session. Read-only-safe. |
-| L2 | `search_documents` | Hybrid keyword + semantic search across every indexed workspace, including memory. |
+| L2 | `search_documents` | Keyword search (SQLite FTS5) across every indexed workspace, including memory. When it finds nothing it returns a `next_step` telling the client what to do instead. |
 | L2 | `search_folder` | Whole-machine fallback: live-scans a folder you point it at when the index has no match — bounded, home-directory-only, secret-blind. Files it surfaces become readable via `read_document` for the session. |
 | L2 | `read_document` | Read one file's text (`.md`/`.markdown`/`.txt`), windowed by offset/length. |
 | Mgmt | `index_folder` | Ask your AI to "index this folder" and it becomes a permanent, watched workspace — searchable from then on, no config edits or restarts. Hidden/secret folders and `$HOME` itself are refused. |
-| Mgmt | `index_status` | Per-workspace indexing/embedding progress, read-only mode, watcher state. |
+| Mgmt | `index_status` | Per-workspace document/chunk counts, which roots are still scanning, read-only mode, watcher state. |
 
 ### Security
 
@@ -190,12 +192,11 @@ Ney is built to hand an AI *your documents* — not your secrets, and not the re
 - **A hidden folder can never *become* a root** — `index_folder` and `search_folder` refuse a target whose own path is hidden or secret-looking (`~/.config`, `~/.ssh`, `~/.aws`), including via a symlink or `..` that lands there, and refuse `$HOME` itself as a wholesale index target. The deny rule is evaluated from your home directory down rather than from the root down, so pointing ney at a hidden folder can't lift the protection for everything beneath it. Both layers are enforced independently — admission time *and* read time — so a root added by an older version or straight from the CLI is still denied at read.
 - **Reads are narrow by construction** — `read_document` serves `.md`, `.markdown`, and `.txt` only (the same set the indexer accepts), caps file size, and reads through a single validated file handle so the file it checked is the file it read.
 - **Your own excludes** — add glob patterns under `index.exclude` in the config (see below). Files that were indexed before a pattern matched them are pruned automatically on the next index pass.
-- **Local-first** — with no cloud provider configured, nothing ever leaves your machine. With a cloud embedder, only file chunks are sent for embedding — configure a local embedder (Ollama / LM Studio) to keep even that on-device.
-- **Credentials stay out of logs** — provider API keys are sent as request headers, never in URLs, so a network error message can't carry your key into a terminal log or crash report.
+- **Local-first, unconditionally** — ney makes no network calls at all. There is no provider to configure, so there is no path by which your documents leave the machine.
 
 ### Concurrent access
 
-Only one writer process (`index`, `watch`, `mcp`, `reset`) holds `~/.ney/writer.lock` at a time. If a second `ney mcp` starts while one is already running — say Claude Desktop and Claude Code both spawn one — the second **serves read-only** instead of failing: `get_context`, `search_documents`, `read_document`, `remember`, and `update_profile` all still work off the existing index (as of its startup) and by writing plain files directly; indexing/embedding/watching stay with the first process. `index_status` reports `mode: "read-only"` so clients can tell, and `index_folder` is declined in that mode. `ney index`/`ney reset` from another terminal still fail fast with the holder's pid rather than racing a vector-file write. Read-only commands (`search`, `status`) never need the lock.
+Only one writer process (`index`, `watch`, `mcp`, `reset`) holds `~/.ney/writer.lock` at a time. If a second `ney mcp` starts while one is already running — say Claude Desktop and Claude Code both spawn one — the second **serves read-only** instead of failing: `get_context`, `search_documents`, `read_document`, `remember`, and `update_profile` all still work off the existing index and by writing plain files directly; indexing and watching stay with the first process. `index_status` reports `mode: "read-only"` so clients can tell, and `index_folder` is declined in that mode. `ney index`/`ney reset` from another terminal still fail fast with the holder's pid rather than racing the first process's writes. Read-only commands (`search`, `status`) never need the lock.
 
 The lock is a kernel `flock` held on an open file descriptor, so the OS releases it the moment the holding process exits — including a crash or `kill -9`. There is no stale-lock state to clean up by hand, and a leftover `writer.lock` file carries no authority on its own.
 
@@ -209,7 +210,7 @@ The same engine is usable directly from the terminal. First run:
 ney            # no arguments — offers the guided setup wizard
 ```
 
-The wizard walks four short steps: **[1/4]** scan `context.dev_roots` (default `~/workspace` if present) for git repos and pick which to index, **[2/4]** bootstrap `~/.ney/profile.md` with a couple of quick questions (skipped if a profile already exists — it's yours from then on), **[3/4]** register the AI clients found on your machine, **[4/4]** optionally configure an embedder for semantic search. Rerun it anytime with `ney init`.
+The wizard walks three short steps: **[1/3]** scan `context.dev_roots` (default `~/workspace` if present) for git repos and pick which to index, **[2/3]** bootstrap `~/.ney/profile.md` with a couple of quick questions (skipped if a profile already exists — it's yours from then on), **[3/3]** register the AI clients found on your machine. Rerun it anytime with `ney init` — it only ever writes the one config key it asked you about, so your `config.yaml` edits survive.
 
 Manual usage:
 
@@ -218,21 +219,7 @@ ney index ~/my-notes
 ney search "order-1233"
 ```
 
-With no providers configured, indexing writes the chunk + keyword (FTS5) index only — fast, CPU-only, fully offline. Search runs in keyword mode and tells you so. This is already enough for exact lookups (order numbers, names, error codes).
-
-**Add semantic search (optional):**
-
-```bash
-ney init
-```
-
-The wizard detects local model servers (Ollama, LM Studio), lists the models they expose, lets you pick an embedding model, and writes `~/.ney/config.yaml` for you. It also works with a remote server — just enter its URL. The fastest local setup:
-
-```bash
-ollama pull bge-m3          # embedder → enables semantic search
-```
-
-Or use a cloud embedder — set the API key as an environment variable (`OPENAI_API_KEY` / `GEMINI_API_KEY`). After configuring an embedder, the next `ney index` (or the background worker in `ney mcp`/`ney watch`) embeds the already-indexed chunks — no full re-index needed.
+Indexing writes the chunk + keyword (FTS5) index — fast, CPU-only, fully offline. This is enough for exact lookups (order numbers, names, error codes) and is all ney does: the AI client you connect is the part that reasons about what it finds.
 
 **Check everything is ready:**
 
@@ -245,14 +232,13 @@ ney doctor
 | Command | Description |
 |---|---|
 | `ney mcp` | Serve the 9 MCP tools (`get_context`, `list_projects`, `search_documents`, `search_folder`, `index_folder`, `read_document`, `remember`, `update_profile`, `index_status`) over stdio — see [MCP](#mcp--connect-your-ai) above |
-| `ney init` | Guided setup wizard — discover repos, bootstrap profile, AI clients, optional embedder |
-| `ney index <path>` | Index files recursively (`.md`, `.markdown`, `.txt`); prunes missing files and orphan vectors; `--no-embed` writes chunks + keyword index only |
+| `ney init` | Guided setup wizard — discover repos, bootstrap profile, connect AI clients |
+| `ney index <path>` | Index files recursively (`.md`, `.markdown`, `.txt`); prunes files that no longer exist |
 | `ney watch <path>` | Watch directory and re-index on changes (debounced; Ctrl+C to stop) |
-| `ney search "<query>"` | Search — semantic + keyword combined (`retrieval.mode: auto`), grouped by file with snippets; live-scans folders that aren't indexed yet |
+| `ney search "<query>"` | Keyword search (FTS5), grouped by file with snippets; live-scans folders that aren't indexed yet |
 | `ney status` | Index stats: files, chunks, DB size, last indexed |
 | `ney config` | Print current config (`config show` / `config edit` also work) |
-| `ney doctor` | Check config, API keys, Ollama, SQLite, index health |
-| `ney models` | List configured providers and locally available models |
+| `ney doctor` | Check config, SQLite, index health, MCP readiness |
 | `ney reset` | Clear the index (add `--workspace <name>` for partial reset) |
 | `ney version` | Print version |
 
@@ -262,7 +248,6 @@ ney doctor
 |---|---|
 | `--workspace <name>` | Target a specific workspace |
 | `--top-k <n>` | Number of chunks to retrieve (default: 8) |
-| `--provider <name>` | Override the embedder provider |
 | `--path <dir>` | Limit results to files under this directory |
 | `--json` | Machine-readable JSON output |
 
@@ -283,18 +268,8 @@ ney search "auth flow" --workspace code
 
 ## Providers
 
-Embedding providers (for semantic search — entirely optional):
-
-| Provider | Notes |
-|---|---|
-| **Ollama** | Local, offline, no API key |
-| **LM Studio** (`lmstudio`) | Any OpenAI-compatible server (LM Studio, vLLM, llama.cpp); set `endpoint`, no API key |
-| **OpenAI** | `text-embedding-3-small/large` |
-| **Gemini** | `text-embedding-004` |
-
-Claude cannot be used as an embedder (Anthropic has no embedding API); `ney doctor` will catch this misconfiguration.
-
-> **Note:** Changing the embedding model invalidates the existing index. `ney doctor` detects the mismatch; run `ney reset && ney index <path>` to rebuild.
+None. No API keys, no model server, nothing to configure — ney's only dependency is the
+filesystem it indexes.
 
 ---
 
@@ -303,17 +278,9 @@ Claude cannot be used as an embedder (Anthropic has no embedding API); `ney doct
 `~/.ney/config.yaml`
 
 ```yaml
-embedder:
-  provider: none            # none | openai | gemini | ollama | lmstudio (default: none — keyword-only)
-  model: bge-m3
-  endpoint: http://localhost:11434   # ollama/lmstudio only (LM Studio default: http://localhost:1234)
-
+# retrieval settings
 retrieval:
   top_k: 8                  # chunks retrieved per query
-  rerank: false             # set true to rerank retrieved results
-  rerank_top_k: 24          # candidates fetched before rerank
-  mode: auto                # auto | semantic | keyword | hybrid — auto uses what's available
-                            # (legacy key `hybrid: true/false` still accepted)
 
 # indexing — extra exclude patterns (globs matched case-insensitively against
 # file/dir names), on top of the built-in always-on excludes (dotfiles +
@@ -321,11 +288,6 @@ retrieval:
 index:
   exclude: []
   # exclude: ["*.bak", "drafts-*", "node_modules"]
-
-reranker:                   # used when retrieval.rerank is true
-  provider: cohere          # cohere | jina | ollama
-  model: rerank-v3.5
-  # endpoint: http://localhost:11434   # ollama/local only
 
 chunking:
   strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
@@ -347,16 +309,16 @@ context:
 telemetry: false            # always off
 ```
 
-API keys are read from environment variables (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`). They can also be set directly in the config file, but env vars are recommended.
+`config.yaml` is yours. `ney init` only ever writes the single key it asked you about
+(`context.dev_roots`), preserving your comments and any key it doesn't recognise.
 
 ---
 
 ## How it works
 
 ```
-Index:   Files → Loader → Chunker → SQLite + FTS   (Phase A — instant, CPU-only)
-Embed:   pending chunks → Embedder → VectorStore    (Phase B — background worker)
-Search:  Query → FTS + (Embed → VectorStore) → RRF → ranked chunks   (auto mode: uses whatever's ready)
+Index:   Files → Loader → Chunker → SQLite + FTS   (instant, CPU-only)
+Search:  Query → FTS5 → ranked chunks
 Context: get_context → live git scan of dev_roots + indexed workspaces → profile.md → rendered L1 blob
 ```
 
@@ -370,26 +332,26 @@ Context: get_context → live git scan of dev_roots + indexed workspaces → pro
   That's the whole supported set. PDF, DOCX, HTML, JSON, and Confluence XML loaders were removed — see [Data & privacy](#data--privacy) for the migration note if you're upgrading from an older ney
 - **Path filter** (always on) excludes dotfiles and secret-file patterns from every surface — indexing, live scan, MCP reads, and the admission check that decides whether a folder may become a served root at all
 - **Chunkers** split text with format-aware defaults (`chunking.strategy: auto`) — markdown by heading, plain text by paragraph
-- **Embedder** converts chunks to float32 vectors; stored in `~/.ney/vectors.bin` (brute) or `~/.ney/vectors.hnsw` (HNSW backend)
 - **SQLite** (`~/.ney/index.db`) stores metadata, chunk content, and workspace info
 - **Context** (`internal/context`) is stateless: `get_context`/`list_projects` scan git repos on disk live, no DB table involved; `remember`/`update_profile` write plain markdown files directly
-- **Hash-based skip** — unchanged files are not re-embedded on re-index
-- **Incremental sync** — deleted files and stale vectors are removed on re-index; renames detected by content hash
-- **Vector store** — `brute` (default) or `hnsw` via `vector_store.backend` in config; migrate with `ney index --migrate-vectors`
-- **Offline capable** — use Ollama as the embedder to run fully air-gapped
-- **Tiered search** — `ney mcp` (and `ney search` on a not-yet-indexed folder) never returns nothing: live filesystem scan → keyword/FTS → semantic, whichever tiers are ready
+- **Hash-based skip** — unchanged files are not re-chunked on re-index
+- **Incremental sync** — deleted files are removed on re-index; renames detected by content hash
+- **Offline by construction** — ney makes no network calls, so it runs air-gapped with no setup
+- **Tiered search** — `ney mcp` (and `ney search` on a not-yet-indexed folder) never dead-ends: live filesystem scan → keyword/FTS, whichever tiers are ready, plus a `next_step` when there is genuinely nothing to return
 
 ---
 
 ## Data & privacy
 
-- All data lives in `~/.ney/` — nothing is sent anywhere unless you configure a cloud provider
+- All data lives in `~/.ney/` — and ney makes no network calls, so nothing is sent anywhere at all
 - `telemetry: false` is the default and cannot be flipped remotely
-- A cloud embedder (if configured) only receives file chunks during indexing — use a local embedder to keep everything on-device
 - Secret files (dotfiles, keys, credentials — see [Security](#security)) are never indexed, never searchable, and never served over MCP
-- The index holds the full text of everything you indexed, so `~/.ney/` is `0700` **and** its files (`index.db` and its WAL sidecars, the vector files, `profile.md`, `config.yaml`, `memory/`) are `0600` — one layer isn't enough when a backup, `rsync`, or a container bind-mount can loosen a directory. Files created `0644` by an older ney are tightened in place the next time ney opens them.
+- Only regular files are ever opened. Symlinks are not followed during indexing or scanning — a link's name says nothing about its target, so an innocuously-named one could otherwise pull a file from outside the folder you pointed ney at
+- The index holds the full text of everything you indexed, so `~/.ney/` is `0700` **and** its files (`index.db` and its WAL sidecars, `profile.md`, `config.yaml`, `memory/`) are `0600` — one layer isn't enough when a backup, `rsync`, or a container bind-mount can loosen a directory. Files created `0644` by an older ney are tightened in place the next time ney opens them.
 
-**Migrating from an older ney:** ney now indexes markdown and `.txt` only — PDF, DOCX, HTML, JSON, and Confluence loaders were removed (Obsidian and Notion-export handling stay, as markdown variants). If your existing `~/.ney/index.db` has chunks from those removed formats, run `ney reset && ney index <path>` to rebuild a clean md-only index; a stale mixed-format index still works for md content but will never re-embed the removed formats.
+**Upgrading from a pre-release build:** semantic search was removed along with every provider. Old `embedder:` / `reranker:` / `vector_store:` keys in `config.yaml` are simply ignored — no migration needed. Delete the now-unused `~/.ney/vectors.bin` and `~/.ney/vectors.hnsw*` by hand if they're lying around. ney also indexes markdown and `.txt` only; if your `index.db` has chunks from the removed PDF/DOCX/HTML/JSON loaders, run `ney reset && ney index <path>`.
+
+A chunker defect fixed on 2026-08-01 had been writing roughly 20x more chunks than it should (see [roadmap](docs/roadmap.md)). Nothing to do about it: the first `ney index` or `ney mcp` after upgrading re-chunks every document and reclaims the disk automatically. Expect that first run to take a few times longer than usual, and `index.db` to end up several times smaller.
 
 ---
 
@@ -399,6 +361,6 @@ Ney is focused on being the best personal context server for AI clients working 
 
 - Auto-injecting a "call get_context first" instruction into client system prompts (e.g. `~/.claude/CLAUDE.md`)
 - Better MCP ergonomics: resource templates, per-root tool scoping
-- Smarter incremental embedding and index compaction
+- Index compaction and smarter incremental sync
 
 See [docs/roadmap.md](docs/roadmap.md) for history and details.

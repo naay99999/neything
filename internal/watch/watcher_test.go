@@ -2,7 +2,6 @@ package watch
 
 import (
 	"context"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,42 +14,8 @@ import (
 	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
 
-const testDim = 16
-
-// mockEmbedder mirrors internal/index's test helper (unexported there) so
-// these tests can build a real *index.Indexer without a network embedder.
-type mockEmbedder struct{}
-
-func (m *mockEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
-	out := make([][]float32, len(texts))
-	for i, text := range texts {
-		out[i] = hashToVector(text, testDim)
-	}
-	return out, nil
-}
-
-func (m *mockEmbedder) Dimensions() int { return testDim }
-func (m *mockEmbedder) ModelID() string { return "mock-embedder" }
-
-func hashToVector(text string, dim int) []float32 {
-	h := fnv.New64a()
-	h.Write([]byte(text))
-	seed := h.Sum64()
-	vec := make([]float32, dim)
-	for i := range vec {
-		seed = seed*6364136223846793005 + 1
-		vec[i] = float32(int(seed>>33)%1000) / 1000
-	}
-	return vec
-}
-
-// setupWatcher builds a real Indexer (DB + brute-force vector store) rooted
-// at a fresh temp dir, following the same construction pattern as
-// internal/index's pipeline tests. Watcher takes a concrete *index.Indexer,
-// not an interface, so tests exercise the real thing rather than a stub.
 func setupWatcher(t *testing.T) (w *Watcher, root string, ix *index.Indexer, db *store.DB) {
 	t.Helper()
 	dir := t.TempDir()
@@ -60,19 +25,11 @@ func setupWatcher(t *testing.T) (w *Watcher, root string, ix *index.Indexer, db 
 	}
 
 	dbPath := filepath.Join(dir, "index.db")
-	vecPath := filepath.Join(dir, "vectors.bin")
-
 	db, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-
-	vs, err := vectorstore.NewBruteForceStore(vecPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { vs.Close() })
 
 	chunkResolver, err := chunk.NewResolver("character", 200, 20, 0, 0, nil)
 	if err != nil {
@@ -81,8 +38,6 @@ func setupWatcher(t *testing.T) (w *Watcher, root string, ix *index.Indexer, db 
 
 	ix = &index.Indexer{
 		DB:            db,
-		Vectors:       vs,
-		Embedder:      &mockEmbedder{},
 		Loaders:       loader.NewRegistry(&loader.MarkdownLoader{}),
 		ChunkResolver: chunkResolver,
 		BatchSize:     8,
@@ -428,5 +383,77 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestWatcherShutdownDoesNotRaceFlush drives the exact window the flush lock
+// exists for. time.Timer.Stop does not wait for a callback that has already
+// started, so a debounce flush can still be running when Run performs its
+// final flush and reads Stats — putting two Indexer invocations in flight at
+// once (Serialize is nil here, as in plain `ney watch`) and mutating Stats
+// concurrently with Run's return.
+//
+// The overlap is forced rather than raced for: OnEvent, which the flush body
+// calls per indexed file, parks the first flush until the test has cancelled
+// the context. Run's shutdown then necessarily coincides with it. Meaningful
+// under -race, and verified to fail without the fix.
+func TestWatcherShutdownDoesNotRaceFlush(t *testing.T) {
+	w, root, _, db := setupWatcher(t)
+	defer db.Close()
+
+	w.Debounce = 5 * time.Millisecond
+
+	entered := make(chan struct{})
+	gate := make(chan struct{})
+	var once sync.Once
+	w.OnEvent = func(string) {
+		once.Do(func() {
+			close(entered)
+			<-gate
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan *Stats, 1)
+	go func() {
+		s, err := w.Run(ctx)
+		if err != nil {
+			t.Errorf("run: %v", err)
+		}
+		done <- s
+	}()
+
+	// One write is enough: it schedules a debounce flush, which parks in
+	// OnEvent below.
+	if !waitFor(t, 5*time.Second, func() bool {
+		_ = os.WriteFile(filepath.Join(root, "n.md"), []byte("content"), 0o644)
+		select {
+		case <-entered:
+			return true
+		default:
+			return false
+		}
+	}) {
+		close(gate)
+		cancel()
+		<-done
+		t.Fatal("the debounce flush never started")
+	}
+
+	// A flush is now parked mid-body. Shut down on top of it, then release it
+	// so the two run concurrently.
+	cancel()
+	close(gate)
+
+	select {
+	case stats := <-done:
+		if stats == nil {
+			t.Fatal("expected stats from a cancelled watcher")
+		}
+		// Reading every field: the race detector reports an unsynchronized
+		// read here if the parked flush is still writing.
+		t.Logf("indexed=%d removed=%d errors=%d", stats.FilesIndexed, stats.FilesRemoved, stats.Errors)
+	case <-time.After(30 * time.Second):
+		t.Fatal("watcher did not shut down")
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -40,16 +39,6 @@ type Chunk struct {
 	Content    string
 	StartPos   int
 	EndPos     int
-}
-
-type ProviderRecord struct {
-	ID         int64
-	Role       string
-	Name       string
-	Model      string
-	Dimensions int
-	Version    string
-	CreatedAt  time.Time
 }
 
 type StoreStats struct {
@@ -123,7 +112,109 @@ func (d *DB) migrate() error {
 	if _, err := d.db.Exec(schema); err != nil {
 		return err
 	}
-	return d.BackfillFTS()
+	if err := d.BackfillFTS(); err != nil {
+		return err
+	}
+	return d.migrateChunkerVersion()
+}
+
+// chunkerVersion identifies the chunk-boundary algorithm the rows in `chunks`
+// were produced by. Bump it whenever a change to internal/chunk makes the
+// stored chunks wrong or wasteful, and every existing index rebuilds itself
+// on its next indexing pass.
+//
+// v2: the character chunker used to emit ~OverlapChars extra chunks per
+// document — shrinking suffixes of the tail, up to 95% of all rows on a real
+// corpus.
+const chunkerVersion = "2"
+
+// migrateChunkerVersion forces a re-chunk of every document when the stored
+// chunks came from an older chunker.
+//
+// It blanks documents.hash rather than deleting chunk rows. The indexer skips
+// a file whose hash still matches, and this class of change never alters file
+// contents — so without this, `ney index` would report every file as
+// "unchanged" and keep serving the stale chunks forever, with no signal to
+// the user. Blanking the hash makes the next pass treat each document as
+// modified and replace its chunks + FTS rows atomically, which also means
+// search keeps working on the old rows until each document's turn comes,
+// instead of going empty the moment the DB is opened.
+//
+// Runs at Open, like BackfillFTS, and is safe under SetMaxOpenConns(1): every
+// statement here is an Exec or a QueryRow, never a query left open. A
+// read-only `ney mcp` may be the one to run it; that is fine, because it does
+// both halves together and the next writer sees the blank hashes and rebuilds.
+func (d *DB) migrateChunkerVersion() error {
+	current, err := d.GetMeta("chunker_version")
+	if err != nil {
+		return err
+	}
+	if current == chunkerVersion {
+		return nil
+	}
+	res, err := d.db.Exec(`UPDATE documents SET hash=''`)
+	if err != nil {
+		return err
+	}
+	// Only flag a rebuild when there was something to rebuild. A fresh install
+	// takes this branch too (no version stamped yet) with zero documents, and
+	// must not go on to announce a rebuild and VACUUM an empty database.
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		if err := d.SetMeta(metaChunkerRebuildPending, "1"); err != nil {
+			return err
+		}
+	}
+	return d.SetMeta("chunker_version", chunkerVersion)
+}
+
+// metaChunkerRebuildPending is set while a chunker-version rebuild is still
+// working through the corpus, and cleared by FinishChunkerRebuildIfDone.
+const metaChunkerRebuildPending = "chunker_rebuild_pending"
+
+// FinishChunkerRebuildIfDone reclaims the space freed by a chunker-version
+// rebuild, once one is pending and every document has been re-chunked.
+//
+// Deleting the superseded chunk rows only moves their pages onto SQLite's
+// freelist — the file itself never shrinks, so an upgrade would otherwise
+// leave index.db permanently sized for an index several times larger than the
+// one it now holds (262 MB for 91 MB of data, on the corpus that surfaced the
+// chunker bug). VACUUM is the only way to give that back.
+//
+// "Done" is a blank hash existing nowhere in the DB, which is global rather
+// than per-workspace on purpose: the migration blanks every workspace's
+// hashes at once, so a single workspace finishing its pass is not the end of
+// the rebuild.
+//
+// Best-effort and non-fatal. VACUUM rewrites the whole database and needs a
+// moment plus scratch space, and a concurrently reading process can make it
+// return SQLITE_BUSY; none of that should fail an indexing run that already
+// succeeded. It is skipped entirely when no rebuild is pending, which is
+// every run after the first.
+func (d *DB) FinishChunkerRebuildIfDone() (vacuumed bool, err error) {
+	pending, err := d.GetMeta(metaChunkerRebuildPending)
+	if err != nil || pending == "" {
+		return false, err
+	}
+	var stale int
+	if err := d.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM documents WHERE hash='' LIMIT 1)`).Scan(&stale); err != nil {
+		return false, err
+	}
+	if stale == 1 {
+		return false, nil // still working through the corpus
+	}
+	// Merge the FTS5 index first. Replacing every document's chunks leaves the
+	// old terms behind as tombstones spread across many segments, which VACUUM
+	// cannot compact because to SQLite they are live rows in the shadow
+	// tables. Without this the rebuilt index stays ~50% larger than one built
+	// from scratch.
+	if _, err := d.db.Exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')`); err != nil {
+		return false, err
+	}
+	if _, err := d.db.Exec(`VACUUM`); err != nil {
+		// Leave the flag set so a later run retries.
+		return false, err
+	}
+	return true, d.SetMeta(metaChunkerRebuildPending, "")
 }
 
 func (d *DB) Begin() (*sql.Tx, error) { return d.db.Begin() }
@@ -508,37 +599,7 @@ func (d *DB) GetDocumentsByChunkIDs(chunkIDs []int64) (map[int64]*DocWithWorkspa
 	return out, nil
 }
 
-// Provider / IndexMeta
-
-func (d *DB) SetActiveEmbedder(name, model string, dimensions int) error {
-	val := fmt.Sprintf(`{"name":%q,"model":%q,"dimensions":%d}`, name, model, dimensions)
-	return d.SetMeta("active_embedder", val)
-}
-
-func (d *DB) GetActiveEmbedder() (*ProviderRecord, error) {
-	val, err := d.GetMeta("active_embedder")
-	if err != nil || val == "" {
-		return nil, err
-	}
-	// simple parse without json to avoid import cycle risk
-	pr := &ProviderRecord{}
-	// parse {"name":"x","model":"y","dimensions":N}
-	var name, model string
-	var dims int
-	_, err = fmt.Sscanf(
-		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(val, `"`, ""), "{", ""), "}", ""),
-		"name:%s,model:%s,dimensions:%d", &name, &model, &dims,
-	)
-	if err != nil {
-		// fallback: just store raw
-		pr.Name = val
-		return pr, nil
-	}
-	pr.Name = strings.TrimSuffix(strings.TrimPrefix(name, ":"), ",")
-	pr.Model = strings.TrimSuffix(strings.TrimPrefix(model, ":"), ",")
-	pr.Dimensions = dims
-	return pr, nil
-}
+// IndexMeta
 
 func (d *DB) GetMeta(key string) (string, error) {
 	var val string
@@ -561,9 +622,15 @@ func (d *DB) SetMeta(key, value string) error {
 
 func (d *DB) Stats() (*StoreStats, error) {
 	s := &StoreStats{}
-	d.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&s.WorkspaceCount)
-	d.db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&s.DocumentCount)
-	d.db.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&s.ChunkCount)
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&s.WorkspaceCount); err != nil {
+		return nil, err
+	}
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM documents`).Scan(&s.DocumentCount); err != nil {
+		return nil, err
+	}
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&s.ChunkCount); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -577,64 +644,6 @@ func (d *DB) CountChunks() (int, error) {
 	return n, err
 }
 
-// GetChunkDocumentIDs returns chunk IDs → document IDs for vector delete on reset
-func (d *DB) GetChunkIDsByWorkspace(workspaceID int64) ([]int64, error) {
-	rows, err := d.db.Query(
-		`SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace_id=? ORDER BY c.id`,
-		workspaceID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-func (d *DB) GetAllChunkIDs() ([]int64, error) {
-	rows, err := d.db.Query(`SELECT id FROM chunks`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-// GetChunkIDsPage returns chunk IDs with id > afterID, ordered by id
-// ascending, up to limit rows. It is the paginated counterpart of
-// GetAllChunkIDs, used by EmbedWorker so a corpus with millions of chunks
-// doesn't have to be loaded into memory in one query. Like every query
-// method here, it fully drains its sql.Rows (via defer) before returning —
-// safe to issue another query immediately after, even with the single
-// SetMaxOpenConns(1) connection.
-func (d *DB) GetChunkIDsPage(afterID int64, limit int) ([]int64, error) {
-	rows, err := d.db.Query(`SELECT id FROM chunks WHERE id > ? ORDER BY id LIMIT ?`, afterID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
 func (d *DB) DeleteAllData() error {
 	if err := d.ClearFTS(); err != nil {
 		return err
@@ -645,13 +654,4 @@ func (d *DB) DeleteAllData() error {
 	}
 	_, err = d.db.Exec(`DELETE FROM index_meta`)
 	return err
-}
-
-// int64SliceToStrings converts chunk IDs to string IDs for VectorStore.Delete
-func Int64SliceToStrings(ids []int64) []string {
-	out := make([]string, len(ids))
-	for i, id := range ids {
-		out[i] = strconv.FormatInt(id, 10)
-	}
-	return out
 }

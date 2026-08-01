@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,13 +53,12 @@ func newMCPTestEnv(t *testing.T) *mcpTestEnv {
 		t.Fatal(err)
 	}
 
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	if _, err := app.DB.UpsertWorkspace("corpus", resolvedRoot); err != nil {
@@ -125,6 +125,29 @@ func callTool[T any](t *testing.T, env *mcpTestEnv, name string, args any) T {
 	return out
 }
 
+// callToolWithText is callTool plus the tool's human-readable text content,
+// for assertions that a message reaches clients which only read the text.
+func callToolWithText[T any](t *testing.T, env *mcpTestEnv, name string, args any) (T, string) {
+	t.Helper()
+	var zero T
+	res, err := env.cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool %s: %v", name, err)
+	}
+	if res.IsError {
+		t.Fatalf("tool %s returned an error result: %s", name, toolResultText(res))
+	}
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content for %s: %v", name, err)
+	}
+	out := zero
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal structured content for %s into %T: %v (raw: %s)", name, out, err, b)
+	}
+	return out, toolResultText(res)
+}
+
 // callToolExpectError calls a tool expecting it to fail (either a
 // protocol-level error, e.g. bad input, or a tool-level IsError result, e.g.
 // a rejected path) and returns a combined error message.
@@ -153,7 +176,7 @@ func toolResultText(res *mcp.CallToolResult) string {
 
 // --- search_documents ---------------------------------------------------------
 
-func TestMCPSearchDocumentsKeywordOnly(t *testing.T) {
+func TestMCPSearchDocumentsKeyword(t *testing.T) {
 	env := newMCPTestEnv(t)
 
 	out := callTool[searchDocumentsOutput](t, env, "search_documents", searchDocumentsInput{Query: "invoice order-1233"})
@@ -163,12 +186,6 @@ func TestMCPSearchDocumentsKeywordOnly(t *testing.T) {
 	}
 	if !out.Meta.KeywordUsed {
 		t.Fatal("expected meta.keyword_used=true")
-	}
-	if out.Meta.SemanticUsed {
-		t.Fatal("expected meta.semantic_used=false — no embedder is configured in this env")
-	}
-	if out.Meta.Degraded == "" {
-		t.Fatal("expected a degraded note when no embedder is configured")
 	}
 	found := false
 	for _, r := range out.Results {
@@ -185,8 +202,11 @@ func TestMCPSearchDocumentsKeywordOnly(t *testing.T) {
 	if !found {
 		t.Fatalf("expected notes.md among results, got %+v", out.Results)
 	}
-	if out.IndexStatus.EmbeddingState != "disabled" {
-		t.Fatalf("expected embedding_state=disabled with no embedder configured, got %q", out.IndexStatus.EmbeddingState)
+	if out.IndexStatus.Chunks == 0 {
+		t.Fatal("expected index_status.chunks > 0 after the corpus was indexed")
+	}
+	if out.NextStep != "" {
+		t.Fatalf("next_step must be empty when there are results, got %q", out.NextStep)
 	}
 }
 
@@ -218,13 +238,12 @@ func TestMCPSearchDocumentsLiveScanDuringPhaseA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 	if _, err := app.DB.UpsertWorkspace("corpus", resolvedRoot); err != nil {
 		t.Fatal(err)
@@ -424,12 +443,6 @@ func TestMCPListProjectsAndIndexStatus(t *testing.T) {
 	if statusOut.Workspaces[0].Chunks != p.Chunks || statusOut.Workspaces[0].Documents != p.Documents {
 		t.Fatalf("index_status counts should match list_projects: %+v vs %+v", statusOut.Workspaces[0], p)
 	}
-	if statusOut.Embedder.Configured {
-		t.Fatal("expected embedder.configured=false — this test env has no embedder")
-	}
-	if statusOut.Embedding.State != "disabled" {
-		t.Fatalf("expected embedding.state=disabled, got %q", statusOut.Embedding.State)
-	}
 	if len(statusOut.PhaseARunning) != 0 {
 		t.Fatalf("expected no roots mid-scan after setup finished indexing synchronously, got %v", statusOut.PhaseARunning)
 	}
@@ -565,13 +578,12 @@ func newMCPTestEnvReadOnly(t *testing.T) *mcpTestEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	roots := []mcpRoot{{Name: "corpus", Path: resolvedRoot}}
@@ -670,13 +682,12 @@ func newMCPTestEnvIndexable(t *testing.T) *mcpTestEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	ix, err := newIndexer(app, cfg)
@@ -845,13 +856,12 @@ func newMCPTestEnvFullLoop(t *testing.T) (*mcpTestEnv, *index.Indexer) {
 		t.Fatalf("expected dev_roots to default to the freshly-created ~/workspace, got %v", cfg.Context.DevRoots)
 	}
 
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	memPath := memoryDir()
@@ -1002,5 +1012,224 @@ func TestMCPUpdateProfileRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "Prefers terse commit messages.") {
 		t.Fatalf("expected profile.md to contain the update, got: %s", data)
+	}
+}
+
+// --- first-run guidance (B3) ----------------------------------------------------
+
+func TestNoResultsGuidance(t *testing.T) {
+	cases := []struct {
+		name          string
+		chunks, roots int
+		phaseA        bool
+		wantAll       []string
+	}{
+		{
+			name: "still indexing", chunks: 0, roots: 1, phaseA: true,
+			wantAll: []string{"still running", "index_status"},
+		},
+		{
+			name: "fresh install", chunks: 0, roots: 0,
+			wantAll: []string{"index_folder", "search_folder", "ney init"},
+		},
+		{
+			name: "roots served but nothing indexable", chunks: 0, roots: 2,
+			wantAll: []string{".md", "index_folder"},
+		},
+		{
+			name: "indexed but no match", chunks: 500, roots: 3,
+			wantAll: []string{"search_folder", "3 indexed folder"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := noResultsGuidance(c.chunks, c.roots, c.phaseA)
+			if got == "" {
+				t.Fatal("guidance must never be empty — an empty next_step is the dead end this exists to prevent")
+			}
+			for _, want := range c.wantAll {
+				if !strings.Contains(got, want) {
+					t.Errorf("guidance %q does not mention %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestMCPSearchDocumentsEmptyIndexReturnsNextStep is the end-to-end guard for
+// the worst first-run experience: a client connects to a ney that has never
+// indexed anything, searches, and used to get a bare "No results found."
+func TestMCPSearchDocumentsEmptyIndexReturnsNextStep(t *testing.T) {
+	env := newMCPTestEnvEmpty(t)
+
+	out, text := callToolWithText[searchDocumentsOutput](t, env, "search_documents",
+		searchDocumentsInput{Query: "anything at all"})
+
+	if len(out.Results) != 0 {
+		t.Fatalf("expected no results from an empty index, got %+v", out.Results)
+	}
+	for _, want := range []string{"index_folder", "search_folder", "ney init"} {
+		if !strings.Contains(out.NextStep, want) {
+			t.Errorf("next_step %q should mention %q", out.NextStep, want)
+		}
+	}
+	// The same guidance must reach clients that only read the text content.
+	if !strings.Contains(text, out.NextStep) {
+		t.Errorf("text content should carry next_step; got:\n%s", text)
+	}
+}
+
+func TestMCPIndexStatusNothingIndexedTellsClientWhatToDo(t *testing.T) {
+	env := newMCPTestEnvEmpty(t)
+
+	out, text := callToolWithText[indexStatusOutput](t, env, "index_status", indexStatusInput{})
+	for _, w := range out.Workspaces {
+		if w.Chunks != 0 {
+			t.Fatalf("expected nothing indexed, got %+v", w)
+		}
+	}
+	if !strings.Contains(out.NextStep, "index_folder") {
+		t.Errorf("next_step %q should tell the client to call index_folder", out.NextStep)
+	}
+	if !strings.Contains(text, "index_folder") {
+		t.Errorf("text content should carry the guidance; got:\n%s", text)
+	}
+}
+
+func TestMCPSearchDocumentsIndexedButNoMatchSuggestsSearchFolder(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	out := callTool[searchDocumentsOutput](t, env, "search_documents",
+		searchDocumentsInput{Query: "zzzznotawordanywhere"})
+	if len(out.Results) != 0 {
+		t.Fatalf("expected no results, got %+v", out.Results)
+	}
+	if !strings.Contains(out.NextStep, "search_folder") {
+		t.Errorf("next_step %q should point at search_folder once something IS indexed", out.NextStep)
+	}
+	if strings.Contains(out.NextStep, "ney init") {
+		t.Errorf("next_step %q should not suggest setup when the index already has content", out.NextStep)
+	}
+}
+
+// newMCPTestEnvEmpty builds a server with no user roots and nothing indexed —
+// the state a brand-new install is in when an AI client first connects.
+func newMCPTestEnvEmpty(t *testing.T) *mcpTestEnv {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := initApp(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { app.DB.Close() })
+
+	// Only the internal memory root, exactly as runMCP registers it —
+	// including the workspace row, so index_status sees the same
+	// never-empty workspace list it sees in production.
+	if _, err := app.DB.UpsertWorkspace("memory", memoryDir()); err != nil {
+		t.Fatal(err)
+	}
+	roots := []mcpRoot{{Name: "memory", Path: memoryDir(), Internal: true}}
+	state := newServerState(rootNames(roots), false)
+	server := newMCPServer(mcpDeps{app: app, cfg: cfg, state: state, rs: newRootSet(roots), flt: newPathFilter(cfg)})
+
+	t1, t2 := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := server.Connect(ctx, t1, nil); err != nil {
+		t.Fatal(err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	cs, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	return &mcpTestEnv{cs: cs, app: app, state: state}
+}
+
+// TestReadDocumentPaginationIsConsistent: read_document memoizes the last
+// file so paginating a large document doesn't re-read it per window. The
+// windows must still stitch back into the original.
+func TestReadDocumentPaginationIsConsistent(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	var want strings.Builder
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&want, "line %d with some words in it\n", i)
+	}
+	path := filepath.Join(env.root, "long.md")
+	writeTestFile(t, path, want.String())
+
+	var got strings.Builder
+	offset := 0
+	for i := 0; ; i++ {
+		if i > 100 {
+			t.Fatal("pagination did not terminate")
+		}
+		out := callTool[readDocumentOutput](t, env, "read_document",
+			readDocumentInput{Path: path, OffsetChars: offset, MaxChars: 500})
+		got.WriteString(out.Content)
+		if !out.Truncated {
+			break
+		}
+		offset = out.NextOffset
+	}
+	if got.String() != want.String() {
+		t.Fatal("paginated windows do not reassemble into the original document")
+	}
+}
+
+// TestReadDocumentDoesNotServeStaleContent is the guard that makes the cache
+// safe: rewriting the file between two calls must be visible immediately.
+func TestReadDocumentDoesNotServeStaleContent(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	path := filepath.Join(env.root, "mutable.md")
+	writeTestFile(t, path, "original content here")
+
+	first := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: path})
+	if !strings.Contains(first.Content, "original") {
+		t.Fatalf("unexpected first read: %q", first.Content)
+	}
+
+	// Same length as the original, so only the inode-identity/mtime checks can
+	// catch it — a size comparison alone would not.
+	writeTestFile(t, path, "replaced content here")
+
+	second := callTool[readDocumentOutput](t, env, "read_document", readDocumentInput{Path: path})
+	if strings.Contains(second.Content, "original") {
+		t.Fatalf("cache served stale content after the file changed: %q", second.Content)
+	}
+	if !strings.Contains(second.Content, "replaced") {
+		t.Fatalf("expected the rewritten content, got %q", second.Content)
+	}
+}
+
+// TestSearchDocumentsRespectsTopK: the live-scan supplement appends hits after
+// the retriever has already capped its own leg, so the final truncation is
+// what keeps the tool honest about top_k.
+func TestSearchDocumentsRespectsTopK(t *testing.T) {
+	env := newMCPTestEnv(t)
+
+	// Enough matching documents that both legs have material to contribute.
+	for i := 0; i < 12; i++ {
+		writeTestFile(t, filepath.Join(env.root, fmt.Sprintf("dup%d.md", i)),
+			"quokkazebra marker appears here too\n")
+	}
+	// Mark the root as still scanning so appendLiveScanHits actually runs.
+	env.state.setPhaseA("corpus", true)
+	defer env.state.setPhaseA("corpus", false)
+
+	out := callTool[searchDocumentsOutput](t, env, "search_documents",
+		searchDocumentsInput{Query: "quokkazebra marker", TopK: 3})
+
+	if len(out.Results) > 3 {
+		t.Fatalf("requested top_k=3, got %d results", len(out.Results))
 	}
 }

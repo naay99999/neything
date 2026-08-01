@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
-	"github.com/naay99999/neything/internal/index"
 	"github.com/naay99999/neything/internal/lockfile"
 	"github.com/naay99999/neything/internal/watch"
 	"github.com/spf13/cobra"
@@ -47,7 +46,6 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	applyProviderOverride(cfg)
 
 	lock, err := lockfile.Acquire(config.NeyDir())
 	if err != nil {
@@ -60,7 +58,6 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer app.DB.Close()
-	defer app.Vectors.Close()
 
 	ix, err := newIndexer(app, cfg)
 	if err != nil {
@@ -97,43 +94,12 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Phase B runs beside the watcher for the whole watch: the watcher only
-	// writes chunks+FTS (Phase A), and nudges the worker after every flush
-	// batch. The worker gets its own cancel, derived from cmd.Context()
-	// (not watchCtx) rather than tied to Watcher.Run's ctx, so Ctrl+C stops
-	// the watcher (flush + prune) first, and the worker is stopped
-	// explicitly once Watcher.Run returns.
-	var worker *index.EmbedWorker
-	if app.Embedder != nil {
-		workerCtx, stopWorker := context.WithCancel(cmd.Context())
-		worker = &index.EmbedWorker{
-			DB:       app.DB,
-			Vectors:  app.Vectors,
-			Embedder: app.Embedder,
-		}
-		workerDone := make(chan struct{})
-		go func() {
-			defer close(workerDone)
-			_ = worker.RunLoop(workerCtx)
-		}()
-		// Drain any backlog left by earlier runs (e.g. a --no-embed index)
-		// before the first filesystem event arrives.
-		worker.Notify()
-		defer func() {
-			stopWorker()
-			<-workerDone
-		}()
-	}
-
 	w := &watch.Watcher{
 		Indexer:     ix,
 		RootPath:    rootPath,
 		WorkspaceID: workspaceID,
 		Debounce:    flagWatchDebounce,
 		OnEvent:     onEvent,
-	}
-	if worker != nil {
-		w.OnFlush = worker.Notify
 	}
 
 	stats, err := w.Run(watchCtx)
@@ -142,18 +108,16 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	}
 
 	type result struct {
-		Workspace     string `json:"workspace"`
-		FilesIndexed  int    `json:"files_indexed"`
-		FilesRemoved  int    `json:"files_removed"`
-		VectorsPruned int    `json:"vectors_pruned"`
-		Errors        int    `json:"errors"`
+		Workspace    string `json:"workspace"`
+		FilesIndexed int    `json:"files_indexed"`
+		FilesRemoved int    `json:"files_removed"`
+		Errors       int    `json:"errors"`
 	}
 	r := result{
-		Workspace:     workspaceName,
-		FilesIndexed:  stats.FilesIndexed,
-		FilesRemoved:  stats.FilesRemoved,
-		VectorsPruned: stats.VectorsPruned,
-		Errors:        stats.Errors,
+		Workspace:    workspaceName,
+		FilesIndexed: stats.FilesIndexed,
+		FilesRemoved: stats.FilesRemoved,
+		Errors:       stats.Errors,
 	}
 
 	if flagJSON {
@@ -165,9 +129,6 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	fmt.Printf("✓ %d files indexed\n", stats.FilesIndexed)
 	if stats.FilesRemoved > 0 {
 		fmt.Printf("✓ %d files removed\n", stats.FilesRemoved)
-	}
-	if stats.VectorsPruned > 0 {
-		fmt.Printf("✓ %d vectors pruned\n", stats.VectorsPruned)
 	}
 	if stats.Errors > 0 {
 		fmt.Printf("⚠ %d errors (see stderr)\n", stats.Errors)

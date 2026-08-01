@@ -12,11 +12,9 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/chunk"
-	"github.com/naay99999/neything/internal/embed"
 	"github.com/naay99999/neything/internal/loader"
 	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/naay99999/neything/internal/store"
-	"github.com/naay99999/neything/internal/vectorstore"
 )
 
 // maxIndexFileSize caps how large a file Index/IndexPath will read into
@@ -32,24 +30,12 @@ type Stats struct {
 	FilesRemoved  int
 	FilesFailed   int
 	ChunksCreated int
-	VectorsPruned int
-	// ChunksPendingEmbed is the number of chunks written by this run that
-	// have no vector yet. Phase A (this file) never embeds — that's
-	// EmbedWorker's job now — so every chunk this run created is
-	// definitionally pending, no extra diff query needed.
-	ChunksPendingEmbed int
-	Duration           time.Duration
+	Duration      time.Duration
 }
 
-// flushEveryDocs bounds how much indexed work a crash can lose: vectors are
-// held in memory between flushes (SQLite commits per document regardless).
-const flushEveryDocs = 100
-
 type Indexer struct {
-	DB       *store.DB
-	Vectors  vectorstore.VectorStore
-	Embedder embed.Embedder
-	Loaders  loader.Registry
+	DB      *store.DB
+	Loaders loader.Registry
 	// Filter decides which files/dirs are excluded (dotfiles + secret-file
 	// patterns + user config). nil is valid and applies the built-in rules
 	// only — see pathfilter.
@@ -87,6 +73,12 @@ func (ix *Indexer) walkIndexable(root string, fn func(path string, d fs.DirEntry
 			}
 			return nil
 		}
+		// Type before name: a symlink's name tells us nothing about what
+		// os.ReadFile would actually open, and a FIFO would block that read
+		// forever. See pathfilter.ExcludedMode.
+		if pathfilter.ExcludedMode(d.Type()) {
+			return nil
+		}
 		if ix.Filter.ExcludedFile(d.Name()) {
 			return nil
 		}
@@ -97,19 +89,10 @@ func (ix *Indexer) walkIndexable(root string, fn func(path string, d fs.DirEntry
 	})
 }
 
-// Index walks rootPath and performs Phase A only: parse → chunk → write
-// chunk rows + FTS rows. It never calls Embedder.Embed or Vectors.Add — that
-// is EmbedWorker's job (internal/index/embedworker.go), run separately so a
-// slow/unreachable embedder can't hold the single SQLite connection or block
-// indexing. Embedder may be nil (FTS-only, tier 0-1 mode); when set, it is
-// used only for model-consistency bookkeeping elsewhere (EmbedWorker), never
-// here.
-//
-// Model-consistency checking (comparing the configured embedder against the
-// one the existing index was built with) also moved to EmbedWorker: since
-// this pipeline no longer writes vectors, chunk+FTS writing is
-// embedder-neutral and has nothing to be inconsistent about.
-func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_ *Stats, err error) {
+// Index walks rootPath: parse → chunk → write chunk rows + FTS rows, then
+// prune documents whose files are gone. Search is keyword-only (SQLite FTS5),
+// so this is the whole indexing story — there is no second phase.
+func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (*Stats, error) {
 	start := time.Now()
 
 	workspaceID, err := ix.DB.UpsertWorkspace(workspaceName, rootPath)
@@ -117,21 +100,9 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 		return nil, fmt.Errorf("upsert workspace: %w", err)
 	}
 
-	// Flush even on error so documents already committed to SQLite keep a
-	// consistent vector store when a run aborts partway through. Phase A
-	// only ever calls Vectors.Delete (for chunks that were re-chunked or
-	// removed) — never Add — but Delete still mutates in-memory state that
-	// needs persisting.
-	defer func() {
-		if ferr := ix.Vectors.Flush(); ferr != nil && err == nil {
-			err = fmt.Errorf("flush vectors: %w", ferr)
-		}
-	}()
-
 	stats := &Stats{}
 	seenPaths := make(map[string]bool)
 	pathToHash := make(map[string]string)
-	docsSinceFlush := 0
 
 	err = ix.walkIndexable(rootPath, func(path string, d fs.DirEntry) error {
 		stats.FilesScanned++
@@ -159,13 +130,6 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 			fmt.Fprintf(os.Stderr, "warning: index %s: %v\n", path, err)
 			return nil
 		}
-		docsSinceFlush++
-		if docsSinceFlush >= flushEveryDocs {
-			docsSinceFlush = 0
-			if err := ix.Vectors.Flush(); err != nil {
-				return fmt.Errorf("flush vectors: %w", err)
-			}
-		}
 		return nil
 	})
 	if err != nil {
@@ -179,7 +143,17 @@ func (ix *Indexer) Index(ctx context.Context, rootPath, workspaceName string) (_
 
 	ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 
-	stats.ChunksPendingEmbed = stats.ChunksCreated
+	// A chunker-version rebuild leaves the superseded chunk rows' pages on
+	// SQLite's freelist; once every document has been re-chunked this hands
+	// the disk back. No-op on every run outside that one-time window, and
+	// non-fatal — the indexing run itself already succeeded. Diagnostics go to
+	// stderr: `ney mcp` reaches this path and owns stdout.
+	if vacuumed, err := ix.DB.FinishChunkerRebuildIfDone(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reclaim space after chunker rebuild: %v\n", err)
+	} else if vacuumed {
+		fmt.Fprintln(os.Stderr, "note: re-chunked every document for the new chunker and reclaimed the freed space")
+	}
+
 	stats.Duration = time.Since(start)
 	return stats, nil
 }
@@ -195,6 +169,12 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 	// skip, not an error — the watcher fires on every save of e.g. prod.env
 	// and shouldn't warn each time.
 	if ix.Filter.ExcludedFile(filepath.Base(path)) {
+		return &Stats{FilesScanned: 1, FilesSkipped: 1}, nil
+	}
+	// Same type check the walk applies, for the watcher's entry point. Lstat,
+	// never Stat: Stat resolves the link and would report the target as a
+	// regular file, leaving this path leaking while the walk is protected.
+	if fi, lerr := os.Lstat(path); lerr == nil && pathfilter.ExcludedMode(fi.Mode()) {
 		return &Stats{FilesScanned: 1, FilesSkipped: 1}, nil
 	}
 
@@ -217,12 +197,8 @@ func (ix *Indexer) IndexPath(ctx context.Context, path string, workspaceID int64
 	}
 
 	if stats.FilesSkipped == 0 {
-		if err := ix.Vectors.Flush(); err != nil {
-			return stats, fmt.Errorf("flush vectors: %w", err)
-		}
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
 	}
-	stats.ChunksPendingEmbed = stats.ChunksCreated
 	_ = workspaceName
 	return stats, nil
 }
@@ -237,18 +213,10 @@ func (ix *Indexer) RemovePath(ctx context.Context, path string) (*Stats, error) 
 	if doc == nil {
 		return stats, nil
 	}
-	chunkIDs, err := ix.DB.DeleteDocumentWithCleanup(doc.ID)
-	if err != nil {
+	// The returned chunk IDs are unused now, but the call itself owns the
+	// chunk + FTS row cleanup — never drop it.
+	if _, err := ix.DB.DeleteDocumentWithCleanup(doc.ID); err != nil {
 		return nil, err
-	}
-	if len(chunkIDs) > 0 {
-		if err := ix.Vectors.Delete(ctx, store.Int64SliceToStrings(chunkIDs)); err != nil {
-			return nil, fmt.Errorf("delete vectors: %w", err)
-		}
-		if err := ix.Vectors.Flush(); err != nil {
-			return nil, fmt.Errorf("flush vectors: %w", err)
-		}
-		stats.VectorsPruned += len(chunkIDs)
 	}
 	stats.FilesRemoved++
 	ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
@@ -287,11 +255,6 @@ func (ix *Indexer) PruneMissing(ctx context.Context, rootPath string, workspaceI
 
 	if err := ix.pruneMissing(ctx, workspaceID, seenPaths, hashFor, stats); err != nil {
 		return nil, err
-	}
-	if stats.VectorsPruned > 0 {
-		if err := ix.Vectors.Flush(); err != nil {
-			return nil, fmt.Errorf("flush vectors: %w", err)
-		}
 	}
 	if stats.FilesRemoved > 0 {
 		ix.DB.SetMeta("last_indexed_at", time.Now().Format(time.RFC3339))
@@ -430,27 +393,19 @@ func (ix *Indexer) pruneMissing(ctx context.Context, workspaceID int64, seenPath
 			continue
 		}
 
-		chunkIDs, err := ix.DB.DeleteDocumentWithCleanup(doc.ID)
-		if err != nil {
+		// Cleanup call kept for its chunk + FTS row deletion; the returned
+		// IDs have no consumer any more.
+		if _, err := ix.DB.DeleteDocumentWithCleanup(doc.ID); err != nil {
 			return err
-		}
-		if len(chunkIDs) > 0 {
-			if err := ix.Vectors.Delete(ctx, store.Int64SliceToStrings(chunkIDs)); err != nil {
-				return fmt.Errorf("delete vectors: %w", err)
-			}
-			stats.VectorsPruned += len(chunkIDs)
 		}
 		stats.FilesRemoved++
 	}
 	return nil
 }
 
-// indexDocument writes one loaded document's chunks. This is Phase A only:
+// indexDocument writes one loaded document's chunks:
 // upsert doc row → tx { delete old chunks+FTS → insert chunks → insert FTS }
-// → commit → Vectors.Delete(oldIDs) → record hash. It never calls
-// Embedder.Embed or Vectors.Add — embedding is EmbedWorker's job, run
-// entirely outside this transaction (and outside this pipeline) so a slow or
-// unreachable embedder never holds the single SQLite connection.
+// → commit → record hash.
 func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, workspaceID int64, hash string, sizeBytes int, stats *Stats) error {
 	// The row is upserted without its content hash: the hash is only recorded
 	// after chunks are committed. Otherwise a failed run would leave a
@@ -474,8 +429,9 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 		return err
 	}
 
-	oldIDs, err := ix.DB.DeleteChunksByDocument(tx, docID)
-	if err != nil {
+	// Owns the old chunk + FTS row deletion for this document; the returned
+	// IDs have no consumer any more.
+	if _, err := ix.DB.DeleteChunksByDocument(tx, docID); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("delete old chunks: %w", err)
 	}
@@ -483,12 +439,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 	rawChunks := ix.ChunkResolver.For(doc).Chunk(doc)
 	if len(rawChunks) == 0 {
 		tx.Rollback()
-		if len(oldIDs) > 0 {
-			if err := ix.Vectors.Delete(ctx, store.Int64SliceToStrings(oldIDs)); err != nil {
-				return fmt.Errorf("delete old vectors: %w", err)
-			}
-			stats.VectorsPruned += len(oldIDs)
-		}
 		return ix.DB.UpdateDocumentHash(docID, hash)
 	}
 
@@ -519,13 +469,6 @@ func (ix *Indexer) indexDocument(ctx context.Context, doc loader.Document, works
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
-	}
-
-	if len(oldIDs) > 0 {
-		if err := ix.Vectors.Delete(ctx, store.Int64SliceToStrings(oldIDs)); err != nil {
-			return fmt.Errorf("delete old vectors: %w", err)
-		}
-		stats.VectorsPruned += len(oldIDs)
 	}
 
 	if err := ix.DB.UpdateDocumentHash(docID, hash); err != nil {

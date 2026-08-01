@@ -1,39 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
 	"github.com/naay99999/neything/internal/store"
 )
-
-func TestNormalizeEndpoint(t *testing.T) {
-	cases := map[string]string{
-		"192.168.1.150:1234":      "http://192.168.1.150:1234",
-		"http://localhost:1234/":  "http://localhost:1234",
-		"https://api.example.com": "https://api.example.com",
-		"  http://host:1234/  ":   "http://host:1234",
-		"":                        "",
-	}
-	for in, want := range cases {
-		if got := normalizeEndpoint(in); got != want {
-			t.Errorf("normalizeEndpoint(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestLooksLikeEmbedder(t *testing.T) {
-	if !looksLikeEmbedder("text-embedding-nomic-embed-text-v1.5") {
-		t.Error("nomic embed model should look like an embedder")
-	}
-	if looksLikeEmbedder("google/gemma-4-e4b") {
-		t.Error("gemma should not look like an embedder")
-	}
-}
 
 func TestParseSelection(t *testing.T) {
 	cases := []struct {
@@ -111,16 +89,16 @@ func TestDisplayPaths(t *testing.T) {
 	}
 }
 
-// TestWriteSetupConfigPersistsDevRoot covers the step-1 "prompt for a dev
-// root when unset" flow: whatever the user typed must survive into
-// config.yaml as context.dev_roots, or the wizard would ask again on every
-// run and get_context/list_projects would never see repos under it.
-func TestWriteSetupConfigPersistsDevRoot(t *testing.T) {
+// TestWizardPersistsTypedDevRoot covers the step-1 "prompt for a dev root
+// when unset" flow: whatever the user typed must survive into config.yaml as
+// context.dev_roots, or the wizard would ask again on every run and
+// get_context/list_projects would never see repos under it.
+func TestWizardPersistsTypedDevRoot(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 
 	devRoot := filepath.Join(dir, "code")
-	if err := writeSetupConfig(nil, devRoot); err != nil {
+	if err := config.SetDevRoots([]string{devRoot}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -133,20 +111,36 @@ func TestWriteSetupConfigPersistsDevRoot(t *testing.T) {
 	}
 }
 
-// TestWriteSetupConfigNoDevRootLeavesDefault covers the common case: no
-// custom dev root was typed (context.dev_roots was already set, or the
-// wizard fell back silently), so writeSetupConfig must not force an empty
-// context.dev_roots — Load()'s own default (~/workspace if present) should
-// still apply.
-func TestWriteSetupConfigNoDevRootLeavesDefault(t *testing.T) {
+// TestWizardWithoutDevRootLeavesConfigUntouched covers the common case: no
+// custom dev root was typed (context.dev_roots was already set, or the wizard
+// fell back silently). The wizard must not touch config.yaml at all — writing
+// an empty context.dev_roots would make Load's IsSet check true and
+// permanently suppress the ~/workspace default.
+func TestWizardWithoutDevRootLeavesConfigUntouched(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	if err := writeSetupConfig(nil, ""); err != nil {
+	if _, err := config.Load(); err != nil { // materialize the default config
 		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, ".ney", "config.yaml")
+	before, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := config.SetDevRoots(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("config.yaml was rewritten when no dev root was typed:\n%s", after)
 	}
 
 	cfg, err := config.Load()
@@ -156,5 +150,35 @@ func TestWriteSetupConfigNoDevRootLeavesDefault(t *testing.T) {
 	want := filepath.Join(dir, "workspace")
 	if len(cfg.Context.DevRoots) != 1 || cfg.Context.DevRoots[0] != want {
 		t.Fatalf("expected default dev_roots=[%s], got %v", want, cfg.Context.DevRoots)
+	}
+}
+
+// TestRunSetupWizardRefusesNonInteractive pins B6: an EOF/piped stdin used to
+// answer "y" to every "register ney with this client?" prompt, writing into
+// Claude Desktop / Codex configs with no human present.
+func TestRunSetupWizardRefusesNonInteractive(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	orig := isInteractive
+	isInteractive = func() bool { return false }
+	t.Cleanup(func() { isInteractive = orig })
+
+	err := runSetupWizard(context.Background())
+	if err == nil {
+		t.Fatal("expected runSetupWizard to refuse a non-TTY stdin")
+	}
+	if !strings.Contains(err.Error(), "interactive") {
+		t.Errorf("error should explain why: %v", err)
+	}
+
+	// Nothing may have been written to any AI client config.
+	for _, p := range []string{
+		filepath.Join(dir, "Library", "Application Support", "Claude", "claude_desktop_config.json"),
+		filepath.Join(dir, ".codex", "config.toml"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("wizard wrote %s despite refusing to run", p)
+		}
 	}
 }

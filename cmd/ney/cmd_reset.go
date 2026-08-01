@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/naay99999/neything/internal/config"
@@ -42,8 +41,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	cfg, err := loadConfig()
-	if err != nil {
+	if _, err := loadConfig(); err != nil {
 		return err
 	}
 
@@ -59,12 +57,6 @@ func runReset(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	vs, err := config.NewVectorStore(cfg, db, false)
-	if err != nil {
-		return err
-	}
-	defer vs.Close()
-
 	if flagWorkspace != "" {
 		ws, err := db.GetWorkspaceByName(flagWorkspace)
 		if err != nil {
@@ -72,16 +64,6 @@ func runReset(cmd *cobra.Command, args []string) error {
 		}
 		if ws == nil {
 			return fmt.Errorf("workspace %q not found", flagWorkspace)
-		}
-		chunkIDs, err := db.GetChunkIDsByWorkspace(ws.ID)
-		if err != nil {
-			return err
-		}
-		if err := vs.Delete(cmd.Context(), store.Int64SliceToStrings(chunkIDs)); err != nil {
-			return err
-		}
-		if err := vs.Flush(); err != nil {
-			return err
 		}
 		if err := db.DeleteWorkspace(ws.ID); err != nil {
 			return err
@@ -97,10 +79,6 @@ func runReset(cmd *cobra.Command, args []string) error {
 	if err := db.DeleteAllData(); err != nil {
 		return err
 	}
-	os.Remove(config.VectorsPath())
-	os.Remove(config.HNSWPath())
-	os.Remove(config.HNSWPath() + ".graph")
-
 	if flagJSON {
 		PrintJSON(resetResult{OK: true, Scope: "full"})
 		return nil

@@ -34,10 +34,9 @@ var skipDirNames = map[string]bool{
 }
 
 type Stats struct {
-	FilesIndexed  int
-	FilesRemoved  int
-	VectorsPruned int
-	Errors        int
+	FilesIndexed int
+	FilesRemoved int
+	Errors       int
 }
 
 type Watcher struct {
@@ -91,6 +90,25 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	pending := make(map[string]struct{})
 	var pendingMu sync.Mutex
 
+	// stats is written from two goroutines: the debounce timer's (flush) and
+	// this loop's (the fsnotify error branch, and the shutdown flush/prune).
+	// Every mutation and the final read go through here.
+	var statsMu sync.Mutex
+	addStats := func(mutate func(*Stats)) {
+		statsMu.Lock()
+		defer statsMu.Unlock()
+		mutate(stats)
+	}
+
+	// flushMu makes flush non-overlapping, and flushStopped (guarded by it)
+	// retires flushing for good at shutdown. time.Timer.Stop does not wait for
+	// a callback that has already started, so without both: two Indexer
+	// invocations could be in flight at once whenever Serialize is nil (plain
+	// `ney watch`), and a callback blocked behind the final flush could still
+	// mutate stats after Run had read them and returned.
+	var flushMu sync.Mutex
+	flushStopped := false
+
 	runSerialized := func(run func()) {
 		if w.Serialize != nil {
 			w.Serialize(run)
@@ -99,7 +117,8 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 		}
 	}
 
-	flush := func() {
+	// flushLocked is the flush body; the caller must hold flushMu.
+	flushLocked := func() {
 		pendingMu.Lock()
 		paths := make([]string, 0, len(pending))
 		for p := range pending {
@@ -120,12 +139,11 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 				if _, err := os.Stat(path); err != nil {
 					s, err := w.Indexer.RemovePath(ctx, path)
 					if err != nil {
-						stats.Errors++
+						addStats(func(st *Stats) { st.Errors++ })
 						w.logf("warning: remove %s: %v", path, err)
 						continue
 					}
-					stats.FilesRemoved += s.FilesRemoved
-					stats.VectorsPruned += s.VectorsPruned
+					addStats(func(st *Stats) { st.FilesRemoved += s.FilesRemoved })
 					w.logf("removed %s", path)
 					continue
 				}
@@ -134,12 +152,11 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 				}
 				s, err := w.Indexer.IndexPath(ctx, path, w.WorkspaceID, "")
 				if err != nil {
-					stats.Errors++
+					addStats(func(st *Stats) { st.Errors++ })
 					w.logf("warning: index %s: %v", path, err)
 					continue
 				}
-				stats.FilesIndexed += s.FilesScanned - s.FilesSkipped
-				stats.VectorsPruned += s.VectorsPruned
+				addStats(func(st *Stats) { st.FilesIndexed += s.FilesScanned - s.FilesSkipped })
 				if s.FilesSkipped > 0 {
 					w.logf("skipped %s (unchanged)", path)
 				} else {
@@ -152,16 +169,24 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 		}
 	}
 
+	flush := func() {
+		flushMu.Lock()
+		defer flushMu.Unlock()
+		if flushStopped {
+			return
+		}
+		flushLocked()
+	}
+
 	// pruneTick runs the periodic sweep for files removed without a
 	// filesystem event (e.g. deleted while the watcher wasn't running).
 	pruneTick := func() {
 		runSerialized(func() {
 			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err != nil {
-				stats.Errors++
+				addStats(func(st *Stats) { st.Errors++ })
 				w.logf("warning: prune sync: %v", err)
 			} else if s.FilesRemoved > 0 {
-				stats.FilesRemoved += s.FilesRemoved
-				stats.VectorsPruned += s.VectorsPruned
+				addStats(func(st *Stats) { st.FilesRemoved += s.FilesRemoved })
 				w.logf("pruned %d missing files", s.FilesRemoved)
 			}
 		})
@@ -171,8 +196,7 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	pruneFinal := func() {
 		runSerialized(func() {
 			if s, err := w.Indexer.PruneMissing(ctx, w.RootPath, w.WorkspaceID); err == nil {
-				stats.FilesRemoved += s.FilesRemoved
-				stats.VectorsPruned += s.VectorsPruned
+				addStats(func(st *Stats) { st.FilesRemoved += s.FilesRemoved })
 			}
 		})
 	}
@@ -188,6 +212,35 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 		debounceTimer = time.AfterFunc(w.Debounce, flush)
 	}
 
+	// finish retires the watcher and returns a snapshot of its stats. It stops
+	// the debounce timer, then takes flushMu to run the last flush and latch
+	// flushStopped in one critical section: a callback that already fired and
+	// is queued behind us then wakes up, sees the latch, and returns without
+	// touching stats. That ordering is what makes the read below race-free.
+	finish := func(finalFlush bool) *Stats {
+		debounceMu.Lock()
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+		debounceMu.Unlock()
+
+		flushMu.Lock()
+		if finalFlush {
+			flushLocked()
+		}
+		flushStopped = true
+		flushMu.Unlock()
+
+		if finalFlush && !w.DisablePrune {
+			pruneFinal()
+		}
+
+		statsMu.Lock()
+		defer statsMu.Unlock()
+		out := *stats
+		return &out
+	}
+
 	// syncTickerC stays nil (and so never fires) when pruning is disabled —
 	// an external owner is expected to centralize pruning across watchers.
 	var syncTickerC <-chan time.Time
@@ -200,31 +253,22 @@ func (w *Watcher) Run(ctx context.Context) (*Stats, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Stop the pending debounce timer explicitly: without this, a
-			// timer scheduled just before shutdown could still fire flush()
+			// A timer scheduled just before shutdown must not fire flush()
 			// after Run has returned and the caller has moved on to closing
-			// the DB/Vectors — racing a write against Close().
-			debounceMu.Lock()
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
-			debounceMu.Unlock()
-			flush()
-			if !w.DisablePrune {
-				pruneFinal()
-			}
-			return stats, nil
+			// the DB — that would race a write against Close(). finish stops
+			// the timer and latches flushing off; see its comment.
+			return finish(true), nil
 		case <-syncTickerC:
 			pruneTick()
 		case err, ok := <-fsw.Errors:
 			if !ok {
-				return stats, nil
+				return finish(false), nil
 			}
-			stats.Errors++
+			addStats(func(st *Stats) { st.Errors++ })
 			w.logf("warning: watcher error: %v", err)
 		case ev, ok := <-fsw.Events:
 			if !ok {
-				return stats, nil
+				return finish(false), nil
 			}
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() && !skipDirNames[filepath.Base(ev.Name)] {

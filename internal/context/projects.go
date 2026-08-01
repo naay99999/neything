@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,9 +46,21 @@ var skipDirNames = map[string]bool{
 	"vendor":       true,
 }
 
+// scanConcurrency bounds how many repositories are described at once.
+// Describing one repo costs three git processes, and a scan of a normal dev
+// root covers dozens — done serially that is the whole cost of get_context.
+// The work is dominated by process spawn and filesystem I/O, so a modest
+// fixed width beats scaling with CPU count.
+const scanConcurrency = 8
+
 // ScanRepos walks each root (depth capped, skipping node_modules, vendor,
 // and dot-directories) looking for git repositories, and returns one
 // Project per repo found, sorted by LastCommit descending.
+//
+// Discovery (cheap, os.ReadDir) is separated from description (three git
+// forks per repo) so the latter can run concurrently. Results are written
+// into a pre-sized slice by index rather than appended from the workers, so
+// the order reaching the sort is identical on every call.
 //
 // Any git error for a given repo (no commits yet, corrupt .git, etc.)
 // causes that repo to be skipped silently — the scan itself never fails.
@@ -57,9 +70,38 @@ func ScanRepos(ctx context.Context, roots []string) []Project {
 	if _, err := exec.LookPath("git"); err != nil {
 		return projects
 	}
+
+	var dirs []string
 	for _, root := range roots {
-		root = filepath.Clean(root)
-		scanDir(ctx, root, 0, &projects)
+		collectRepoDirs(ctx, filepath.Clean(root), 0, &dirs)
+	}
+	if len(dirs) == 0 {
+		return projects
+	}
+
+	found := make([]Project, len(dirs))
+	ok := make([]bool, len(dirs))
+
+	sem := make(chan struct{}, scanConcurrency)
+	var wg sync.WaitGroup
+	for i, dir := range dirs {
+		wg.Add(1)
+		go func(i int, dir string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			found[i], ok[i] = buildProject(ctx, dir)
+		}(i, dir)
+	}
+	wg.Wait()
+
+	for i := range dirs {
+		if ok[i] {
+			projects = append(projects, found[i])
+		}
 	}
 	sort.Slice(projects, func(i, j int) bool {
 		return projects[i].LastCommit.After(projects[j].LastCommit)
@@ -67,11 +109,11 @@ func ScanRepos(ctx context.Context, roots []string) []Project {
 	return projects
 }
 
-// scanDir looks for a .git directory directly inside dir; if found it
-// builds a Project and does not recurse further. Otherwise it recurses
-// into subdirectories (skipping node_modules/vendor/dot-dirs) up to
-// scanMaxDepth.
-func scanDir(ctx context.Context, dir string, depth int, projects *[]Project) {
+// collectRepoDirs appends the path of every git repository found under dir to
+// out. A directory containing .git is a repo and is never descended into;
+// anything else is recursed into (skipping node_modules/vendor/dot-dirs) up
+// to scanMaxDepth. Pure filesystem work — no git process is started here.
+func collectRepoDirs(ctx context.Context, dir string, depth int, out *[]string) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -82,9 +124,7 @@ func scanDir(ctx context.Context, dir string, depth int, projects *[]Project) {
 
 	for _, e := range entries {
 		if e.IsDir() && e.Name() == ".git" {
-			if p, ok := buildProject(ctx, dir); ok {
-				*projects = append(*projects, p)
-			}
+			*out = append(*out, dir)
 			return // never descend into a repo
 		}
 	}
@@ -100,15 +140,40 @@ func scanDir(ctx context.Context, dir string, depth int, projects *[]Project) {
 		if strings.HasPrefix(name, ".") || skipDirNames[name] {
 			continue
 		}
-		scanDir(ctx, filepath.Join(dir, name), depth+1, projects)
+		collectRepoDirs(ctx, filepath.Join(dir, name), depth+1, out)
 	}
+}
+
+// gitCmd builds a git invocation against a repository ney did not create.
+//
+// ScanRepos describes whatever repositories it finds under the configured dev
+// roots, and a repository carries its own configuration. git honours several
+// keys that name a command to run — core.fsmonitor is the notable one — so
+// plain `git status` inside a repo whose .git/config an attacker controls
+// (unpacked from an archive, say) executes that command. The -c overrides
+// below neutralise those keys for this process only; they do not touch the
+// user's own git config.
+//
+// GIT_OPTIONAL_LOCKS=0 is not about safety: it stops `git status` from taking
+// index.lock and rewriting .git/index behind the user's back, on every single
+// get_context call.
+func gitCmd(ctx context.Context, repo string, args ...string) *exec.Cmd {
+	full := append([]string{
+		"-C", repo,
+		"-c", "core.fsmonitor=",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "protocol.ext.allow=never",
+	}, args...)
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	return cmd
 }
 
 // buildProject shells out to git to describe the repo at path. Any git
 // failure (empty repo with no commits, detached/corrupt state, etc.)
 // returns ok=false so the caller skips it.
 func buildProject(ctx context.Context, path string) (Project, bool) {
-	logOut, err := exec.CommandContext(ctx, "git", "-C", path, "log", "-1", "--format=%ct%x00%s").Output()
+	logOut, err := gitCmd(ctx, path, "log", "-1", "--format=%ct%x00%s").Output()
 	if err != nil {
 		return Project{}, false
 	}
@@ -121,12 +186,12 @@ func buildProject(ctx context.Context, path string) (Project, bool) {
 		return Project{}, false
 	}
 
-	branchOut, err := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	branchOut, err := gitCmd(ctx, path, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return Project{}, false
 	}
 
-	statusOut, err := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain").Output()
+	statusOut, err := gitCmd(ctx, path, "status", "--porcelain").Output()
 	if err != nil {
 		return Project{}, false
 	}

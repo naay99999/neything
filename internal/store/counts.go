@@ -12,11 +12,8 @@ func (d *DB) CountDocumentsByWorkspace(workspaceID int64) (int, error) {
 }
 
 // CountChunksByWorkspace returns the number of chunk rows belonging to a
-// workspace's documents via SELECT COUNT(*), the counting counterpart of
-// GetChunkIDsByWorkspace (still used where the chunk IDs themselves are
-// needed, e.g. diffing against VectorStore.IDs() for embed coverage). A
-// single QueryRow call — no open sql.Rows — so it's always safe under
-// SetMaxOpenConns(1).
+// workspace's documents via SELECT COUNT(*). A single QueryRow call — no
+// open sql.Rows — so it's always safe under SetMaxOpenConns(1).
 func (d *DB) CountChunksByWorkspace(workspaceID int64) (int, error) {
 	var n int
 	err := d.db.QueryRow(

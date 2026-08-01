@@ -37,11 +37,11 @@ func TestVerifyOriginalPoCsAreClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { app.DB.Close(); app.Vectors.Close() })
+	t.Cleanup(func() { app.DB.Close() })
 
 	ix, err := newIndexer(app, cfg)
 	if err != nil {

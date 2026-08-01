@@ -42,20 +42,20 @@ func detectClients(neyBin string) []clientReg {
 			Name:     "Claude Desktop",
 			Detected: desktopErr == nil,
 			Register: func() error { return registerClaudeDesktop(desktopCfg, neyBin) },
-			Manual: fmt.Sprintf("เพิ่มใน %s:\n"+
+			Manual: fmt.Sprintf("Add to %s:\n"+
 				`  "mcpServers": {"ney": {"command": %q, "args": ["mcp"]}}`, desktopCfg, neyBin),
 		},
 		{
 			Name:     "Claude Code",
 			Detected: claudeErr == nil,
 			Register: func() error { return registerClaudeCode(neyBin) },
-			Manual:   fmt.Sprintf("รัน: claude mcp add --scope user ney -- %s mcp", neyBin),
+			Manual:   fmt.Sprintf("Run: claude mcp add --scope user ney -- %s mcp", neyBin),
 		},
 		{
 			Name:     "Codex",
 			Detected: codexErr == nil,
 			Register: func() error { return registerCodex(codexCfg, neyBin) },
-			Manual: fmt.Sprintf("เพิ่มใน %s:\n"+
+			Manual: fmt.Sprintf("Add to %s:\n"+
 				"  [mcp_servers.ney]\n  command = %q\n  args = [\"mcp\"]", codexCfg, neyBin),
 		},
 	}

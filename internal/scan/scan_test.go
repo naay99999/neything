@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -244,5 +245,64 @@ func TestScanSkipsSecretDirs(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("expected the secrets dir to be skipped entirely, got: %+v", hits)
+	}
+}
+
+// TestScanDoesNotFollowSymlinks is the regression guard for a confirmed
+// content leak. WalkDir reports a symlink as a non-directory entry and
+// DirEntry.Info describes the link itself, so its tiny size sailed past the
+// 2 MB content-grep cap — and then grepFile's os.Open followed it. A link
+// called readme.md inside a scanned folder returned lines of ~/.ssh/id_rsa as
+// the search snippet.
+func TestScanDoesNotFollowSymlinks(t *testing.T) {
+	home := t.TempDir()
+	secret := filepath.Join(home, "id_rsa")
+	if err := os.WriteFile(secret, []byte("BEGIN PRIVATE KEY\nSUPERSECRETMATERIAL\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dl := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(dl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(dl, "readme.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	hits, _, err := Scan(context.Background(), dl, "SUPERSECRETMATERIAL", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected no hits behind a symlink, got %d (%+v)", len(hits), hits)
+	}
+	for _, h := range hits {
+		if strings.Contains(h.Snippet, "SUPERSECRETMATERIAL") {
+			t.Fatalf("symlink target contents leaked into a snippet: %q", h.Snippet)
+		}
+	}
+}
+
+// TestScanDoesNotHangOnNamedPipe: opening a FIFO for reading blocks until a
+// writer appears, which would stall the scan past its own timeout.
+func TestScanDoesNotHangOnNamedPipe(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "real.md"), []byte("kubernetes notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "pipe.md"), 0o644); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, _, err := Scan(context.Background(), dir, "kubernetes", Options{}); err != nil {
+			t.Errorf("scan: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("scan blocked on a named pipe")
 	}
 }

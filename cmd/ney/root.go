@@ -20,7 +20,6 @@ var rootCmd = &cobra.Command{
 var (
 	flagWorkspace string
 	flagTopK      int
-	flagProvider  string
 	flagJSON      bool
 	flagPath      string
 	flagAll       bool
@@ -32,7 +31,6 @@ func init() {
 
 	rootCmd.PersistentFlags().StringVar(&flagWorkspace, "workspace", "", "workspace name")
 	rootCmd.PersistentFlags().IntVar(&flagTopK, "top-k", 8, "number of chunks to retrieve")
-	rootCmd.PersistentFlags().StringVar(&flagProvider, "provider", "", "override embedder provider")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "output JSON")
 	rootCmd.PersistentFlags().StringVar(&flagPath, "path", "", "limit scope to path")
 	rootCmd.PersistentFlags().BoolVar(&flagAll, "all", false, "search across all workspaces, ignoring the current folder's scope")
@@ -45,17 +43,22 @@ func init() {
 		statusCmd,
 		configCmd,
 		doctorCmd,
-		modelsCmd,
 		versionCmd,
 		resetCmd,
 		mcpCmd,
 	)
 }
 
+// loadConfig wraps config.Load and owns the first-run hint. config.Load is
+// silent by construction so `ney mcp` can never emit it; the hint is printed
+// here, to stderr, only for an interactive human.
 func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, fmt.Errorf("config error: %w", err)
+	}
+	if cfg.CreatedDefault && !flagJSON && isatty.IsTerminal(os.Stderr.Fd()) {
+		fmt.Fprintf(os.Stderr, "Created default config at %s\n\n", config.ConfigPath())
 	}
 	return cfg, nil
 }
@@ -69,7 +72,7 @@ func main() {
 	// wizard (interactive terminals only); everywhere else it falls through
 	// to cobra's help.
 	if len(os.Args) == 1 && !setupCompleted() && isatty.IsTerminal(os.Stdin.Fd()) {
-		ans := strings.ToLower(promptLine("Ney ยังไม่ได้ตั้งค่าบนเครื่องนี้ — เริ่ม setup เลยไหม? [Y/n] "))
+		ans := strings.ToLower(promptLine("Ney isn't set up on this machine yet — start setup now? [Y/n] "))
 		if ans == "" || strings.HasPrefix(ans, "y") {
 			if err := runSetupWizard(context.Background()); err != nil {
 				printCLIError(err)

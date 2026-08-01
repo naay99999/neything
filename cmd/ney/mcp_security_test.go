@@ -25,13 +25,12 @@ func newMCPSecurityEnv(t *testing.T) (*mcpTestEnv, *index.Indexer) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	ix, err := newIndexer(app, cfg)
@@ -184,13 +183,12 @@ func TestMCPReadDocumentDeniesDotDirRootFromHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := initAppWithOptions(cfg, false)
+	app, err := initApp(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		app.DB.Close()
-		app.Vectors.Close()
 	})
 
 	// Served root as a pre-fix install would have persisted it.
@@ -270,10 +268,14 @@ func TestMCPReadDocumentAllowsMemoryRoot(t *testing.T) {
 	// is denied, since ~/.ney is a dot-directory.
 	var flt *pathfilter.Filter // nil: built-in rules only
 	memFile := filepath.Join(memPath, filepath.Base(rem.Path))
-	if !excludedForClient(flt, []mcpRoot{{Name: "memory", Path: memPath}}, memFile) {
+	home, err := resolvedHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !excludedForClient(flt, []mcpRoot{{Name: "memory", Path: memPath}}, home, memFile) {
 		t.Fatal("a non-internal ~/.ney/memory root should be denied from $HOME — the Internal bit is what exempts it")
 	}
-	if excludedForClient(flt, []mcpRoot{{Name: "memory", Path: memPath, Internal: true}}, memFile) {
+	if excludedForClient(flt, []mcpRoot{{Name: "memory", Path: memPath, Internal: true}}, home, memFile) {
 		t.Fatal("an internal memory root must be exempt")
 	}
 }

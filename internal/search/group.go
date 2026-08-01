@@ -8,7 +8,7 @@ type FileGroup struct {
 	Workspace string           `json:"workspace,omitempty"`
 	BestScore float32          `json:"best_score"`
 	Chunks    []EnrichedResult `json:"chunks"`
-	// Source is "index" for groups built from GroupByFile (FTS/semantic
+	// Source is "index" for groups built from GroupByFile (FTS
 	// results) or "live-scan" for tier-0 filesystem-scan hits appended by a
 	// caller (see cmd/ney/cmd_search.go, cmd/ney/mcp_tools.go) when the
 	// index isn't ready yet.
