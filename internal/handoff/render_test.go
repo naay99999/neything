@@ -158,6 +158,20 @@ func TestFenceLongerThanInnerBackticks(t *testing.T) {
 	}
 }
 
+func TestLatestAskOmittedWhenSameAsGoal(t *testing.T) {
+	s := baseSession()
+	s.LastPrompt = s.FirstPrompt
+	b := Build("repo", []session.Session{s}, nil, neycontext.GitState{}, false, testNow)
+	for name, out := range map[string]string{"inject": b.RenderInject(), "full": b.RenderFull()} {
+		if strings.Contains(out, "Latest ask:") {
+			t.Errorf("%s: Latest ask rendered although identical to goal:\n%s", name, out)
+		}
+		if !strings.Contains(out, "Goal: implement stripe checkout") {
+			t.Errorf("%s: Goal missing:\n%s", name, out)
+		}
+	}
+}
+
 func TestNowLineOnlyWhenGitOK(t *testing.T) {
 	s := baseSession()
 	b := Build("repo", []session.Session{s}, nil, neycontext.GitState{Uncommitted: 4, CommitsSince: 2}, false, testNow)

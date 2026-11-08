@@ -191,7 +191,7 @@ func (s source) Load(ref session.Ref, full bool) (session.Session, error) {
 
 // loadPartial reads a large file's head (up to the first real prompt) plus
 // its tail. The tail window starts at tailWindow and doubles, up to
-// maxTailWindow, while the parse found no assistant text: a huge trailing
+// maxTailWindow, while the parse found no assistant text or no prompt after the first: a huge trailing
 // line (multi-MB tool_result) otherwise hides LastMessage, Title and End.
 // When the head may overlap the window, or the window covers the file, one
 // clean pass over the whole file is used instead.
@@ -221,7 +221,9 @@ func loadPartial(f *os.File, size int64) (*acc, error) {
 		if err := a.read(tr); err != nil {
 			return nil, err
 		}
-		if a.s.LastMessage != "" || window >= maxTailWindow {
+		// The head pass counted the first prompt; a second one means the tail
+		// found the real latest ask.
+		if (a.s.LastMessage != "" && a.s.PromptCount > 1) || window >= maxTailWindow {
 			return a, nil
 		}
 	}

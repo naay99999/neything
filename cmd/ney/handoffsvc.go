@@ -161,6 +161,11 @@ func buildBrief(ctx context.Context, cfg *config.Config, req handoffRequest, ful
 	refs = append(refs, rest...)
 
 	sessions := loadSessions(cfg, refs, handoffMaxSessions, full)
+	// The requested session may exist but fail to load (or not be a real
+	// session); never let another session silently become primary.
+	if req.SessionID != "" && (len(sessions) == 0 || sessions[0].ID != req.SessionID) {
+		return handoff.Brief{}, root, errSessionNotFound{ID: req.SessionID, Repo: repoName}
+	}
 	for i := range sessions {
 		relativizeFiles(&sessions[i], root)
 	}

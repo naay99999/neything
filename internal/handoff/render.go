@@ -148,7 +148,7 @@ func (b Brief) renderInjectWith(o injectOpts) string {
 		if g := clip(p.FirstPrompt, goalMax); g != "" {
 			sb.WriteString("Goal: " + g + "\n")
 		}
-		if a := clip(p.LastPrompt, askMax); o.ask && a != "" {
+		if a := clip(p.LastPrompt, askMax); o.ask && a != "" && p.LastPrompt != p.FirstPrompt {
 			sb.WriteString("Latest ask: " + a + "\n")
 		}
 		if e := clip(p.LastMessage, o.endedMax); e != "" {
@@ -236,7 +236,7 @@ func (b Brief) RenderFull() string {
 		if g := clip(p.FirstPrompt, fullFieldMax); g != "" {
 			head.WriteString("Goal: " + g + "\n")
 		}
-		if a := clip(p.LastPrompt, fullFieldMax); a != "" {
+		if a := clip(p.LastPrompt, fullFieldMax); a != "" && p.LastPrompt != p.FirstPrompt {
 			head.WriteString("Latest ask: " + a + "\n")
 		}
 		if e := clip(p.LastMessage, fullEndedMax); e != "" {

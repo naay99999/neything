@@ -216,6 +216,34 @@ func TestLoadPartialLargeFile(t *testing.T) {
 	}
 }
 
+// A long session whose last real prompt lies beyond the first 256 KiB tail
+// window, followed only by assistant text: the window must keep growing until
+// a prompt shows up, or LastPrompt would collapse to FirstPrompt.
+func TestLoadPartialFindsPromptBeyondInitialWindow(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"first ask"},"cwd":"/repo","timestamp":"2026-11-01T10:00:00.000Z"}` + "\n")
+	filler := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("f", 1000) + `"}]},"cwd":"/repo","timestamp":"2026-11-01T10:00:01.000Z"}` + "\n"
+	for b.Len() < 200<<10 {
+		b.WriteString(filler)
+	}
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"the real last ask"},"cwd":"/repo","timestamp":"2026-11-01T11:00:00.000Z"}` + "\n")
+	for n := 0; n < 600<<10; n += len(filler) {
+		b.WriteString(filler)
+	}
+	b.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"all done"}]},"cwd":"/repo","timestamp":"2026-11-01T11:30:00.000Z"}` + "\n")
+	p := filepath.Join(t.TempDir(), "sparse.jsonl")
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New("").Load(session.Ref{Agent: "claude-code", ID: "sparse", Path: p}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.LastPrompt != "the real last ask" || s.FirstPrompt != "first ask" || s.LastMessage != "all done" {
+		t.Errorf("FirstPrompt=%q LastPrompt=%q LastMessage=%q", s.FirstPrompt, s.LastPrompt, s.LastMessage)
+	}
+}
+
 func TestSlug(t *testing.T) {
 	if got := Slug("/Users/x/my.app/ไทย repo"); got != "-Users-x-my-app-----repo" {
 		t.Errorf("Slug = %q", got)

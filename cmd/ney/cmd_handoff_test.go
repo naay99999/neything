@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/naay99999/neything/internal/session/claudecode"
 )
@@ -109,6 +111,65 @@ func TestHandoffCommand(t *testing.T) {
 	_, stderr, err := execHandoff(t, repo, "--session", "nope")
 	if err == nil || !strings.Contains(err.Error(), "session nope not found for payrepo") {
 		t.Errorf("--session nope: err=%v stderr=%q", err, stderr)
+	}
+}
+
+// writeSession drops a copy of a claudecode testdata transcript into repo's
+// project dir, with cwd rewritten, goal optionally replaced, and mtime set.
+func writeSession(t *testing.T, repo, fixture, id, goal string, mtime time.Time) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "session", "claudecode", "testdata", fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := strings.ReplaceAll(string(raw), "/repo/", repo+"/")
+	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+repo+`"`)
+	if goal != "" {
+		data = strings.ReplaceAll(data, "Fix the payment flow so refunds work", goal)
+	}
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".claude", "projects", claudecode.Slug(repo), id+".jsonl")
+	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A requested session that exists but is not a real session must fail, not
+// silently hand over a different session's brief.
+func TestHandoffSessionNotASession(t *testing.T) {
+	repo := handoffFixture(t)
+	writeSession(t, repo, "metaonly.jsonl", "s3", "", time.Now())
+	out, _, err := execHandoff(t, repo, "--session", "s3")
+	if err == nil || !strings.Contains(err.Error(), "session s3 not found for payrepo") {
+		t.Errorf("err=%v out=%q", err, out)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty", out)
+	}
+}
+
+func TestBuildBriefExcludeSessionID(t *testing.T) {
+	repo := handoffFixture(t)
+	now := time.Now()
+	writeSession(t, repo, "basic.jsonl", "s1", "", now.Add(-48*time.Hour))
+	writeSession(t, repo, "basic.jsonl", "s2", "Second session goal", now)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, err := buildBrief(context.Background(), cfg, handoffRequest{Cwd: repo, Now: now}, false)
+	if err != nil || b.Primary == nil || b.Primary.ID != "s2" {
+		t.Fatalf("baseline: err=%v primary=%+v", err, b.Primary)
+	}
+	b, _, err = buildBrief(context.Background(), cfg, handoffRequest{Cwd: repo, Now: now, ExcludeSessionID: "s2"}, false)
+	if err != nil || b.Primary == nil || b.Primary.ID != "s1" {
+		t.Fatalf("exclude s2: err=%v primary=%+v", err, b.Primary)
+	}
+	if len(b.Others) != 0 {
+		t.Errorf("Others = %d, excluded session leaked", len(b.Others))
 	}
 }
 
