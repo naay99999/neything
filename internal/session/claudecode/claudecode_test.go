@@ -98,13 +98,13 @@ func TestLoadLongLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	line := func(n int) string {
-		return `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"zz","content":"` +
-			strings.Repeat("a", n) + `"}]},"cwd":"/repo","timestamp":"2026-11-01T10:01:05.000Z"}` + "\n"
-	}
+	huge := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"zz","content":"` +
+		strings.Repeat("a", 17<<20) + `"}]},"cwd":"/repo","timestamp":"2026-11-01T10:01:05.000Z"}` + "\n"
+	// The 2 MB line carries an assistant message that must be parsed.
+	big := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` +
+		strings.Repeat("b", 2<<20) + `END-MARK"}]},"cwd":"/repo","timestamp":"2026-11-01T10:02:00.000Z"}` + "\n"
 	p := filepath.Join(t.TempDir(), "long.jsonl")
-	data := string(base) + line(2<<20) + line(17<<20)
-	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(string(base)+huge+big), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, full := range []bool{true, false} {
@@ -112,17 +112,65 @@ func TestLoadLongLines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("full=%v: %v", full, err)
 		}
-		if !full {
-			// The tail window lies inside the oversize line, so only the
-			// head contributes; the session must still load.
-			if s.FirstPrompt != "Fix the payment flow so refunds work" {
-				t.Errorf("partial: FirstPrompt = %q", s.FirstPrompt)
-			}
-			continue
+		if len(s.LastMessage) < 2<<20 || !strings.HasSuffix(s.LastMessage, "END-MARK") {
+			t.Errorf("full=%v: 2 MB line not parsed (LastMessage len %d)", full, len(s.LastMessage))
 		}
-		if s.PromptCount != 2 || s.Title != "Fix payment flow" {
+		if s.FirstPrompt != "Fix the payment flow so refunds work" {
+			t.Errorf("full=%v: FirstPrompt = %q", full, s.FirstPrompt)
+		}
+		if full && (s.PromptCount != 2 || s.Title != "Fix payment flow") {
 			t.Errorf("full: PromptCount=%d Title=%q", s.PromptCount, s.Title)
 		}
+	}
+}
+
+func TestLoadPartialAdaptiveWindow(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"first ask"},"cwd":"/repo","timestamp":"2026-11-01T10:00:00.000Z"}` + "\n")
+	filler := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("f", 1000) + `"}]},"cwd":"/repo","timestamp":"2026-11-01T10:00:01.000Z"}` + "\n"
+	for b.Len() < 1500<<10 {
+		b.WriteString(filler)
+	}
+	b.WriteString(`{"type":"user","message":{"role":"user","content":"last ask"},"cwd":"/repo","timestamp":"2026-11-01T11:00:00.000Z"}` + "\n")
+	b.WriteString(`{"type":"ai-title","aiTitle":"Adaptive title"}` + "\n")
+	b.WriteString(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"all done"}]},"cwd":"/repo","timestamp":"2026-11-01T11:00:05.000Z"}` + "\n")
+	b.WriteString(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"q","content":"` + strings.Repeat("z", 3<<20) + `"}]},"cwd":"/repo","timestamp":"2026-11-01T11:00:06.000Z"}` + "\n")
+	b.WriteString(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"q2","content":"x"}]},"cwd":"/repo","timestamp":"2026-11-01T11:00:07.000Z"}` + "\n")
+	p := filepath.Join(t.TempDir(), "adaptive.jsonl")
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New("").Load(session.Ref{Agent: "claude-code", ID: "adaptive", Path: p}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.LastMessage != "all done" || s.Title != "Adaptive title" || s.LastPrompt != "last ask" {
+		t.Errorf("LastMessage=%q Title=%q LastPrompt=%q", s.LastMessage, s.Title, s.LastPrompt)
+	}
+	if s.End.Second() != 7 {
+		t.Errorf("End = %v", s.End)
+	}
+}
+
+func TestLoadIgnoresPseudoPrompts(t *testing.T) {
+	base, err := os.ReadFile(filepath.Join("testdata", "basic.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pseudo, err := os.ReadFile(filepath.Join("testdata", "metaonly.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "mixed.jsonl")
+	if err := os.WriteFile(p, append(base, pseudo...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New("").Load(session.Ref{Agent: "claude-code", ID: "mixed", Path: p}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.PromptCount != 2 || s.LastPrompt != "Now run the tests please" {
+		t.Errorf("PromptCount=%d LastPrompt=%q", s.PromptCount, s.LastPrompt)
 	}
 }
 

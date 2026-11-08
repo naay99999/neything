@@ -1,3 +1,8 @@
 {"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: local command output follows."},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:00.000Z","isSidechain":false,"uuid":"m1"}
 {"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:01.000Z","isSidechain":false,"uuid":"m2"}
 {"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model</local-command-stdout>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:02.000Z","isSidechain":false,"uuid":"m3"}
+{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:10.000Z","isSidechain":false,"uuid":"p0"}
+{"type":"user","message":{"role":"user","content":"<bash-input>ls</bash-input>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:11.000Z","isSidechain":false,"uuid":"p1"}
+{"type":"user","message":{"role":"user","content":"<bash-stdout>x</bash-stdout>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:12.000Z","isSidechain":false,"uuid":"p2"}
+{"type":"user","message":{"role":"user","content":"<bash-stderr>e</bash-stderr>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:13.000Z","isSidechain":false,"uuid":"p3"}
+{"type":"user","message":{"role":"user","content":"<task-notification>done</task-notification>"},"cwd":"/repo","gitBranch":"main","sessionId":"s3","timestamp":"2026-11-01T12:00:14.000Z","isSidechain":false,"uuid":"p4"}

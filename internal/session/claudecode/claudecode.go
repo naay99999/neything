@@ -17,18 +17,21 @@ import (
 )
 
 const (
-	agentName   = "claude-code"
-	tailWindow  = 256 << 10 // bytes read from the end of a large file
-	tailKeep    = 30        // Tail entries kept on a full load
-	cwdMaxLines = 64        // Recent gives up on a file after this many lines
-	headMax     = 120       // runes in a TailEntry.Head
-	bodyMax     = 2000      // runes in a TailEntry.Body
+	agentName     = "claude-code"
+	tailWindow    = 256 << 10 // initial bytes read from the end of a large file
+	maxTailWindow = 4 << 20   // the window doubles up to this size
+	tailKeep      = 30        // Tail entries kept on a full load
+	cwdMaxLines   = 64        // Recent gives up on a file after this many lines
+	headMax       = 120       // runes in a TailEntry.Head
+	bodyMax       = 2000      // runes in a TailEntry.Body
 )
 
 // notPromptPrefixes mark user entries that are harness chatter, not prompts.
 var notPromptPrefixes = []string{
 	"<command-name>", "<command-message>", "<local-command-stdout>",
 	"<local-command-caveat>", "<system-reminder>",
+	"[Request interrupted", "<bash-input>", "<bash-stdout>", "<bash-stderr>",
+	"<task-notification>",
 }
 
 type source struct{ dir string }
@@ -163,38 +166,14 @@ func (s source) Load(ref session.Ref, full bool) (session.Session, error) {
 		return session.Session{}, session.ErrNotASession
 	}
 
-	a := newAcc(full)
+	var a *acc
 	if full || fi.Size() <= tailWindow {
+		a = newAcc(full)
 		if err := a.read(f); err != nil {
 			return session.Session{}, err
 		}
-	} else {
-		a.haltAtPrompt = true
-		head := &stopReader{r: f}
-		a.stop = head
-		if err := session.Lines(head, a.handle); err != nil {
-			return session.Session{}, err
-		}
-		a.haltAtPrompt, a.stop = false, nil
-		if !a.halted || head.n > fi.Size()-tailWindow {
-			// No prompt found, or the head read may overlap the tail window:
-			// fall back to one clean pass over the whole file.
-			a = newAcc(false)
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return session.Session{}, err
-			}
-			if err := a.read(f); err != nil {
-				return session.Session{}, err
-			}
-		} else {
-			tr, err := session.TailReader(f, tailWindow)
-			if err != nil {
-				return session.Session{}, err
-			}
-			if err := a.read(tr); err != nil {
-				return session.Session{}, err
-			}
-		}
+	} else if a, err = loadPartial(f, fi.Size()); err != nil {
+		return session.Session{}, err
 	}
 	if a.s.PromptCount == 0 {
 		return session.Session{}, session.ErrNotASession
@@ -208,6 +187,52 @@ func (s source) Load(ref session.Ref, full bool) (session.Session, error) {
 		a.s.Tail = a.tail
 	}
 	return a.s, nil
+}
+
+// loadPartial reads a large file's head (up to the first real prompt) plus
+// its tail. The tail window starts at tailWindow and doubles, up to
+// maxTailWindow, while the parse found no assistant text: a huge trailing
+// line (multi-MB tool_result) otherwise hides LastMessage, Title and End.
+// When the head may overlap the window, or the window covers the file, one
+// clean pass over the whole file is used instead.
+func loadPartial(f *os.File, size int64) (*acc, error) {
+	for window := int64(tailWindow); ; window *= 2 {
+		if window >= size {
+			return wholeFile(f)
+		}
+		a := newAcc(false)
+		a.haltAtPrompt = true
+		head := &stopReader{r: f}
+		a.stop = head
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		if err := session.Lines(head, a.handle); err != nil {
+			return nil, err
+		}
+		a.haltAtPrompt, a.stop = false, nil
+		if !a.halted || head.n > size-window {
+			return wholeFile(f)
+		}
+		tr, err := session.TailReader(f, window)
+		if err != nil {
+			return nil, err
+		}
+		if err := a.read(tr); err != nil {
+			return nil, err
+		}
+		if a.s.LastMessage != "" || window >= maxTailWindow {
+			return a, nil
+		}
+	}
+}
+
+func wholeFile(f *os.File) (*acc, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	a := newAcc(false)
+	return a, a.read(f)
 }
 
 // acc accumulates a Session over transcript lines.
