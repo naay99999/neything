@@ -56,6 +56,8 @@ func newMCPServer(deps mcpDeps) *mcp.Server {
 			"the section if it doesn't exist yet.",
 	}, updateProfileHandler())
 
+	registerHandoffTools(server, deps)
+
 	return server
 }
 

@@ -109,7 +109,7 @@ func toolResultText(res *mcp.CallToolResult) string {
 	return b.String()
 }
 
-func TestMCPListsOnlyContextTools(t *testing.T) {
+func TestMCPListsTools(t *testing.T) {
 	env := newMCPTestEnv(t)
 
 	res, err := env.cs.ListTools(context.Background(), nil)
@@ -121,7 +121,7 @@ func TestMCPListsOnlyContextTools(t *testing.T) {
 		got = append(got, tool.Name)
 	}
 	sort.Strings(got)
-	want := []string{"get_context", "remember", "update_profile"}
+	want := []string{"get_context", "get_handoff", "list_sessions", "remember", "update_profile", "write_handoff"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
