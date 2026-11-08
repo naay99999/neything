@@ -65,3 +65,14 @@ func TestReadNotesMissingDir(t *testing.T) {
 		t.Fatalf("got %v, %v", notes, err)
 	}
 }
+
+func TestWriteNoteCapsLongAgentName(t *testing.T) {
+	dir := t.TempDir()
+	path, err := WriteNote(dir, "/r", strings.Repeat("x", 300), "body", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(filepath.Base(path)); n > 100 {
+		t.Errorf("file name too long: %d", n)
+	}
+}

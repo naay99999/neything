@@ -94,7 +94,7 @@ Other commands: `ney config show|edit`, `ney version`.
 |---|---|
 | `get_handoff` | Handoff brief for the repo at `cwd` (full by default; `full=false` for compact; `session_id` picks a session) |
 | `list_sessions` | Recent sessions across agents for the repo at `cwd`, newest first (JSON: agent, id, title, branch, start, end, prompts) |
-| `write_handoff` | Leave a note for the next session (max 8000 chars); shown first in the next brief if newer than the last session |
+| `write_handoff` | Leave a note for the next session (max 8000 chars); shown first in the next brief if written during or after the last session |
 | `get_context` | Your profile plus recently active git projects under `context.dev_roots` |
 | `remember` | Save a fact or decision as a markdown file in `~/.ney/memory` |
 | `update_profile` | Edit one section of `~/.ney/profile.md` |

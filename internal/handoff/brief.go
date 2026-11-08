@@ -21,14 +21,14 @@ type Brief struct {
 	RepoName string
 	Primary  *session.Session  // nil when no session in window
 	Others   []session.Session // at most 2
-	Note     *Note             // newest note, only if newer than Primary.End (or Primary nil)
+	Note     *Note             // newest note, only if written at/after Primary.Start (or Primary nil)
 	Git      neycontext.GitState
 	GitOK    bool
 	Now      time.Time
 }
 
 // Build assembles a Brief. sessions are newest End first. Every string is
-// trimmed to 8 KiB and then redacted here, and nowhere else.
+// redacted and then trimmed to 8 KiB here, and nowhere else.
 func Build(repoName string, sessions []session.Session, notes []Note, git neycontext.GitState, gitOK bool, now time.Time) Brief {
 	b := Brief{RepoName: scrub(repoName), Git: git, GitOK: gitOK, Now: now}
 	if len(sessions) > 0 {
@@ -44,7 +44,7 @@ func Build(repoName string, sessions []session.Session, notes []Note, git neycon
 			newest = &notes[i]
 		}
 	}
-	if newest != nil && (b.Primary == nil || newest.At.After(b.Primary.End)) {
+	if newest != nil && (b.Primary == nil || !newest.At.Before(b.Primary.Start)) {
 		n := Note{Agent: scrub(newest.Agent), At: newest.At, Body: scrub(newest.Body)}
 		b.Note = &n
 	}
@@ -54,7 +54,11 @@ func Build(repoName string, sessions []session.Session, notes []Note, git neycon
 // Empty reports whether there is nothing worth handing over.
 func (b Brief) Empty() bool { return b.Primary == nil && b.Note == nil }
 
-func scrub(s string) string { return redact.String(trimBytes(s, maxFieldBytes)) }
+// scrub redacts before the final trim: a secret straddling the 8 KiB cut would
+// otherwise leave an unmatchable fragment. A 2x window is redacted first.
+func scrub(s string) string {
+	return trimBytes(redact.String(trimBytes(s, 2*maxFieldBytes)), maxFieldBytes)
+}
 
 // trimBytes keeps at most max bytes of s, cut on a UTF-8 boundary.
 func trimBytes(s string, max int) string {

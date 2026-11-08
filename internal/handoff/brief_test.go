@@ -43,7 +43,7 @@ func TestBuildRedacts(t *testing.T) {
 func TestBuildNoteOrdering(t *testing.T) {
 	s := baseSession()
 	newer := Note{Agent: "codex", At: s.End.Add(time.Minute), Body: "NOTE-BODY remember the migration"}
-	older := Note{Agent: "codex", At: s.End.Add(-time.Minute), Body: "OLD-NOTE"}
+	older := Note{Agent: "codex", At: s.Start.Add(-time.Minute), Body: "OLD-NOTE"}
 
 	b := Build("repo", []session.Session{s}, []Note{newer, older}, neycontext.GitState{}, false, testNow)
 	if b.Note == nil {
@@ -63,6 +63,37 @@ func TestBuildNoteOrdering(t *testing.T) {
 	b = Build("repo", nil, []Note{older}, neycontext.GitState{}, false, testNow)
 	if b.Note == nil || b.Empty() || b.RenderInject() == "" {
 		t.Errorf("note alone should make a brief")
+	}
+}
+
+func TestBuildNoteDuringSessionShown(t *testing.T) {
+	s := baseSession()
+	in := Note{Agent: "claude-code", At: s.End.Add(-5 * time.Second), Body: "INSIDE-NOTE"}
+	b := Build("repo", []session.Session{s}, []Note{in}, neycontext.GitState{}, false, testNow)
+	if b.Note == nil || b.Note.Body != "INSIDE-NOTE" {
+		t.Fatalf("note written inside the primary session must be shown: %+v", b.Note)
+	}
+}
+
+func TestBuildNoteBeforeLaterOtherAgentSessionHidden(t *testing.T) {
+	s := baseSession()
+	s.Agent = "codex"
+	stale := Note{Agent: "claude-code", At: s.Start.Add(-time.Second), Body: "STALE"}
+	b := Build("repo", []session.Session{s}, []Note{stale}, neycontext.GitState{}, false, testNow)
+	if b.Note != nil {
+		t.Fatalf("stale note shown: %+v", b.Note)
+	}
+}
+
+func TestBuildRedactsSecretStraddlingTrimBoundary(t *testing.T) {
+	secret := "sk-ant-api03-ZZZZYYYYXXXXWWWWVVVV"
+	s := baseSession()
+	s.LastMessage = strings.Repeat("a", 8180) + " " + secret + " tail"
+	b := Build("repo", []session.Session{s}, nil, neycontext.GitState{}, false, testNow)
+	for n := 6; n <= len(secret); n++ {
+		if strings.Contains(b.Primary.LastMessage, secret[:n]) {
+			t.Fatalf("secret prefix %q survived", secret[:n])
+		}
 	}
 }
 

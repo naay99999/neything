@@ -47,7 +47,7 @@ harness coverage.
    (default on, disable per repo) **and** MCP tools for detail.
 3. **Summarizer = A + C.** A deterministic digest built from transcript + live
    git state is the base (no LLM, no tokens). If an agent wrote a handoff note
-   via `write_handoff` that is newer than the latest session, it is shown first;
+   via `write_handoff` written during or after the latest session, it is shown first;
    the digest always follows. LLM-written summaries (session-end `claude -p`)
    are rejected for v1: token cost, latency, silent failure, harness CLI
    dependency.
@@ -188,8 +188,10 @@ Session selection:
 count, commits since the primary session's end time.
 
 Notes: `write_handoff` writes `~/.ney/handoff/<repo-key>/<RFC3339>-<agent>.md`
-where `<repo-key>` is a filesystem-safe form of the repo root path. A note newer
-than the primary session's end time is rendered first.
+where `<repo-key>` is a filesystem-safe form of the repo root path. The newest
+note is rendered first when it was written at or after the primary session's
+start (i.e. during or after the most recent session); older notes are stale and
+hidden.
 
 **`RenderInject()`** — hard cap 3 KB, Thai/English agnostic (content is
 whatever the user wrote):

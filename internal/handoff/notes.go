@@ -51,7 +51,7 @@ func WriteNote(neyDir, repoRoot, agent, body string, now time.Time) (string, err
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	agent = RepoKey(agent)
+	agent = trimBytes(RepoKey(agent), 32)
 	if agent == "" {
 		agent = "agent"
 	}
