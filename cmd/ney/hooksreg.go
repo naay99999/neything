@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,11 +68,17 @@ func parseHooksFile(data []byte) (top, hooks map[string]json.RawMessage, groups 
 		if err = json.Unmarshal(data, &top); err != nil {
 			return
 		}
+		if top == nil { // file content was JSON null
+			top = map[string]json.RawMessage{}
+		}
 	}
 	hooks = map[string]json.RawMessage{}
 	if raw, ok := top["hooks"]; ok {
 		if err = json.Unmarshal(raw, &hooks); err != nil {
 			return
+		}
+		if hooks == nil {
+			hooks = map[string]json.RawMessage{}
 		}
 	}
 	if raw, ok := hooks["SessionStart"]; ok {
@@ -93,8 +100,23 @@ func groupHooks(g map[string]json.RawMessage) ([]map[string]json.RawMessage, err
 	return hs, nil
 }
 
+// encodeJSON marshals v without HTML escaping (so users' `&&`, `<`, `>` in
+// commands are never rewritten). indent adds 2-space indentation.
+func encodeJSON(v any, indent bool) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 func mustRaw(v any) json.RawMessage {
-	b, _ := json.Marshal(v)
+	b, _ := encodeJSON(v, false)
 	return b
 }
 
@@ -166,9 +188,13 @@ func registerSessionStartHook(path, neyBin, agent string) (changed bool, err err
 
 	hooks["SessionStart"] = mustRaw(outGroups)
 	top["hooks"] = mustRaw(hooks)
-	out, err := json.MarshalIndent(top, "", "  ")
+	out, err := encodeJSON(top, true)
 	if err != nil {
 		return false, err
+	}
+	// Write through a symlink: update its target, not the link itself.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
 	}
 	if err := backupFile(path); err != nil {
 		return false, err
