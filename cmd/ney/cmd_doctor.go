@@ -24,7 +24,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	var results []checkResult
 
 	// 1. Config valid
-	_, err := config.Load()
+	cfg, err := config.Load()
 	if err != nil {
 		results = append(results, checkResult{
 			Check:   "config_valid",
@@ -51,6 +51,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		// Args-less on purpose: `ney mcp` needs no configuration.
 		Hint: fmt.Sprintf("claude mcp add --scope user ney -- %s mcp", resolveNeyBinary()),
 	})
+
+	results = append(results, claudeCodeChecks(cfg)...)
 
 	printDoctorResults(results)
 	return nil

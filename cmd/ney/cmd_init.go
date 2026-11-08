@@ -107,16 +107,26 @@ func stepClients() {
 			fmt.Println(Dim(indentLines(c.Manual, "        ")))
 			continue
 		}
-		ans := strings.ToLower(promptDefault(fmt.Sprintf("      ✓ Found %s — register ney with it? (y/n)", c.Name), "y"))
-		if !strings.HasPrefix(ans, "y") {
-			fmt.Println(Dim("        Skipped"))
-			continue
+		fmt.Printf("      ✓ Found %s\n", c.Name)
+		applied := false
+		for _, ch := range c.Changes {
+			fmt.Printf("        Will %s:\n", ch.Title)
+			fmt.Println(Dim(indentLines(ch.Preview, "          ")))
+			ans := strings.ToLower(promptDefault("        Apply? (y/n)", "y"))
+			if !strings.HasPrefix(ans, "y") {
+				fmt.Println(Dim("        Skipped"))
+				continue
+			}
+			if err := ch.Apply(); err != nil {
+				fmt.Println(Yellow("        Failed: " + err.Error()))
+				continue
+			}
+			applied = true
+			fmt.Println(Green("        ✓ Done"))
 		}
-		if err := c.Register(); err != nil {
-			fmt.Println(Yellow("        Registration failed: " + err.Error()))
-			continue
+		if applied {
+			fmt.Println(Green("        Restart " + c.Name + " to apply"))
 		}
-		fmt.Println(Green("        ✓ Registered (restart " + c.Name + " to apply)"))
 	}
 }
 

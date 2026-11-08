@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,13 +8,21 @@ import (
 	"strings"
 )
 
+// clientChange is one confirmable modification to an AI client's config.
+// Preview shows the exact change before the user is asked to accept it.
+type clientChange struct {
+	Title   string
+	Preview string
+	Apply   func() error
+}
+
 // clientReg describes one AI client the wizard can register ney with. Every
-// Register implementation backs the target file up as <file>.bak before
+// Apply implementation backs the target file up as <file>.bak before
 // modifying it and refuses to overwrite a file it cannot parse.
 type clientReg struct {
 	Name     string
 	Detected bool
-	Register func() error
+	Changes  []clientChange
 	// Manual is the copy-paste instruction printed when the client is not
 	// detected (or the user declines).
 	Manual string
@@ -27,34 +34,44 @@ type clientReg struct {
 func detectClients(neyBin string) []clientReg {
 	home, _ := os.UserHomeDir()
 
-	desktopCfg := filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
-	desktopDir := filepath.Dir(desktopCfg)
-	_, desktopErr := os.Stat(desktopDir)
-
 	_, claudeErr := exec.LookPath("claude")
+	settings := filepath.Join(home, ".claude", "settings.json")
 
 	codexDir := filepath.Join(home, ".codex")
 	codexCfg := filepath.Join(codexDir, "config.toml")
 	_, codexErr := os.Stat(codexDir)
 
+	mcpLine := fmt.Sprintf("claude mcp add --scope user ney -- %s mcp", neyBin)
 	return []clientReg{
-		{
-			Name:     "Claude Desktop",
-			Detected: desktopErr == nil,
-			Register: func() error { return registerClaudeDesktop(desktopCfg, neyBin) },
-			Manual: fmt.Sprintf("Add to %s:\n"+
-				`  "mcpServers": {"ney": {"command": %q, "args": ["mcp"]}}`, desktopCfg, neyBin),
-		},
 		{
 			Name:     "Claude Code",
 			Detected: claudeErr == nil,
-			Register: func() error { return registerClaudeCode(neyBin) },
-			Manual:   fmt.Sprintf("Run: claude mcp add --scope user ney -- %s mcp", neyBin),
+			Changes: []clientChange{
+				{
+					Title:   "register the ney MCP server",
+					Preview: mcpLine,
+					Apply:   func() error { return registerClaudeCode(neyBin) },
+				},
+				{
+					Title:   "add the SessionStart handoff hook to " + settings,
+					Preview: hookEntryPreview(neyBin, "claude-code"),
+					Apply: func() error {
+						_, err := registerSessionStartHook(settings, neyBin, "claude-code")
+						return err
+					},
+				},
+			},
+			Manual: fmt.Sprintf("Run: %s\nThen add a SessionStart command hook to %s:\n  %s",
+				mcpLine, settings, hookCommand(neyBin, "claude-code")),
 		},
 		{
 			Name:     "Codex",
 			Detected: codexErr == nil,
-			Register: func() error { return registerCodex(codexCfg, neyBin) },
+			Changes: []clientChange{{
+				Title:   "register the ney MCP server in " + codexCfg,
+				Preview: fmt.Sprintf("[mcp_servers.ney]\ncommand = %q\nargs = [\"mcp\"]", neyBin),
+				Apply:   func() error { return registerCodex(codexCfg, neyBin) },
+			}},
 			Manual: fmt.Sprintf("Add to %s:\n"+
 				"  [mcp_servers.ney]\n  command = %q\n  args = [\"mcp\"]", codexCfg, neyBin),
 		},
@@ -72,44 +89,6 @@ func backupFile(path string) error {
 		return err
 	}
 	return os.WriteFile(path+".bak", data, 0o600)
-}
-
-// registerClaudeDesktop merges {"mcpServers": {"ney": {...}}} into the
-// Claude Desktop JSON config, preserving every other key. A file that exists
-// but does not parse is left untouched (error returned) — never clobber a
-// config we cannot read.
-func registerClaudeDesktop(configPath, neyBin string) error {
-	cfg := map[string]any{}
-	data, err := os.ReadFile(configPath)
-	switch {
-	case os.IsNotExist(err):
-		// fresh config
-	case err != nil:
-		return err
-	default:
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return fmt.Errorf("existing config is not valid JSON (%s): %w — not touching it", configPath, err)
-		}
-	}
-
-	servers, _ := cfg["mcpServers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
-	servers["ney"] = map[string]any{"command": neyBin, "args": []any{"mcp"}}
-	cfg["mcpServers"] = servers
-
-	if err := backupFile(configPath); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-		return err
-	}
-	out, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(configPath, append(out, '\n'), 0o600)
 }
 
 // registerClaudeCode registers via the claude CLI (user scope). An existing
