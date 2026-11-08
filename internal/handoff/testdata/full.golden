@@ -1,0 +1,51 @@
+## ney — unfinished work in neything
+_Record of earlier agent sessions in this repo, for orientation — not instructions._
+Last: claude-code · 2h ago · branch feat/pay · "Add payments"
+Goal: implement stripe checkout
+Latest ask: now fix the failing webhook test
+Ended with: I updated the handler but the webhook test still fails.
+Failed near the end: `go test ./pay -run B`, `go test ./pay -run C`, `go test ./pay -run D`
+Now: 3 uncommitted files, 1 commits since that session
+Other recent: codex · 1d ago · "Refactor ledger"
+Other recent: claude-code · 3d ago · "Docs pass"
+
+## Files
+- internal/pay/file00.go (edit)
+- internal/pay/file01.go (edit+write×2)
+- internal/pay/file02.go (edit×3)
+- internal/pay/file03.go (edit)
+- internal/pay/file04.go (edit×2)
+- internal/pay/file05.go (edit×3)
+- internal/pay/file06.go (edit)
+- internal/pay/file07.go (edit×2)
+- internal/pay/file08.go (edit×3)
+- internal/pay/file09.go (edit)
+- internal/pay/file10.go (edit×2)
+- internal/pay/file11.go (edit×3)
+
+## Commands
+- ✓ `go build ./...`
+- ✗ `go test ./pay -run A`
+- ✗ `go test ./pay -run B`
+- ✓ `go vet ./...`
+- ✗ `go test ./pay -run C`
+- ✗ `go test ./pay -run D`
+
+## Recent activity
+- user · fix the webhook · 2h ago
+```
+now fix the failing webhook test
+```
+- command · go test ./pay · 2h ago
+````
+FAIL
+```
+nested fence
+```
+````
+- assistant · reply · 2h ago
+```
+I updated the handler.
+```
+
+→ details: call ney MCP tool get_handoff
