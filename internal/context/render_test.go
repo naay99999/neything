@@ -119,13 +119,13 @@ func TestRelativeTime(t *testing.T) {
 		{3 * 24 * time.Hour, "3d ago"},
 	}
 	for _, c := range cases {
-		got := relativeTime(now.Add(-c.delta), now)
+		got := RelativeTime(now.Add(-c.delta), now)
 		if got != c.want {
-			t.Errorf("relativeTime(-%v) = %q, want %q", c.delta, got, c.want)
+			t.Errorf("RelativeTime(-%v) = %q, want %q", c.delta, got, c.want)
 		}
 	}
 
-	if got := relativeTime(time.Time{}, now); got != "unknown" {
-		t.Errorf("relativeTime(zero) = %q, want unknown", got)
+	if got := RelativeTime(time.Time{}, now); got != "unknown" {
+		t.Errorf("RelativeTime(zero) = %q, want unknown", got)
 	}
 }

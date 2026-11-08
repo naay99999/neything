@@ -93,7 +93,7 @@ func renderProjectLine(p Project, now time.Time) string {
 		parts = append(parts, p.Branch)
 	}
 
-	timePart := relativeTime(p.LastCommit, now)
+	timePart := RelativeTime(p.LastCommit, now)
 	if p.LastCommitSubject != "" {
 		timePart = fmt.Sprintf("%s: %q", timePart, p.LastCommitSubject)
 	}
@@ -102,9 +102,9 @@ func renderProjectLine(p Project, now time.Time) string {
 	return "- " + strings.Join(parts, " · ")
 }
 
-// relativeTime renders t relative to now as a short human string ("2h
+// RelativeTime renders t relative to now as a short human string ("2h
 // ago", "3d ago"). A zero t renders as "unknown".
-func relativeTime(t, now time.Time) string {
+func RelativeTime(t, now time.Time) string {
 	if t.IsZero() {
 		return "unknown"
 	}
