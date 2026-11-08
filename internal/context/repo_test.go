@@ -73,6 +73,7 @@ func TestResolveRepoWorktree(t *testing.T) {
 func TestResolveRepoNotGit(t *testing.T) {
 	requireGit(t)
 	dir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
 	got, ok := ResolveRepo(context.Background(), dir)
 	if ok || got != filepath.Clean(dir) {
 		t.Errorf("ResolveRepo = (%q, %v), want (%q, false)", got, ok, dir)
@@ -103,5 +104,20 @@ func TestRepoState(t *testing.T) {
 	}
 	if got.CommitsSince != 0 {
 		t.Errorf("zero since: CommitsSince = %d, want 0", got.CommitsSince)
+	}
+}
+
+func TestRepoStateUnborn(t *testing.T) {
+	root := newRepo(t)
+	if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := RepoState(context.Background(), root, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("RepoState on unborn branch: %v", err)
+	}
+	want := GitState{Branch: "main", Uncommitted: 1, CommitsSince: 0}
+	if got != want {
+		t.Errorf("RepoState = %+v, want %+v", got, want)
 	}
 }

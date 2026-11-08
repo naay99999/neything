@@ -48,9 +48,11 @@ type GitState struct {
 // of commits on HEAD made after since. A zero since yields CommitsSince = 0.
 func RepoState(ctx context.Context, root string, since time.Time) (GitState, error) {
 	var st GitState
-	out, err := gitCmd(ctx, root, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	// symbolic-ref works on an unborn branch; rev-parse covers detached HEAD
+	// ("HEAD"). A branch lookup failure is not fatal.
+	out, err := gitCmd(ctx, root, "symbolic-ref", "--short", "-q", "HEAD").Output()
 	if err != nil {
-		return st, fmt.Errorf("git branch: %w", err)
+		out, _ = gitCmd(ctx, root, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	}
 	st.Branch = strings.TrimSpace(string(out))
 
@@ -63,6 +65,10 @@ func RepoState(ctx context.Context, root string, since time.Time) (GitState, err
 	}
 
 	if since.IsZero() {
+		return st, nil
+	}
+	// Unborn branch: no commits, rev-list would fail.
+	if gitCmd(ctx, root, "rev-parse", "--verify", "-q", "HEAD").Run() != nil {
 		return st, nil
 	}
 	out, err = gitCmd(ctx, root, "rev-list", "--count", "--since="+since.Format(time.RFC3339), "HEAD").Output()
