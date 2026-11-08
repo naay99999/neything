@@ -7,7 +7,36 @@
 |---|---|
 | Current version | 0.1 (MVP) |
 | Status | Active |
-| Last updated | 2026-08-01 |
+| Last updated | 2026-11-08 |
+
+---
+
+## 2026-11 — Session handoff refocus
+
+Ney was not being used: it needed manual input (memory only grew when someone called `remember`
+or wrote notes by hand), and after four pivots its identity was unclear. The sharpest real pain
+was handoff — work left half-done in one coding agent, then re-explained to the next. Ney is now
+**automatic cross-agent session handoff**. Spec: `docs/superpowers/specs/2026-11-07-session-handoff-design.md`.
+
+**Cut** (recoverable from history): the whole document indexing/search stack — loaders,
+chunkers, SQLite FTS5 store, indexer, watcher, live scan, writer lock, `internal/discover`,
+`internal/pathfilter` — the `index`/`search`/`watch`/`reset`/`status` commands, and the
+`search_documents`/`search_folder`/`read_document`/`index_folder`/`index_status`/`list_projects`
+tools. Claude Desktop registration is gone too. There is no database any more.
+
+**New design:**
+- `internal/session` (+ `claudecode`, `codex` adapters) reads the transcripts harnesses already
+  write; adapters are tolerant of unknown formats and never redact.
+- `internal/handoff` builds a brief from the repo's latest session(s), live repo state and
+  agent-written notes; `handoff.Build` is the single redaction chokepoint (`internal/redact`).
+- A `SessionStart` hook (`ney hook session-start`) injects a <=3 KB brief; it never fails.
+- MCP: `get_handoff`, `list_sessions`, `write_handoff` join `get_context`, `remember`, `update_profile`.
+- `ney init` registers the MCP server and hook for Claude Code and Codex; `ney handoff [--full]`
+  and `ney doctor` for inspection. Config gains `handoff.*` and `sources`.
+
+**Phase 2** (not started): Cursor as a source, cross-session recall (FTS only if needed), and
+lessons distilled from sessions. Acceptance: one week of real use — new sessions in repos with
+unfinished work should state what was left without being told.
 
 ---
 
