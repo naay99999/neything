@@ -18,6 +18,10 @@ func TestString(t *testing.T) {
 		{"DB_PASSWORD=hunter2hunter2", "hunter2hunter2"},
 		{`{"client_secret": "s3cr3tvalue"}`, "s3cr3tvalue"},
 		{"MY_TOKEN: abc.def.ghi", "abc.def.ghi"},
+		{"export API_KEY='abc123secret'", "abc123secret"},
+		{"{'password': 'hunter2x'}", "hunter2x"},
+		{`{"password": "v4lue9"}`, "v4lue9"},
+		{"Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="},
 	}
 	for _, c := range cases {
 		got := String(c.in)
@@ -31,7 +35,7 @@ func TestString(t *testing.T) {
 }
 
 func TestStringLeavesOrdinaryTextAlone(t *testing.T) {
-	for _, s := range []string{"go test ./... && bun run build", "token budget is 300"} {
+	for _, s := range []string{"go test ./... && bun run build", "token budget is 300", "src/task-runner-config.ts", "risk-assessment-notes.md"} {
 		if got := String(s); got != s {
 			t.Errorf("changed %q -> %q", s, got)
 		}
