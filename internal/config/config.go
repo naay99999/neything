@@ -11,7 +11,11 @@ import (
 
 type Config struct {
 	Context   ContextConfig `mapstructure:"context"`
+	Handoff   HandoffConfig `mapstructure:"handoff"`
 	Telemetry bool          `mapstructure:"telemetry"`
+	// Sources lists the agent transcript sources handoff reads. Defaults to
+	// ["claude-code", "codex"].
+	Sources []string `mapstructure:"sources"`
 
 	// CreatedDefault reports whether this Load call created ~/.ney/config.yaml
 	// from the template. It is not a config key: Load itself is silent (it is
@@ -34,6 +38,20 @@ type ContextConfig struct {
 	// must fall within to count as "active" in get_context. Defaults to 14.
 	ActiveDays int `mapstructure:"active_days"`
 }
+
+// HandoffConfig controls session handoff briefs.
+type HandoffConfig struct {
+	// Auto enables the SessionStart hook injection. Defaults to true.
+	Auto bool `mapstructure:"auto"`
+	// MaxAgeDays is how far back sessions are considered. Defaults to 14.
+	MaxAgeDays int `mapstructure:"max_age_days"`
+	// DisabledRepos are repo roots where the hook stays silent. A leading "~"
+	// is expanded on load.
+	DisabledRepos []string `mapstructure:"disabled_repos"`
+}
+
+// knownSources are the valid names for Config.Sources.
+var knownSources = map[string]bool{"claude-code": true, "codex": true}
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 #
@@ -117,6 +135,19 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if !v.IsSet("handoff.auto") {
+		cfg.Handoff.Auto = true
+	}
+	if cfg.Handoff.MaxAgeDays == 0 {
+		cfg.Handoff.MaxAgeDays = 14
+	}
+	for i, r := range cfg.Handoff.DisabledRepos {
+		cfg.Handoff.DisabledRepos[i] = expandTilde(r)
+	}
+	if !v.IsSet("sources") {
+		cfg.Sources = []string{"claude-code", "codex"}
+	}
+
 	if err := Validate(&cfg); err != nil {
 		return nil, err
 	}
@@ -133,6 +164,14 @@ func Validate(cfg *Config) error {
 	// to a concrete positive value via its default-application step.
 	if cfg.Context.ActiveDays < 0 {
 		return fmt.Errorf("context.active_days must be greater than 0, got %d", cfg.Context.ActiveDays)
+	}
+	if cfg.Handoff.MaxAgeDays < 0 {
+		return fmt.Errorf("handoff.max_age_days must not be negative, got %d", cfg.Handoff.MaxAgeDays)
+	}
+	for _, name := range cfg.Sources {
+		if !knownSources[name] {
+			return fmt.Errorf("unknown source %q in sources (valid: claude-code, codex)", name)
+		}
 	}
 	return nil
 }

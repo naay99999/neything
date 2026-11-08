@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -170,5 +172,41 @@ func TestLoadIsSilentOnFirstRun(t *testing.T) {
 	}
 	if again.CreatedDefault {
 		t.Error("CreatedDefault should be false on a subsequent load")
+	}
+}
+
+// --- handoff / sources ----------------------------------------------------------
+
+func TestLoadHandoffDefaults(t *testing.T) {
+	cfg := writeTestConfig(t, "")
+	if !cfg.Handoff.Auto {
+		t.Error("Handoff.Auto = false, want true by default")
+	}
+	if cfg.Handoff.MaxAgeDays != 14 {
+		t.Errorf("MaxAgeDays = %d, want 14", cfg.Handoff.MaxAgeDays)
+	}
+	if want := []string{"claude-code", "codex"}; !reflect.DeepEqual(cfg.Sources, want) {
+		t.Errorf("Sources = %v, want %v", cfg.Sources, want)
+	}
+}
+
+func TestLoadHandoffAutoFalse(t *testing.T) {
+	cfg := writeTestConfig(t, "handoff:\n  auto: false\n  disabled_repos: [\"~/secret\"]\n")
+	if cfg.Handoff.Auto {
+		t.Error("Handoff.Auto = true, want false when explicitly set")
+	}
+	home, _ := os.UserHomeDir()
+	if want := []string{filepath.Join(home, "secret")}; !reflect.DeepEqual(cfg.Handoff.DisabledRepos, want) {
+		t.Errorf("DisabledRepos = %v, want %v", cfg.Handoff.DisabledRepos, want)
+	}
+}
+
+func TestValidateUnknownSource(t *testing.T) {
+	err := Validate(&Config{Sources: []string{"claude-code", "vim"}})
+	if err == nil || !strings.Contains(err.Error(), "vim") {
+		t.Fatalf("err = %v, want unknown-source error naming vim", err)
+	}
+	if err := Validate(&Config{Handoff: HandoffConfig{MaxAgeDays: -1}}); err == nil {
+		t.Error("negative max_age_days accepted")
 	}
 }
