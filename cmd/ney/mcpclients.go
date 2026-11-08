@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/naay99999/neything/internal/session/codex"
@@ -65,7 +66,7 @@ func detectClients(neyBin string) []clientReg {
 				},
 				{
 					Title:   "add the SessionStart handoff hook to " + settings,
-					Preview: hookEntryPreview(neyBin, "claude-code"),
+					Preview: hookEntryPreview(neyBin, "claude-code") + "\n" + hookRewriteNote(settings),
 					Apply: func() error {
 						_, err := registerSessionStartHook(settings, neyBin, "claude-code")
 						return err
@@ -86,7 +87,7 @@ func detectClients(neyBin string) []clientReg {
 				},
 				{
 					Title:   "add the SessionStart handoff hook to " + codexHooks,
-					Preview: hookEntryPreview(neyBin, "codex"),
+					Preview: hookEntryPreview(neyBin, "codex") + "\n" + hookRewriteNote(codexHooks),
 					Apply: func() error {
 						_, err := registerSessionStartHook(codexHooks, neyBin, "codex")
 						return err
@@ -136,6 +137,11 @@ func registerClaudeCode(neyBin string) error {
 func registerCodex(configPath, neyBin string) error {
 	section := fmt.Sprintf("[mcp_servers.ney]\ncommand = %q\nargs = [\"mcp\"]\n", neyBin)
 
+	if resolved, rerr := filepath.EvalSymlinks(configPath); rerr == nil {
+		configPath = resolved
+	} else if fi, lerr := os.Lstat(configPath); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a dangling symlink — not replacing it", configPath)
+	}
 	data, err := os.ReadFile(configPath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -146,7 +152,7 @@ func registerCodex(configPath, neyBin string) error {
 		lines := strings.Split(string(data), "\n")
 		start := -1
 		for i, ln := range lines {
-			if strings.TrimSpace(ln) == "[mcp_servers.ney]" {
+			if codexNeyTable.MatchString(ln) {
 				start = i
 				break
 			}
@@ -183,8 +189,9 @@ func registerCodex(configPath, neyBin string) error {
 	if err := backupFile(configPath); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(configPath, []byte(out), 0o600)
+	return writeFileAtomic(configPath, []byte(out))
 }
+
+// codexNeyTable matches the ney MCP table header, tolerating whitespace,
+// a quoted key and a trailing comment.
+var codexNeyTable = regexp.MustCompile(`(?m)^\s*\[\s*mcp_servers\.(?:ney|"ney")\s*\]\s*(?:#.*)?$`)

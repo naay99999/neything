@@ -66,3 +66,51 @@ func TestRegisterCodexFreshFile(t *testing.T) {
 		t.Fatalf("fresh file wrong: %s", data)
 	}
 }
+
+func TestRegisterCodexNoDuplicateTable(t *testing.T) {
+	for _, header := range []string{`[mcp_servers.ney] # note`, `[mcp_servers."ney"]`, `  [ mcp_servers.ney ]`} {
+		cfg := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(cfg, []byte("model = \"x\"\n\n"+header+"\ncommand = \"/old\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := registerCodex(cfg, "/new/ney"); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(cfg)
+		if n := strings.Count(string(data), "mcp_servers"); n != 1 {
+			t.Errorf("%q: %d ney tables:\n%s", header, n, data)
+		}
+		if fi, _ := os.Stat(cfg); fi.Mode().Perm() != 0o644 {
+			t.Errorf("mode changed to %v", fi.Mode().Perm())
+		}
+	}
+}
+
+func TestPreviewsDiscloseRewrite(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, c := range detectClients("/bin/ney") {
+		n := 0
+		for _, ch := range c.Changes {
+			if strings.Contains(ch.Preview, "re-written with keys sorted") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s: rewrite note count = %d", c.Name, n)
+		}
+	}
+}
+
+func TestRegisterHookRefusesDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "settings.json")
+	if err := os.Symlink(filepath.Join(dir, "missing.json"), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registerSessionStartHook(link, "/bin/ney", "claude-code"); err == nil {
+		t.Fatal("want error for dangling symlink")
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink was replaced: %v %v", fi, err)
+	}
+}

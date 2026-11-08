@@ -52,6 +52,11 @@ func hookEntryPreview(neyBin, agent string) string {
 	return string(out)
 }
 
+// hookRewriteNote discloses that registering re-serialises the whole file.
+func hookRewriteNote(path string) string {
+	return "Note: " + path + " will be re-written with keys sorted and 2-space indentation (a .bak copy is kept)."
+}
+
 func isNeyHook(h map[string]json.RawMessage, agent string) (string, bool) {
 	var cmd string
 	if raw, ok := h["command"]; !ok || json.Unmarshal(raw, &cmd) != nil {
@@ -193,8 +198,11 @@ func registerSessionStartHook(path, neyBin, agent string) (changed bool, err err
 		return false, err
 	}
 	// Write through a symlink: update its target, not the link itself.
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+	resolved, rerr := filepath.EvalSymlinks(path)
+	if rerr == nil {
 		path = resolved
+	} else if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("%s is a dangling symlink — not replacing it", path)
 	}
 	if err := backupFile(path); err != nil {
 		return false, err
