@@ -6,16 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/naay99999/neything/internal/pathfilter"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	Retrieval RetrievalConfig `mapstructure:"retrieval"`
-	Index     IndexConfig     `mapstructure:"index"`
-	Chunking  ChunkingConfig  `mapstructure:"chunking"`
-	Context   ContextConfig   `mapstructure:"context"`
-	Telemetry bool            `mapstructure:"telemetry"`
+	Context   ContextConfig `mapstructure:"context"`
+	Telemetry bool          `mapstructure:"telemetry"`
 
 	// CreatedDefault reports whether this Load call created ~/.ney/config.yaml
 	// from the template. It is not a config key: Load itself is silent (it is
@@ -25,34 +21,13 @@ type Config struct {
 	CreatedDefault bool `mapstructure:"-" json:"-"`
 }
 
-// IndexConfig controls what the indexer (and live scan / read_document)
-// will touch. Exclude patterns are globs matched case-insensitively against
-// file and directory basenames, on top of the built-in always-on deny list
-// (dotfiles + common secret-file names — see internal/pathfilter).
-type IndexConfig struct {
-	Exclude []string `mapstructure:"exclude"`
-}
-
-type RetrievalConfig struct {
-	TopK int `mapstructure:"top_k"`
-}
-
-type ChunkingConfig struct {
-	Strategy      string            `mapstructure:"strategy"`
-	TargetChars   int               `mapstructure:"target_chars"`
-	OverlapChars  int               `mapstructure:"overlap_chars"`
-	TargetTokens  int               `mapstructure:"target_tokens"`
-	OverlapTokens int               `mapstructure:"overlap_tokens"`
-	ByFormat      map[string]string `mapstructure:"by_format"`
-}
-
-// ContextConfig controls the "layered context" get_context/list_projects
-// surface (internal/context): where to look for git repos on disk, and how
-// wide the "active" window is when deciding which projects to surface.
+// ContextConfig controls the "layered context" get_context surface
+// (internal/context): where to look for git repos on disk, and how wide the
+// "active" window is when deciding which projects to surface.
 type ContextConfig struct {
 	// DevRoots is where ScanRepos looks for git repositories. Defaults to
 	// ["~/workspace"] if that directory exists at load time, else empty (no
-	// live repo scan; get_context still works off indexed workspaces alone).
+	// live repo scan; get_context then lists no projects).
 	// Leading "~" is expanded against the user's home directory on load.
 	DevRoots []string `mapstructure:"dev_roots"`
 	// ActiveDays is the recency window (in days) a project's last commit
@@ -63,40 +38,13 @@ type ContextConfig struct {
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 #
 # ney is a local-first personal context server for AI clients (MCP).
-# Search is keyword-only (SQLite FTS5) and runs entirely on your machine —
-# no API key, no model server, no embeddings. 'ney mcp' gives Claude
-# Code/Desktop/Cursor/Codex get_context, list_projects, search_documents,
-# search_folder, read_document, remember, update_profile, index_folder and
-# index_status. Indexes markdown (.md/.markdown, + Obsidian/Notion) and
-# plain .txt files.
+# 'ney mcp' gives Claude Code/Desktop/Cursor/Codex get_context, remember
+# and update_profile. Everything runs on your machine — no API key, no
+# model server, no network.
 #
 # Run 'ney init' for guided setup. See README.md.
 
-# retrieval settings
-retrieval:
-  top_k: 8
-
-# indexing — extra exclude patterns (globs matched case-insensitively
-# against file and directory names). These add to the built-in always-on
-# excludes: dotfiles/dot-directories and common secret-file names
-# (*secret*, *credential*, *password*, *.key, *.pem, id_rsa*, ...).
-index:
-  exclude: []
-  # exclude: ["*.bak", "drafts-*", "node_modules"]
-
-# chunking settings
-chunking:
-  strategy: markdown        # auto | character | sentence | paragraph | markdown | tokenizer
-  target_chars: 1200
-  overlap_chars: 150
-  target_tokens: 300        # tokenizer strategy only (~4 chars/token)
-  overlap_tokens: 50
-  # by_format used when strategy: auto
-  # by_format:
-  #   md: markdown
-  #   txt: paragraph
-
-# layered context (get_context / list_projects): where to look for git repos,
+# layered context (get_context): where to look for git repos,
 # and how recent a project's last commit must be to count as "active"
 context:
   # dev_roots defaults to ["~/workspace"] if that directory exists (checked
@@ -113,7 +61,6 @@ func NeyDir() string {
 	return filepath.Join(home, ".ney")
 }
 
-func DBPath() string     { return filepath.Join(NeyDir(), "index.db") }
 func ConfigPath() string { return filepath.Join(NeyDir(), "config.yaml") }
 
 // ensureConfigFile creates ~/.ney (0700) and ~/.ney/config.yaml (0600) from
@@ -159,24 +106,6 @@ func Load() (*Config, error) {
 	}
 
 	// apply defaults
-	if cfg.Retrieval.TopK == 0 {
-		cfg.Retrieval.TopK = 8
-	}
-	if cfg.Chunking.Strategy == "" {
-		cfg.Chunking.Strategy = "markdown"
-	}
-	if cfg.Chunking.TargetChars == 0 {
-		cfg.Chunking.TargetChars = 1200
-	}
-	if cfg.Chunking.OverlapChars == 0 {
-		cfg.Chunking.OverlapChars = 150
-	}
-	if cfg.Chunking.TargetTokens == 0 {
-		cfg.Chunking.TargetTokens = 300
-	}
-	if cfg.Chunking.OverlapTokens == 0 {
-		cfg.Chunking.OverlapTokens = 50
-	}
 	if cfg.Context.ActiveDays == 0 {
 		cfg.Context.ActiveDays = 14
 	}
@@ -195,44 +124,10 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate checks the settings that have real consequences if wrong. The
-// index.exclude check matters most: a malformed glob makes the caller's
-// pathfilter fall back to built-ins only, which would silently stop honouring
-// the user's exclude patterns.
+// Validate checks the settings that have real consequences if wrong. Keys
+// from older versions (retrieval, index, chunking, ...) are ignored by Load
+// and never validated.
 func Validate(cfg *Config) error {
-	if _, err := pathfilter.New(cfg.Index.Exclude); err != nil {
-		return fmt.Errorf("index.exclude: %w", err)
-	}
-	validChunk := map[string]bool{
-		"auto": true, "character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true,
-	}
-	if !validChunk[cfg.Chunking.Strategy] {
-		return fmt.Errorf("unknown chunking strategy %q (valid: auto, character, paragraph, markdown, sentence, tokenizer)", cfg.Chunking.Strategy)
-	}
-	if cfg.Chunking.Strategy == "auto" {
-		validPerFormat := map[string]bool{
-			"character": true, "paragraph": true, "markdown": true, "sentence": true, "tokenizer": true,
-		}
-		for docType, strat := range cfg.Chunking.ByFormat {
-			if !validPerFormat[strat] {
-				return fmt.Errorf("unknown chunking.by_format.%s strategy %q", docType, strat)
-			}
-		}
-	}
-	// An overlap at or above the target leaves no forward progress between
-	// windows: every chunk would start where the previous one did, and the
-	// chunker's "never go backwards" guard degrades to one character per
-	// chunk. Rejecting it here turns a config that silently produces a
-	// useless, enormous index into a startup error. As above, 0 means "unset"
-	// for structs built directly in tests — Load() fills both in first.
-	if cfg.Chunking.TargetChars > 0 && cfg.Chunking.OverlapChars >= cfg.Chunking.TargetChars {
-		return fmt.Errorf("chunking.overlap_chars (%d) must be less than chunking.target_chars (%d)",
-			cfg.Chunking.OverlapChars, cfg.Chunking.TargetChars)
-	}
-	if cfg.Chunking.TargetTokens > 0 && cfg.Chunking.OverlapTokens >= cfg.Chunking.TargetTokens {
-		return fmt.Errorf("chunking.overlap_tokens (%d) must be less than chunking.target_tokens (%d)",
-			cfg.Chunking.OverlapTokens, cfg.Chunking.TargetTokens)
-	}
 	// 0 is accepted here (treated as "unset" by structs built directly in
 	// tests without setting Context.ActiveDays); Load() always normalizes it
 	// to a concrete positive value via its default-application step.
@@ -245,7 +140,7 @@ func Validate(cfg *Config) error {
 // defaultDevRoots returns ["~/workspace"] (expanded) if that directory
 // exists at load time, else an empty slice — an install with no dev_roots
 // configured and no ~/workspace simply gets no live repo scan; get_context
-// still works off indexed workspaces alone.
+// then lists no projects.
 func defaultDevRoots() []string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

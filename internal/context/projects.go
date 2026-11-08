@@ -23,8 +23,7 @@ import (
 	"time"
 )
 
-// Project describes one git repository discovered under a dev root, or
-// mapped from an indexed workspace.
+// Project describes one git repository discovered under a dev root.
 type Project struct {
 	Name              string
 	Path              string
@@ -32,7 +31,6 @@ type Project struct {
 	LastCommitSubject string
 	LastCommit        time.Time
 	Dirty             bool
-	Indexed           bool // set by the caller (e.g. against served workspace roots); ScanRepos never sets this
 }
 
 // scanMaxDepth caps how many directory levels ScanRepos descends below each

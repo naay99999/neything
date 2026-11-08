@@ -1,14 +1,11 @@
 package neycontext
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/naay99999/neything/internal/loader"
 )
 
 func TestWriteMemory_FilenameAndFrontmatter(t *testing.T) {
@@ -225,30 +222,36 @@ func TestWriteMemory_CreatesDirIfMissing(t *testing.T) {
 	}
 }
 
-// loadFrontmatter runs the file through the loader that actually claims
-// memory files in production (ObsidianLoader — memory files start with
-// "---", which is what isObsidianNote sniffs for) and returns the metadata
-// it extracted plus the body it kept. Asserting against the real parser is
-// the point: a frontmatter-injection test that reasons about the raw bytes
-// only proves what we wrote, not what a consumer reads back.
+// loadFrontmatter parses a memory file the way a markdown consumer would: a
+// frontmatter block anchored at byte 0 that terminates at the FIRST "\n---"
+// line, with flat "key: value" lines inside it. It returns the metadata
+// and the body that follows. Asserting against a parser that does not share
+// WriteMemory's assumptions is the point: a frontmatter-injection test that
+// reasons about the raw bytes only proves what we wrote, not what a
+// consumer reads back.
 func loadFrontmatter(t *testing.T, path string) (map[string]string, string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	l := &loader.ObsidianLoader{}
-	if !l.Supports(path) {
-		t.Fatalf("ObsidianLoader does not claim %q; test premise is wrong", path)
+	s := string(data)
+	if !strings.HasPrefix(s, "---\n") {
+		t.Fatalf("file does not start with a frontmatter block:\n%s", s)
 	}
-	docs, err := l.Load(context.Background(), path, data, "hash")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	rest := s[len("---\n"):]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		t.Fatalf("frontmatter block never closes:\n%s", s)
 	}
-	if len(docs) != 1 {
-		t.Fatalf("got %d docs, want 1", len(docs))
+	meta := map[string]string{}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			meta[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
 	}
-	return docs[0].Metadata, docs[0].Content
+	body := strings.TrimLeft(rest[end+len("\n---"):], "\n")
+	return meta, body
 }
 
 func TestWriteMemory_ProjectCannotEscapeFrontmatter(t *testing.T) {

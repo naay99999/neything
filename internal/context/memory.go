@@ -36,7 +36,7 @@ const yamlSpecials = ":#\"'[]{},&*!|>%@`\\"
 // the LLM, i.e. potentially from attacker-planted text the LLM was reading
 // (indirect prompt injection). A value carrying a line break could close the
 // frontmatter block early and inject arbitrary keys — or a whole second
-// document — into a file ney indexes and re-serves to every connected client
+// document — into a file ney re-serves to every connected client
 // on every later session, so this collapses every character that a parser
 // could read as a line break (CR/LF, NUL and the rest of C0/C1, DEL, NEL,
 // U+2028/U+2029) to a plain space. After this the value is guaranteed to be
@@ -164,12 +164,10 @@ func WriteMemory(dir string, m Memory) (path string, err error) {
 	}
 	b.WriteString("---\n")
 	// The body is written verbatim (bar the trim). A stray "---" in it is
-	// harmless: every markdown frontmatter parser in this repo
-	// (loader.parseFrontmatter, used by ObsidianLoader — the loader that
-	// actually claims these files, since they start with "---") only honours
-	// a block anchored at byte 0 and terminates it at the FIRST "\n---",
-	// which is always the delimiter written on the line above. Obsidian
-	// itself behaves the same way. Escaping body dashes would corrupt code
+	// harmless: markdown frontmatter parsers only honour a block anchored
+	// at byte 0 and terminate it at the FIRST "\n---", which is always the
+	// delimiter written on the line above. Obsidian itself behaves the same
+	// way. Escaping body dashes would corrupt code
 	// fences and thematic breaks for no security gain.
 	b.WriteString(strings.TrimSpace(m.Content))
 	b.WriteString("\n")

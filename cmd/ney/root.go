@@ -13,38 +13,23 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "ney",
-	Short: "Local-first AI knowledge engine",
-	Long:  "Ney — give your AI agent search + read access to your local documents over MCP. Local-first: your files never leave your machine.",
+	Short: "Local-first personal context server for AI",
+	Long:  "Ney — give your AI agents your profile, projects and memory over MCP. Local-first: nothing leaves your machine.",
 }
 
-var (
-	flagWorkspace string
-	flagTopK      int
-	flagJSON      bool
-	flagPath      string
-	flagAll       bool
-)
+var flagJSON bool
 
 func init() {
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
 
-	rootCmd.PersistentFlags().StringVar(&flagWorkspace, "workspace", "", "workspace name")
-	rootCmd.PersistentFlags().IntVar(&flagTopK, "top-k", 8, "number of chunks to retrieve")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "output JSON")
-	rootCmd.PersistentFlags().StringVar(&flagPath, "path", "", "limit scope to path")
-	rootCmd.PersistentFlags().BoolVar(&flagAll, "all", false, "search across all workspaces, ignoring the current folder's scope")
 
 	rootCmd.AddCommand(
 		initCmd,
-		indexCmd,
-		watchCmd,
-		searchCmd,
-		statusCmd,
 		configCmd,
 		doctorCmd,
 		versionCmd,
-		resetCmd,
 		mcpCmd,
 	)
 }

@@ -34,7 +34,6 @@ func TestRender_ContainsProjectLine(t *testing.T) {
 			Branch:            "main",
 			LastCommitSubject: "Update README",
 			LastCommit:        now.Add(-2 * time.Hour),
-			Indexed:           true,
 		},
 	}
 
@@ -47,9 +46,6 @@ func TestRender_ContainsProjectLine(t *testing.T) {
 	}
 	if !strings.Contains(out, "Update README") {
 		t.Errorf("expected commit subject:\n%s", out)
-	}
-	if !strings.Contains(out, "indexed") {
-		t.Errorf("expected indexed marker:\n%s", out)
 	}
 	if !strings.Contains(out, "Jane, engineer") {
 		t.Errorf("profile content missing:\n%s", out)
@@ -65,8 +61,8 @@ func TestRender_DaysAgoFormatting(t *testing.T) {
 	if !strings.Contains(out, "3d ago") {
 		t.Errorf("expected '3d ago':\n%s", out)
 	}
-	if !strings.Contains(out, "not indexed") {
-		t.Errorf("expected not-indexed marker:\n%s", out)
+	if strings.Contains(out, "indexed") {
+		t.Errorf("render must not mention indexing:\n%s", out)
 	}
 }
 

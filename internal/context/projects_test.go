@@ -73,9 +73,6 @@ func TestScanRepos_FindsFixtureRepo(t *testing.T) {
 	if p.LastCommit.IsZero() {
 		t.Errorf("LastCommit is zero")
 	}
-	if p.Indexed {
-		t.Errorf("Indexed = true, want false (ScanRepos never sets it)")
-	}
 }
 
 func TestScanRepos_DirtyRepo(t *testing.T) {

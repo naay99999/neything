@@ -33,15 +33,3 @@ func promptLine(question string) string {
 	}
 	return strings.TrimSpace(line)
 }
-
-// promptIndexPath offers the current folder first, then falls back to a typed
-// path. Returns "" when the user gives nothing.
-func promptIndexPath() string {
-	if cwd, err := os.Getwd(); err == nil {
-		ans := strings.ToLower(promptLine(Cyan(fmt.Sprintf("Index this folder (%s)? [Y/n] ", displayPath(cwd)))))
-		if ans == "" || strings.HasPrefix(ans, "y") {
-			return cwd
-		}
-	}
-	return promptLine(Cyan("Path to index: "))
-}

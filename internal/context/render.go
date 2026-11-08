@@ -7,16 +7,11 @@ import (
 )
 
 // diggingDeeper is the static "how to go further" section appended to
-// every Layer-1 render. It names the Layer-2 (search/read) and write
-// tools; get_context itself is deliberately not listed.
+// every Layer-1 render. It names the write tools; get_context
+// itself is deliberately not listed.
 const diggingDeeper = `## Digging deeper
-- search_documents: search docs + memory across all indexed projects
-- search_folder: search a specific folder that isn't indexed yet
-- read_document: read one file by path
-- list_projects: full detail (branch, dirty state, last commit, indexed?) for every project
 - remember: save a new fact or decision to memory
-- update_profile: propose an edit to a profile section
-- index_folder / index_status: index a new folder, or check indexing progress`
+- update_profile: propose an edit to a profile section`
 
 // Render assembles the Layer-1 context blob: profile, an active-projects
 // list windowed to the last activeDays and capped at maxShown entries (with
@@ -103,12 +98,6 @@ func renderProjectLine(p Project, now time.Time) string {
 		timePart = fmt.Sprintf("%s: %q", timePart, p.LastCommitSubject)
 	}
 	parts = append(parts, timePart)
-
-	if p.Indexed {
-		parts = append(parts, "indexed")
-	} else {
-		parts = append(parts, "not indexed")
-	}
 
 	return "- " + strings.Join(parts, " · ")
 }

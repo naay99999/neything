@@ -7,17 +7,14 @@ import (
 )
 
 // defaultScanCacheTTL bounds how long a ScanCache serves a stale scan before
-// re-forking git. get_context and list_projects each independently rescan
-// the same dev_roots (and, within a scan, fork git 3x per repo) — a client
-// that calls get_context and then list_projects moments later (a common
-// session-start pattern) would otherwise pay for two full scans instead of
-// one.
+// re-forking git. get_context rescans the dev_roots (forking git 3x per
+// repo) on every call — a client that calls it repeatedly in quick
+// succession would otherwise pay for a full scan each time.
 const defaultScanCacheTTL = 45 * time.Second
 
 // ScanCache memoizes ScanRepos for a short TTL, keyed by the roots argument,
-// so back-to-back calls (e.g. get_context immediately followed by
-// list_projects) reuse one scan instead of re-forking git 3x per repo for
-// each call. Safe for concurrent use.
+// so back-to-back calls reuse one scan instead of re-forking git 3x
+// per repo for each call. Safe for concurrent use.
 //
 // Only a long-running process (ney mcp) should hold a ScanCache. CLI
 // one-shot commands must call ScanRepos directly — they run once and exit,
@@ -36,7 +33,7 @@ type ScanCache struct {
 // Get returns a cached ScanRepos(ctx, roots) result if one was fetched for
 // the identical roots slice within the TTL, otherwise performs a fresh scan
 // and caches it. The returned slice is a defensive copy — callers may
-// mutate it (e.g. to set Indexed) without corrupting the cache.
+// mutate it without corrupting the cache.
 func (c *ScanCache) Get(ctx context.Context, roots []string) []Project {
 	ttl := c.TTL
 	if ttl <= 0 {

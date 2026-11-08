@@ -52,12 +52,6 @@ context:
 	if err != nil {
 		t.Fatalf("Load after SetDevRoots: %v", err)
 	}
-	if cfg.Retrieval.TopK != 12 {
-		t.Errorf("top_k = %d, want 12 (user value must survive)", cfg.Retrieval.TopK)
-	}
-	if len(cfg.Index.Exclude) != 2 || cfg.Index.Exclude[0] != "*.bak" {
-		t.Errorf("index.exclude = %v, want the user's two patterns", cfg.Index.Exclude)
-	}
 	if cfg.Context.ActiveDays != 30 {
 		t.Errorf("active_days = %d, want 30", cfg.Context.ActiveDays)
 	}
@@ -125,8 +119,8 @@ func TestSetDevRootsCreatesConfigWhenMissing(t *testing.T) {
 		t.Errorf("dev_roots = %v, want [/tmp/code]", cfg.Context.DevRoots)
 	}
 	// The template's other defaults must still be there.
-	if cfg.Retrieval.TopK != 8 {
-		t.Errorf("top_k = %d, want the template default 8", cfg.Retrieval.TopK)
+	if cfg.Context.ActiveDays != 14 {
+		t.Errorf("active_days = %d, want the template default 14", cfg.Context.ActiveDays)
 	}
 }
 

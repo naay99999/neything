@@ -7,85 +7,40 @@ import (
 	"testing"
 )
 
-func TestValidateAutoChunkingByFormat(t *testing.T) {
-	cfg := &Config{
-		Chunking: ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"txt": "paragraph"}},
-	}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateAutoRejectsInvalidByFormat(t *testing.T) {
-	cfg := &Config{
-		Chunking: ChunkingConfig{Strategy: "auto", ByFormat: map[string]string{"txt": "invalid"}},
-	}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("expected error for invalid by_format strategy")
-	}
-}
-
 func baseValidCfg() *Config {
-	return &Config{Chunking: ChunkingConfig{Strategy: "markdown"}}
+	return &Config{}
 }
 
-func TestValidateIndexExclude(t *testing.T) {
-	cfg := baseValidCfg()
-	cfg.Index.Exclude = []string{"*.bak", "drafts-*"}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("valid exclude globs should pass: %v", err)
-	}
-	cfg.Index.Exclude = []string{"[unclosed"}
-	if err := Validate(cfg); err == nil {
-		t.Fatal("expected error for malformed exclude glob")
-	}
-}
-
-// TestValidateOldStyleConfigStillLoads guards against regressions for
-// existing installs whose config.yaml predates optional providers. Stale
-// keys the current Config no longer has (chat:, max_context_chars,
-// loaders.git) are silently ignored by viper — see TestLoadIgnoresRemovedKeys.
-// TestLoadIgnoresRemovedProviderKeys pins the "no migration code" promise of
-// the keyword-only cut: a config.yaml still carrying embedder:, reranker:,
-// vector_store: and the old retrieval knobs must load cleanly, with every
-// key ney still understands intact.
-func TestLoadIgnoresRemovedProviderKeys(t *testing.T) {
+// TestLoadIgnoresRemovedKeys pins the "no migration code" promise: a
+// config.yaml still carrying keys of removed features (retrieval, index,
+// chunking, embedder, loaders, ...) must load cleanly, with every key ney
+// still understands intact.
+func TestLoadIgnoresRemovedKeys(t *testing.T) {
 	cfg := writeTestConfig(t, `embedder:
   provider: ollama
-  model: bge-m3
-  endpoint: http://localhost:11434
-
-reranker:
-  provider: cohere
-  model: rerank-v3.5
-
-vector_store:
-  backend: hnsw
-  hnsw:
-    m: 16
-
 retrieval:
   top_k: 12
-  rerank: true
-  rerank_top_k: 24
   mode: hybrid
-
+index:
+  exclude: ["*.bak", "[unclosed"]
 chunking:
-  strategy: markdown
-  target_chars: 1200
+  strategy: bogus
+  target_chars: 10
+  overlap_chars: 500
+loaders:
+  some_removed_loader:
+    enabled: true
+context:
+  active_days: 30
 `)
-	if cfg.Retrieval.TopK != 12 {
-		t.Errorf("top_k = %d, want 12", cfg.Retrieval.TopK)
-	}
-	if cfg.Chunking.Strategy != "markdown" || cfg.Chunking.TargetChars != 1200 {
-		t.Errorf("chunking not preserved: %+v", cfg.Chunking)
+	if cfg.Context.ActiveDays != 30 {
+		t.Fatalf("active_days = %d, want 30", cfg.Context.ActiveDays)
 	}
 }
 
 // writeTestConfig points $HOME at a fresh temp dir, writes the given
-// retrieval-focused config.yaml under ~/.ney, and loads it through the real
-// config.Load() path (including normalizeRetrievalMode) so these tests
-// exercise the actual viper decode, not just Validate().
+// config.yaml under ~/.ney, and loads it through the real config.Load() path
+// so these tests exercise the actual viper decode, not just Validate().
 func writeTestConfig(t *testing.T, yaml string) *Config {
 	t.Helper()
 	dir := t.TempDir()
@@ -104,49 +59,6 @@ func writeTestConfig(t *testing.T, yaml string) *Config {
 	return cfg
 }
 
-// TestLoadIgnoresRemovedKeys: configs written by older ney versions still
-// contain chat:, retrieval.max_context_chars, and loaders.git — none of
-// which exist in the Config struct anymore. They must load without error.
-func TestLoadIgnoresRemovedKeys(t *testing.T) {
-	cfg := writeTestConfig(t, `embedder:
-  provider: none
-chat:
-  provider: claude
-  model: claude-sonnet-4-6
-retrieval:
-  top_k: 8
-  max_context_chars: 12000
-loaders:
-  git:
-    recent_commits: 5
-`)
-	if cfg.Retrieval.TopK != 8 {
-		t.Fatalf("expected top_k 8, got %d", cfg.Retrieval.TopK)
-	}
-}
-
-// TestLoadIgnoresLegacyLoaderKeys guards against regressions for pre-md-only-
-// cut installs whose config.yaml still has a loaders: section (the Config
-// struct no longer has a Loaders field at all) and by_format entries for
-// removed doc types — viper must silently ignore the former, and the latter
-// is inert (only checked when chunking.strategy is "auto").
-func TestLoadIgnoresLegacyLoaderKeys(t *testing.T) {
-	cfg := writeTestConfig(t, `embedder:
-  provider: none
-loaders:
-  some_removed_loader:
-    enabled: true
-    extra: eng
-chunking:
-  strategy: markdown
-  by_format:
-    some_removed_doc_type: some_removed_strategy
-`)
-	if cfg.Chunking.Strategy != "markdown" {
-		t.Fatalf("expected chunking.strategy markdown, got %q", cfg.Chunking.Strategy)
-	}
-}
-
 // --- context.dev_roots / context.active_days -----------------------------------
 
 func TestValidateRejectsNegativeActiveDays(t *testing.T) {
@@ -157,8 +69,7 @@ func TestValidateRejectsNegativeActiveDays(t *testing.T) {
 	}
 }
 
-// TestValidateZeroActiveDaysAccepted guards the "unset" convention shared
-// with Retrieval.Mode's "": structs built directly in tests (bypassing
+// TestValidateZeroActiveDaysAccepted guards the "unset" convention: structs built directly in tests (bypassing
 // Load()'s defaulting step) leave ActiveDays at its zero value and must
 // still validate — Load() is the only place that turns 0 into 14.
 func TestValidateZeroActiveDaysAccepted(t *testing.T) {
