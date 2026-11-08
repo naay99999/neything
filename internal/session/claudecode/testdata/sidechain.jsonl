@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"Explore the repo"},"cwd":"/repo","gitBranch":"main","sessionId":"s2","timestamp":"2026-11-01T11:00:00.000Z","isSidechain":true,"uuid":"x1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Explored."}]},"cwd":"/repo","gitBranch":"main","sessionId":"s2","timestamp":"2026-11-01T11:00:05.000Z","isSidechain":true,"uuid":"x2"}
