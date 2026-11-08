@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/naay99999/neything/internal/config"
+	"github.com/naay99999/neything/internal/session/codex"
 )
 
 // claudeCodeChecks reports whether the Claude Code side of session handoff is
@@ -75,6 +76,47 @@ func claudeCodeChecks(cfg *config.Config) []checkResult {
 			rs = append(rs, checkResult{Check: "handoff_brief", OK: true, Message: "Handoff brief: ready for " + brief.RepoName})
 		}
 	}
+	return rs
+}
+
+// codexChecks reports the Codex side of session handoff (hook + rollouts).
+// It reports nothing unless "codex" is an enabled source.
+func codexChecks(cfg *config.Config) []checkResult {
+	enabled := false
+	for _, name := range cfg.Sources {
+		enabled = enabled || name == "codex"
+	}
+	if !enabled {
+		return nil
+	}
+	dir, ok := codex.Home()
+	if !ok {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".codex")
+	}
+
+	var rs []checkResult
+	if installed, cmd := hookInstalled(filepath.Join(dir, "hooks.json"), "codex"); !installed {
+		rs = append(rs, checkResult{
+			Check: "codex_hook", OK: false,
+			Message: "Codex hook: not installed",
+			Hint:    "Run `ney init` to add the SessionStart handoff hook",
+		})
+	} else if bin := hookBinary(cmd, "codex"); !binaryExists(bin) {
+		rs = append(rs, checkResult{
+			Check: "codex_hook", OK: false,
+			Message: fmt.Sprintf("Codex hook: installed, but binary not found (%s)", bin),
+			Hint:    "Run `ney init` to refresh the hook path",
+		})
+	} else {
+		rs = append(rs, checkResult{Check: "codex_hook", OK: true, Message: "Codex hook: installed (" + bin + ")"})
+	}
+
+	files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*", "*", "*", "rollout-*.jsonl"))
+	rs = append(rs, checkResult{
+		Check: "codex_sessions", OK: true,
+		Message: fmt.Sprintf("Codex sessions: %d", len(files)),
+	})
 	return rs
 }
 

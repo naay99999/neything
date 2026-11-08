@@ -53,6 +53,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	})
 
 	results = append(results, claudeCodeChecks(cfg)...)
+	results = append(results, codexChecks(cfg)...)
 
 	printDoctorResults(results)
 	return nil

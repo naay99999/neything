@@ -123,6 +123,9 @@ func stepClients() {
 			}
 			applied = true
 			fmt.Println(Green("        ✓ Done"))
+			if ch.After != "" {
+				fmt.Println(Yellow("        " + ch.After))
+			}
 		}
 		if applied {
 			fmt.Println(Green("        Restart " + c.Name + " to apply"))

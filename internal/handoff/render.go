@@ -105,10 +105,19 @@ func (b Brief) lastLine() string {
 	if br := inline(p.Branch); br != "" {
 		parts = append(parts, "branch "+br)
 	}
-	if t := clip(p.Title, 120); t != "" {
+	if t := sessionTitle(*p); t != "" {
 		parts = append(parts, `"`+t+`"`)
 	}
 	return strings.Join(parts, " · ")
+}
+
+// sessionTitle is the session's Title, or — for agents that record none
+// (Codex) — its first prompt clipped to 60 runes.
+func sessionTitle(s session.Session) string {
+	if t := clip(s.Title, 120); t != "" {
+		return t
+	}
+	return clip(s.FirstPrompt, 60)
 }
 
 func (b Brief) nowLine() string {
@@ -121,7 +130,7 @@ func (b Brief) othersLines() string {
 		if i == maxOthers {
 			break
 		}
-		fmt.Fprintf(&sb, "Other recent: %s · %s · \"%s\"\n", inline(o.Agent), neycontext.RelativeTime(o.End, b.Now), clip(o.Title, 120))
+		fmt.Fprintf(&sb, "Other recent: %s · %s · \"%s\"\n", inline(o.Agent), neycontext.RelativeTime(o.End, b.Now), sessionTitle(o))
 	}
 	return sb.String()
 }

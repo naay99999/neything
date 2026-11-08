@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/naay99999/neything/internal/session/codex"
 )
 
 // clientChange is one confirmable modification to an AI client's config.
@@ -14,6 +16,8 @@ type clientChange struct {
 	Title   string
 	Preview string
 	Apply   func() error
+	// After is printed once Apply succeeds (optional follow-up the user must do).
+	After string
 }
 
 // clientReg describes one AI client the wizard can register ney with. Every
@@ -37,9 +41,16 @@ func detectClients(neyBin string) []clientReg {
 	_, claudeErr := exec.LookPath("claude")
 	settings := filepath.Join(home, ".claude", "settings.json")
 
-	codexDir := filepath.Join(home, ".codex")
+	// Codex counts as detected when its home exists or the binary is on PATH.
+	// Without a home dir we target ~/.codex; the directory is created only when
+	// a change is applied.
+	codexDir, codexHomeOK := codex.Home()
+	if !codexHomeOK {
+		codexDir = filepath.Join(home, ".codex")
+	}
+	_, codexBinErr := exec.LookPath("codex")
 	codexCfg := filepath.Join(codexDir, "config.toml")
-	_, codexErr := os.Stat(codexDir)
+	codexHooks := filepath.Join(codexDir, "hooks.json")
 
 	mcpLine := fmt.Sprintf("claude mcp add --scope user ney -- %s mcp", neyBin)
 	return []clientReg{
@@ -66,14 +77,27 @@ func detectClients(neyBin string) []clientReg {
 		},
 		{
 			Name:     "Codex",
-			Detected: codexErr == nil,
-			Changes: []clientChange{{
-				Title:   "register the ney MCP server in " + codexCfg,
-				Preview: fmt.Sprintf("[mcp_servers.ney]\ncommand = %q\nargs = [\"mcp\"]", neyBin),
-				Apply:   func() error { return registerCodex(codexCfg, neyBin) },
-			}},
+			Detected: codexHomeOK || codexBinErr == nil,
+			Changes: []clientChange{
+				{
+					Title:   "register the ney MCP server in " + codexCfg,
+					Preview: fmt.Sprintf("[mcp_servers.ney]\ncommand = %q\nargs = [\"mcp\"]", neyBin),
+					Apply:   func() error { return registerCodex(codexCfg, neyBin) },
+				},
+				{
+					Title:   "add the SessionStart handoff hook to " + codexHooks,
+					Preview: hookEntryPreview(neyBin, "codex"),
+					Apply: func() error {
+						_, err := registerSessionStartHook(codexHooks, neyBin, "codex")
+						return err
+					},
+					After: "Codex runs new hooks only after you trust them: run /hooks inside Codex once.",
+				},
+			},
 			Manual: fmt.Sprintf("Add to %s:\n"+
-				"  [mcp_servers.ney]\n  command = %q\n  args = [\"mcp\"]", codexCfg, neyBin),
+				"  [mcp_servers.ney]\n  command = %q\n  args = [\"mcp\"]\n"+
+				"Then add a SessionStart command hook to %s:\n  %s",
+				codexCfg, neyBin, codexHooks, hookCommand(neyBin, "codex")),
 		},
 	}
 }

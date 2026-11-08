@@ -15,6 +15,7 @@ import (
 	"github.com/naay99999/neything/internal/handoff"
 	"github.com/naay99999/neything/internal/session"
 	"github.com/naay99999/neything/internal/session/claudecode"
+	"github.com/naay99999/neything/internal/session/codex"
 )
 
 const (
@@ -43,14 +44,20 @@ func (e errSessionNotFound) Error() string {
 // resolved at call time (tests set HOME).
 func sourcesFor(cfg *config.Config) []session.Source {
 	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return nil
+	if err != nil {
+		home = ""
 	}
 	var out []session.Source
 	for _, name := range cfg.Sources {
 		switch name {
 		case "claude-code":
-			out = append(out, claudecode.New(filepath.Join(home, ".claude", "projects")))
+			if home != "" {
+				out = append(out, claudecode.New(filepath.Join(home, ".claude", "projects")))
+			}
+		case "codex":
+			if h, ok := codex.Home(); ok {
+				out = append(out, codex.New(h))
+			}
 		}
 	}
 	return out

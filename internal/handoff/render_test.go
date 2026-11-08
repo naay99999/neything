@@ -172,6 +172,26 @@ func TestLatestAskOmittedWhenSameAsGoal(t *testing.T) {
 	}
 }
 
+func TestTitleFallback(t *testing.T) {
+	p := baseSession()
+	p.Title, p.FirstPrompt = "", strings.Repeat("x", 80)
+	o := baseSession()
+	o.ID, o.Title, o.FirstPrompt = "s2", "", "refactor the\nrouter"
+	b := Build("repo", []session.Session{p, o}, nil, neycontext.GitState{}, false, testNow)
+	out := b.RenderFull()
+	if !strings.Contains(out, `"`+strings.Repeat("x", 60)+`…"`) {
+		t.Errorf("primary should fall back to FirstPrompt clipped to 60 runes:\n%s", out)
+	}
+	if !strings.Contains(out, `"refactor the router"`) {
+		t.Errorf("other should fall back to FirstPrompt:\n%s", out)
+	}
+	p.Title = "Real title"
+	b = Build("repo", []session.Session{p}, nil, neycontext.GitState{}, false, testNow)
+	if o := b.RenderFull(); !strings.Contains(o, `"Real title"`) || strings.Contains(o, `"`+strings.Repeat("x", 60)) {
+		t.Errorf("explicit Title must win:\n%s", o)
+	}
+}
+
 func TestNowLineOnlyWhenGitOK(t *testing.T) {
 	s := baseSession()
 	b := Build("repo", []session.Session{s}, nil, neycontext.GitState{Uncommitted: 4, CommitsSince: 2}, false, testNow)

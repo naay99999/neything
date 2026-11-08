@@ -1,0 +1,15 @@
+{"timestamp":"2026-11-01T10:00:00.000Z","type":"session_meta","payload":{"id":"0190aaaa-1111-2222-3333-444455556666","timestamp":"2026-11-01T10:00:00.000Z","cwd":"/repo","originator":"codex_cli_rs","git":{"commit_hash":"abc123","branch":"main","repository_url":"git@example.com:x/y.git"}}}
+{"timestamp":"2026-11-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\n\nAlways be terse.\n\n</user_instructions>"}]}}
+{"timestamp":"2026-11-01T10:00:01.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-11-01T10:00:01.200Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nrun tests\n</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-11-01T10:00:02.000Z","type":"turn_context","payload":{"cwd":"/repo","approval_policy":"on-request"}}
+{"timestamp":"2026-11-01T10:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the payment flow so refunds work"}}
+{"timestamp":"2026-11-01T10:00:03.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the payment flow so refunds work"}]}}
+{"timestamp":"2026-11-01T10:00:10.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"bash\",\"-lc\",\"go test ./...\"],\"workdir\":\"/repo\"}","call_id":"call_1"}}
+{"timestamp":"2026-11-01T10:00:12.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"{\"output\":\"FAIL pay_test.go\",\"metadata\":{\"exit_code\":1,\"duration_seconds\":1.2}}"}}
+{"timestamp":"2026-11-01T10:00:20.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: a.go\n@@\n-old\n+new\n*** Add File: b.go\n+package b\n*** End Patch","call_id":"call_2"}}
+{"timestamp":"2026-11-01T10:00:21.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":"{\"output\":\"Success\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"2026-11-01T10:00:30.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Patched a.go and added b.go."}]}}
+{"timestamp":"2026-11-01T10:00:30.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Patched a.go and added b.go."}}
+{"timestamp":"2026-11-01T10:00:31.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"2026-11-01T10:00:32.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Tests still failing in pay_test.go"}}

@@ -231,7 +231,7 @@ first.
 ```
 SessionStart → ney hook session-start --agent claude-code
   stdin JSON: session_id, cwd, source
-  source ∈ {resume, compact}           → print nothing
+  source ∈ {resume, compact, fork}     → print nothing
   handoff.auto=false or repo disabled  → print nothing
   else → Recent() per source → Load primary → Build → RenderInject
        → stdout: {"hookSpecificOutput":{"hookEventName":"SessionStart",
@@ -243,7 +243,9 @@ SessionStart → ney hook session-start --agent claude-code
 - Codex: whether its SessionStart hook can inject context is verified during
   planning. If not, fallback is a line in the user's global Codex
   instructions (`AGENTS.md`) telling the agent to call `get_handoff` at the
-  start of work in a repo.
+  start of work in a repo. Verified 2026-11-08 from Codex source
+  (codex-rs/hooks output_parser): SessionStart honours
+  hookSpecificOutput.additionalContext; no AGENTS.md fallback needed.
 
 ### MCP tools (v1)
 

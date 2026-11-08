@@ -78,8 +78,9 @@ func hookSessionStart(cmd *cobra.Command) string {
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return "parse stdin: " + err.Error()
 	}
-	// Resuming or compacting continues a session that already has context.
-	if in.Source == "resume" || in.Source == "compact" {
+	// Resuming, compacting or forking (Codex copies the conversation) continues
+	// a session that already has context.
+	if in.Source == "resume" || in.Source == "compact" || in.Source == "fork" {
 		return ""
 	}
 	cfg, err := config.Load()
