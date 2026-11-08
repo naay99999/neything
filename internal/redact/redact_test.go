@@ -22,6 +22,15 @@ func TestString(t *testing.T) {
 		{"{'password': 'hunter2x'}", "hunter2x"},
 		{`{"password": "v4lue9"}`, "v4lue9"},
 		{"Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="},
+		{"STRIPE sk_live_abcdefghij1234567890", "sk_live_abcdefghij1234567890"},
+		{"rk_test_ABCDEFGHIJ0123456789", "rk_test_ABCDEFGHIJ0123456789"},
+		{"key AIzaSyA1234567890abcdefghijklmnopqrstuv", "AIzaSyA1234567890abcdefghijklmnopqrstuv"},
+		{"npm_abcdefghijklmnopqrstuvwxyz0123456789", "npm_abcdefghijklmnopqrstuvwxyz0123456789"},
+		{"postgres://admin:hunter22pw@db.example.com/app", "hunter22pw"},
+		{"curl --token abcd1234efgh", "abcd1234efgh"},
+		{"cli --password=hunter22pw", "hunter22pw"},
+		{"cli --api-key zzzz9999", "zzzz9999"},
+		{"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAunterminated", "MIIEowIBAAKCAQEAunterminated"},
 	}
 	for _, c := range cases {
 		got := String(c.in)
@@ -35,9 +44,16 @@ func TestString(t *testing.T) {
 }
 
 func TestStringLeavesOrdinaryTextAlone(t *testing.T) {
-	for _, s := range []string{"go test ./... && bun run build", "token budget is 300", "src/task-runner-config.ts", "risk-assessment-notes.md"} {
+	for _, s := range []string{"go test ./... && bun run build", "token budget is 300", "src/task-runner-config.ts", "risk-assessment-notes.md", "Basic configuration is fine", "token management works", "cli --token-budget 3000"} {
 		if got := String(s); got != s {
 			t.Errorf("changed %q -> %q", s, got)
 		}
+	}
+}
+
+func TestURLUserinfoKeepsUser(t *testing.T) {
+	got := String("postgres://u:pw@host/db")
+	if got != "postgres://u:[redacted]@host/db" {
+		t.Errorf("got %q", got)
 	}
 }
