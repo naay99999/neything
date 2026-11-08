@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,5 +155,52 @@ func TestHookOutsideGit(t *testing.T) {
 	}
 	if strings.Contains(ctx, "Now:") {
 		t.Errorf("Now: line present outside git:\n%s", ctx)
+	}
+}
+
+func TestHookStdinNeverClosedReturns(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	resetAllFlags(rootCmd)
+	var out, errb bytes.Buffer
+	rootCmd.SetIn(pr)
+	rootCmd.SetOut(&out)
+	rootCmd.SetErr(&errb)
+	rootCmd.SetArgs([]string{"hook", "session-start"})
+	t.Cleanup(func() { rootCmd.SetIn(nil); rootCmd.SetOut(nil); rootCmd.SetErr(nil); rootCmd.SetArgs(nil) })
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- rootCmd.Execute() }()
+	select {
+	case err := <-done:
+		if err != nil || out.Len() != 0 {
+			t.Errorf("err=%v out=%q", err, out.String())
+		}
+		if time.Since(start) > 2500*time.Millisecond {
+			t.Errorf("took %s", time.Since(start))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook hung on open stdin")
+	}
+}
+
+func TestHookRepoDisabledSymlinkAndEmpty(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(base, "real")
+	link := filepath.Join(base, "link")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if !hookRepoDisabled([]string{link}, real, real) {
+		t.Error("symlinked disabled entry not matched against resolved root")
+	}
+	if hookRepoDisabled([]string{"", "  "}, real, real) {
+		t.Error("empty disabled entry matched")
 	}
 }

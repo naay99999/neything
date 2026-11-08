@@ -13,6 +13,7 @@ import (
 
 	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
+	"github.com/naay99999/neything/internal/session"
 )
 
 var hookAgent string
@@ -35,6 +36,28 @@ func init() {
 	hookSessionStartCmd.Flags().StringVar(&hookAgent, "agent", "claude-code", "calling agent (claude-code|codex); accepted for logging, unknown values are not an error")
 	hookCmd.AddCommand(hookSessionStartCmd)
 	rootCmd.AddCommand(hookCmd)
+}
+
+const hookStdinTimeout = time.Second
+
+// readStdinTimeout reads up to 1 MiB from r but gives up after d, so a harness
+// that never closes stdin cannot hang session startup.
+func readStdinTimeout(r io.Reader, d time.Duration) ([]byte, error) {
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(io.LimitReader(r, 1<<20))
+		ch <- result{b, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.b, res.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("timed out after %s", d)
+	}
 }
 
 // hookInput is the subset of the harness's SessionStart payload ney uses.
@@ -70,7 +93,7 @@ func runHookSessionStart(cmd *cobra.Command, _ []string) (err error) {
 
 // hookSessionStart does the work and returns a diagnostic ("" when none).
 func hookSessionStart(cmd *cobra.Command) string {
-	raw, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), 1<<20))
+	raw, err := readStdinTimeout(cmd.InOrStdin(), hookStdinTimeout)
 	if err != nil {
 		return "read stdin: " + err.Error()
 	}
@@ -133,11 +156,11 @@ func hookSessionStart(cmd *cobra.Command) string {
 // disabled root or lies inside one.
 func hookRepoDisabled(disabled []string, root, cwd string) bool {
 	for _, d := range disabled {
-		d = filepath.Clean(d)
-		for _, p := range []string{filepath.Clean(root), filepath.Clean(cwd)} {
-			if p == d || strings.HasPrefix(p, d+string(filepath.Separator)) {
-				return true
-			}
+		if strings.TrimSpace(d) == "" {
+			continue
+		}
+		if session.Within(root, d) || session.Within(cwd, d) {
+			return true
 		}
 	}
 	return false

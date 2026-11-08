@@ -5,6 +5,8 @@ package session
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -61,4 +63,29 @@ type Source interface {
 	Recent(repoRoot string, since time.Time) ([]Ref, error)
 	// Load distils a session. full=false avoids reading whole large files.
 	Load(ref Ref, full bool) (Session, error)
+}
+
+// Canon returns path cleaned and, best-effort, with symlinks resolved; when
+// resolution fails it is just the cleaned path.
+func Canon(path string) string {
+	if path == "" {
+		return ""
+	}
+	c := filepath.Clean(path)
+	if r, err := filepath.EvalSymlinks(c); err == nil {
+		return r
+	}
+	return c
+}
+
+// Within reports whether cwd is root or lies inside it, comparing both the
+// literal and the symlink-resolved forms of each side.
+func Within(cwd, root string) bool {
+	if cwd == "" || root == "" {
+		return false
+	}
+	in := func(c, r string) bool {
+		return c == r || strings.HasPrefix(c, r+string(filepath.Separator))
+	}
+	return in(filepath.Clean(cwd), filepath.Clean(root)) || in(Canon(cwd), Canon(root))
 }

@@ -302,3 +302,33 @@ func TestRecent(t *testing.T) {
 		t.Errorf("ID = %q", refs[0].ID)
 	}
 }
+
+func TestRecentSymlinkedRoot(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(base, "real")
+	link := filepath.Join(base, "link")
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	pd := t.TempDir()
+	d := filepath.Join(pd, Slug(real+"/sub"))
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"type":"user","cwd":"` + real + `/sub","message":{"role":"user","content":"hi"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(d, "s.jsonl"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{real, link} {
+		refs, err := New(pd).Recent(root, time.Now().Add(-time.Hour))
+		if err != nil || len(refs) != 1 {
+			t.Errorf("root %s: refs=%v err=%v", root, refs, err)
+		}
+	}
+}

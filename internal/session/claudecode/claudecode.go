@@ -60,7 +60,10 @@ func Slug(path string) string {
 // it, modified at or after since, newest first.
 func (s source) Recent(repoRoot string, since time.Time) ([]session.Ref, error) {
 	root := filepath.Clean(repoRoot)
-	slug := Slug(root)
+	slugs := []string{Slug(root)}
+	if r := session.Canon(root); r != root {
+		slugs = append(slugs, Slug(r))
+	}
 	dirs, err := os.ReadDir(s.dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -70,7 +73,7 @@ func (s source) Recent(repoRoot string, since time.Time) ([]session.Ref, error) 
 	}
 	var refs []session.Ref
 	for _, d := range dirs {
-		if !d.IsDir() || (d.Name() != slug && !strings.HasPrefix(d.Name(), slug+"-")) {
+		if !d.IsDir() || (!matchesSlug(d.Name(), slugs)) {
 			continue
 		}
 		dirPath := filepath.Join(s.dir, d.Name())
@@ -88,7 +91,7 @@ func (s source) Recent(repoRoot string, since time.Time) ([]session.Ref, error) 
 			}
 			p := filepath.Join(dirPath, f.Name())
 			cwd := firstCwd(p)
-			if cwd != root && !strings.HasPrefix(cwd, root+"/") {
+			if !session.Within(cwd, root) {
 				continue
 			}
 			refs = append(refs, session.Ref{
@@ -479,4 +482,13 @@ func clip(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func matchesSlug(name string, slugs []string) bool {
+	for _, slug := range slugs {
+		if name == slug || strings.HasPrefix(name, slug+"-") {
+			return true
+		}
+	}
+	return false
 }

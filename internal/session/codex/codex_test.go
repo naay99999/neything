@@ -246,3 +246,40 @@ func TestHomeHonorsCodexHome(t *testing.T) {
 		t.Errorf("Home() = %q, %v", got, ok)
 	}
 }
+
+func TestCodexRecentSymlinkedRoot(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(base, "real")
+	link := filepath.Join(base, "link")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(fixtureRef().Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "2026/11/02")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(data), `"cwd":"/repo"`, `"cwd":"`+real+`"`, -1)
+	p := filepath.Join(dir, "rollout-2026-11-02T09-00-00-0190bbbb-0000-0000-0000-000000000001.jsonl")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mod := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(p, mod, mod); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := New(home).Recent(link, mod.Add(-24*time.Hour))
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("refs=%v err=%v", refs, err)
+	}
+}

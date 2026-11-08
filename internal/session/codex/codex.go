@@ -100,7 +100,7 @@ func (s source) Recent(repoRoot string, since time.Time) ([]session.Ref, error) 
 					}
 					p := filepath.Join(dir, name)
 					cwd := metaCwd(p)
-					if cwd != root && !strings.HasPrefix(cwd, root+string(filepath.Separator)) {
+					if !session.Within(cwd, root) {
 						continue
 					}
 					refs = append(refs, session.Ref{
