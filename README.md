@@ -123,10 +123,10 @@ Keys left over from older versions are ignored.
 ## Privacy
 
 - Everything is local. Ney makes no network calls.
-- It reads only the transcript directories above (`~/.claude/projects`, Codex `sessions/`) and the git state of the repo you are in.
+- It reads only: the transcript directories above (`~/.claude/projects`, Codex `sessions/`), `~/.ney`, the repo you are in (its git state), and (for `get_context`) repos under `context.dev_roots`.
 - Every string in a brief passes through a redactor first (API keys, tokens, JWTs, private keys, `Bearer` values, and values of secret-named keys like `password=` become `[redacted]`). **Redaction is best-effort**, not a guarantee; do not rely on it for secrets you would not want an agent to see.
 - The injected text is labelled as a record of earlier sessions, not instructions.
-- Ney writes only under `~/.ney`: handoff notes (`handoff/`), memories (`memory/`), `profile.md`, `config.yaml`.
+- At runtime ney writes only under `~/.ney`: handoff notes (`handoff/`), memories (`memory/`), `profile.md`, `config.yaml`. `ney init` additionally edits the agent config files listed above (with `.bak` backups).
 
 ### Disable it
 

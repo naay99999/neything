@@ -38,14 +38,14 @@ func TestRunSetupWizardRefusesNonInteractive(t *testing.T) {
 	}
 }
 
-// TestSetupCompletedFollowsProfile: the wizard bootstraps ~/.ney/profile.md,
-// so that file is the "set up" marker.
-func TestSetupCompletedFollowsProfile(t *testing.T) {
+// TestSetupCompletedFollowsMarker: profile.md is auto-created by get_context,
+// so only the marker written by a finished `ney init` counts.
+func TestSetupCompletedFollowsMarker(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 
 	if setupCompleted() {
-		t.Fatal("setupCompleted = true on a machine with no profile.md")
+		t.Fatal("setupCompleted = true on a machine with nothing set up")
 	}
 	if err := os.MkdirAll(filepath.Join(dir, ".ney"), 0o700); err != nil {
 		t.Fatal(err)
@@ -53,7 +53,11 @@ func TestSetupCompletedFollowsProfile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".ney", "profile.md"), []byte("# me\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if setupCompleted() {
+		t.Fatal("setupCompleted = true from profile.md alone")
+	}
+	markSetupComplete()
 	if !setupCompleted() {
-		t.Fatal("setupCompleted = false although profile.md exists")
+		t.Fatal("setupCompleted = false after markSetupComplete")
 	}
 }

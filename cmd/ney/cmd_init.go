@@ -24,11 +24,19 @@ var initCmd = &cobra.Command{
 // isInteractive is a var so tests can drive the wizard's TTY guard.
 var isInteractive = func() bool { return isatty.IsTerminal(os.Stdin.Fd()) }
 
-// setupCompleted reports whether this machine has been through setup: the
-// wizard bootstraps ~/.ney/profile.md, so its presence is the marker.
+// setupMarkerName is written at the end of a successful `ney init`. profile.md
+// is not a usable marker: get_context creates it on its own.
+const setupMarkerName = "setup-complete"
+
+// setupCompleted reports whether `ney init` has finished on this machine.
 func setupCompleted() bool {
-	_, err := os.Stat(filepath.Join(config.NeyDir(), "profile.md"))
+	_, err := os.Stat(filepath.Join(config.NeyDir(), setupMarkerName))
 	return err == nil
+}
+
+func markSetupComplete() {
+	_ = os.MkdirAll(config.NeyDir(), 0o700)
+	_ = os.WriteFile(filepath.Join(config.NeyDir(), setupMarkerName), []byte("ok\n"), 0o600)
 }
 
 // runSetupWizard walks the user through the full first-run flow. Every step
@@ -50,6 +58,7 @@ func runSetupWizard(_ context.Context) error {
 
 	stepClients()
 
+	markSetupComplete()
 	fmt.Println()
 	fmt.Println(Bold("✓ Setup complete"))
 	fmt.Println(Dim("  Memory: tell your AI \"remember that ...\" and it saves a file under " + displayPath(memoryDir()) +
