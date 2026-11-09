@@ -18,14 +18,17 @@ const (
 	askMax       = 300
 	endedMax     = 800
 	endedMaxTiny = 300
-	noteMaxInj   = 600
-	maxFilesInj  = 10
-	maxFailedInj = 3
-	maxOthers    = 2
+
+	noteInjectBudget = 1800
+	noteInjectMin    = 300
+	noteCutMarker    = "… (full note: get_handoff)"
+	maxFilesInj      = 10
+	maxFailedInj     = 3
+	maxOthers        = 2
 
 	fullFieldMax = 2000
 	fullEndedMax = 4000
-	fullNoteMax  = 4000
+	fullNoteMax  = 8000
 	fullTailKeep = 30
 	tailBodyMax  = 2000
 )
@@ -144,13 +147,55 @@ type injectOpts struct {
 	files    int
 	ask      bool
 	endedMax int
+	noteMax  int // byte budget for a handoff note's body
+}
+
+// clipLines returns the longest prefix of s that is at most max bytes and
+// ends at a line break; if even the first line is longer, it is cut at a rune
+// boundary. cut reports whether anything was dropped.
+func clipLines(s string, max int) (out string, cut bool) {
+	s = strings.TrimRight(s, "\n")
+	if len(s) <= max {
+		return s, false
+	}
+	if i := strings.LastIndex(s[:max+1], "\n"); i > 0 {
+		return s[:i], true
+	}
+	return trimBytes(s, max), true
+}
+
+// noteBlock renders a handoff note for the inject brief: a header line and
+// the body fenced, so its headings cannot become brief structure.
+func (b Brief) noteBlock(max int) string {
+	n := b.Note
+	body, cut := clipLines(n.Body, max)
+	if cut {
+		body += "\n" + noteCutMarker
+	}
+	return fmt.Sprintf("Handoff note from %s · %s (full: get_handoff):\n", inline(n.Agent), neycontext.RelativeTime(n.At, b.Now)) +
+		fenced(body)
 }
 
 func (b Brief) renderInjectWith(o injectOpts) string {
 	var sb strings.Builder
 	sb.WriteString(b.heading())
-	if n := b.Note; n != nil {
-		fmt.Fprintf(&sb, "Note from %s · %s: %s\n", inline(n.Agent), neycontext.RelativeTime(n.At, b.Now), clip(n.Body, noteMaxInj))
+	if b.Note != nil {
+		// A handoff note was written for this hand-over: it replaces the
+		// fields ney extracts from the transcript.
+		if b.Primary != nil {
+			sb.WriteString(b.lastLine() + "\n")
+		}
+		sb.WriteString(b.noteBlock(o.noteMax))
+		if b.Primary != nil {
+			if b.GitOK {
+				sb.WriteString(b.nowLine())
+			}
+			if o.others {
+				sb.WriteString(b.othersLines())
+			}
+		}
+		sb.WriteString("→ details: call ney MCP tool get_handoff\n")
+		return sb.String()
 	}
 	if p := b.Primary; p != nil {
 		sb.WriteString(b.lastLine() + "\n")
@@ -214,12 +259,17 @@ func (b Brief) RenderInject() string {
 		budget -= len(sec) + 1
 	}
 	steps := []injectOpts{
-		{true, maxFilesInj, true, endedMax},
-		{false, maxFilesInj, true, endedMax},
-		{false, 5, true, endedMax},
-		{false, 0, true, endedMax},
-		{false, 0, false, endedMax},
-		{false, 0, false, endedMaxTiny},
+		{true, maxFilesInj, true, endedMax, noteInjectBudget},
+		{false, maxFilesInj, true, endedMax, noteInjectBudget},
+		{false, 5, true, endedMax, noteInjectBudget},
+		{false, 0, true, endedMax, noteInjectBudget},
+		{false, 0, false, endedMax, noteInjectBudget},
+		{false, 0, false, endedMaxTiny, noteInjectBudget},
+	}
+	if b.Note != nil { // last resort: shrink the note
+		for n := noteInjectBudget - 300; n >= noteInjectMin; n -= 300 {
+			steps = append(steps, injectOpts{false, 0, false, endedMaxTiny, n})
+		}
 	}
 	var out string
 	for _, o := range steps {

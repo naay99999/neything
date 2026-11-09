@@ -50,9 +50,8 @@ func TestBuildNoteOrdering(t *testing.T) {
 		t.Fatal("newer note dropped")
 	}
 	out := b.RenderInject()
-	ni, gi := strings.Index(out, "NOTE-BODY"), strings.Index(out, "Goal:")
-	if ni < 0 || gi < 0 || ni > gi {
-		t.Errorf("note must precede Goal:\n%s", out)
+	if !strings.Contains(out, "NOTE-BODY") || strings.Contains(out, "Goal:") {
+		t.Errorf("a fresh note must replace the extracted Goal:\n%s", out)
 	}
 
 	b = Build("repo", []session.Session{s}, []Note{older}, neycontext.GitState{}, false, testNow)
