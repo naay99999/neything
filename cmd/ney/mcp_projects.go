@@ -45,7 +45,7 @@ func listProjectsHandler(deps mcpDeps) mcp.ToolHandlerFor[listProjectsInput, any
 			scan = neycontext.ScanRepos(ctx, deps.cfg.Context.DevRoots)
 		}
 		now := time.Now()
-		return handoffText(renderProjectList(profileHeadline(), collectItems(scan, now), now)), nil, nil
+		return handoffText(renderProjectList(profileHeadline(), collectItems(ctx, deps.cfg, scan, now), now)), nil, nil
 	}
 }
 

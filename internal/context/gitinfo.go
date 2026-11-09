@@ -73,14 +73,15 @@ func LastCommit(ctx context.Context, root string) (subject string, at time.Time,
 
 // CardDrift reports how far HEAD has moved since commit since: the number of
 // commits, and which of files changed. known is false (with a nil error)
-// when since is empty or not a commit in this repo, e.g. rebased away.
+// when since is empty or not a commit in this repo, e.g. rebased away. Two git
+// calls at most: it runs inside the session-start hook.
 func CardDrift(ctx context.Context, root, since string, files []string) (commits int, changed []string, known bool, err error) {
-	if since == "" || gitCmd(ctx, root, "cat-file", "-e", since+"^{commit}").Run() != nil {
+	if since == "" {
 		return 0, nil, false, nil
 	}
 	out, err := gitCmd(ctx, root, "rev-list", "--count", since+"..HEAD").Output()
 	if err != nil {
-		return 0, nil, true, err
+		return 0, nil, false, nil // unknown commit (or no HEAD): only the age rule applies
 	}
 	if commits, err = strconv.Atoi(strings.TrimSpace(string(out))); err != nil {
 		return 0, nil, true, err

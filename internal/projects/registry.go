@@ -115,7 +115,12 @@ func (r Registry) Find(nameOrPath string) (Entry, bool) {
 // Upsert records e and returns the stored entry. An existing entry keeps its
 // name; its path and remote follow e when e has them; LastSeen only moves
 // forward. A new entry gets a unique name from NameFor.
-func (r *Registry) Upsert(e Entry) Entry {
+func (r *Registry) Upsert(e Entry) Entry { return r.UpsertKnowing(e, nil) }
+
+// UpsertKnowing is Upsert for a registry that may have lost entries (e.g.
+// rebuilt after corruption): a new entry adopts the name of the card whose
+// path or remote matches it, and never takes the name of another repo's card.
+func (r *Registry) UpsertKnowing(e Entry, cards []Card) Entry {
 	if i := r.index(e.Path, e.Remote); i >= 0 {
 		cur := &r.Repos[i]
 		if e.Path != "" {
@@ -133,9 +138,96 @@ func (r *Registry) Upsert(e Entry) Entry {
 	for _, x := range r.Repos {
 		taken[x.Name] = true
 	}
-	e.Name = NameFor(e.Path, taken)
+	e.Name = ""
+	for _, c := range cards {
+		mine := (c.Path != "" && samePath(c.Path, e.Path)) || (e.Remote != "" && c.Remote == e.Remote)
+		if mine && c.Name != "" && !taken[c.Name] {
+			e.Name = c.Name
+			break
+		}
+	}
+	if e.Name == "" {
+		for _, c := range cards {
+			taken[c.Name] = true
+		}
+		e.Name = NameFor(e.Path, taken)
+	}
 	r.Repos = append(r.Repos, e)
 	return e
+}
+
+// ErrLocked is returned by UpdateRegistry when another process holds the
+// registry lock past the timeout.
+var ErrLocked = errors.New("project registry is locked by another ney process")
+
+const (
+	lockFile  = ".registry.lock"
+	lockStale = 10 * time.Second
+)
+
+// UpdateRegistry loads the registry, applies fn, and saves it, all under an
+// exclusive lock file so concurrent ney processes (hooks, MCP servers) never
+// lose each other's updates. A corrupt registry is backed up to .bak and
+// rebuilt from empty. A lock older than 10s is treated as abandoned.
+func UpdateRegistry(dir string, timeout time.Duration, fn func(*Registry)) (Registry, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return Registry{}, err
+	}
+	lock := filepath.Join(dir, lockFile)
+	deadline := time.Now().Add(timeout)
+	for {
+		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return Registry{}, err
+		}
+		if fi, serr := os.Stat(lock); serr == nil && time.Since(fi.ModTime()) > lockStale {
+			_ = os.Remove(lock)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return Registry{}, ErrLocked
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer os.Remove(lock)
+
+	r, err := LoadRegistry(dir)
+	if err != nil {
+		path := filepath.Join(dir, registryFile)
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			if werr := neycontext.WriteFileAtomic(path+".bak", data, 0o600); werr != nil {
+				return Registry{}, werr
+			}
+		}
+		r = Registry{}
+	}
+	fn(&r)
+	return r, r.Save(dir)
+}
+
+// LoadCards reads every card in dir (unparseable ones are skipped). Callers
+// use it only when a repo is new to the registry.
+func LoadCards(dir string) []Card {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var cards []Card
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || !strings.HasSuffix(n, ".md") || n == "index.md" {
+			continue
+		}
+		if c, err := Load(filepath.Join(dir, n)); err == nil {
+			c.Name = strings.TrimSuffix(n, ".md")
+			cards = append(cards, c)
+		}
+	}
+	return cards
 }
 
 func slug(s string) string {

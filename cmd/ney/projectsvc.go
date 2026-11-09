@@ -37,8 +37,19 @@ func hookProjects(ctx context.Context, cfg *config.Config, root string, inRepo b
 	reg, _ := projects.LoadRegistry(dir)
 	var cur projects.Entry
 	if inRepo {
-		cur = reg.Upsert(projects.Entry{Path: root, Remote: neycontext.RepoRemote(ctx, root), LastSeen: now})
-		_ = reg.Save(dir)
+		// The remote is only needed to re-link a new or moved repo; a known path
+		// skips that git call (the hook's budget is two).
+		e := projects.Entry{Path: root, LastSeen: now}
+		if _, known := reg.Lookup(root, ""); !known {
+			e.Remote = neycontext.RepoRemote(ctx, root)
+		}
+		if saved, err := projects.UpdateRegistry(dir, hookLockTimeout, func(r *projects.Registry) {
+			cur = upsertRepo(r, dir, e)
+		}); err == nil {
+			reg = saved
+		} else {
+			cur = upsertRepo(&reg, dir, e) // locked or unwritable: use it for this session only
+		}
 	}
 
 	others := make([]projects.Entry, 0, len(reg.Repos))
@@ -65,6 +76,23 @@ func hookProjects(ctx context.Context, cfg *config.Config, root string, inRepo b
 		}
 	}
 	return p
+}
+
+// hookLockTimeout bounds how long the hook waits for the registry lock; past
+// it the hook proceeds without saving.
+const hookLockTimeout = 100 * time.Millisecond
+
+// mcpLockTimeout is the registry lock wait for MCP and CLI writers.
+const mcpLockTimeout = 2 * time.Second
+
+// upsertRepo records e. A repo new to the registry is matched against the
+// cards on disk, so it adopts its own card and never takes another repo's
+// card name (the registry may have been rebuilt after corruption).
+func upsertRepo(r *projects.Registry, dir string, e projects.Entry) projects.Entry {
+	if _, ok := r.Lookup(e.Path, e.Remote); ok {
+		return r.Upsert(e)
+	}
+	return r.UpsertKnowing(e, projects.LoadCards(dir))
 }
 
 // cardState loads e's card and decides whether it is missing, stale or
@@ -125,15 +153,26 @@ func registryItems(reg projects.Registry) []projects.Item {
 // collectItems merges the registry with a dev_roots scan (repos committed to
 // within the active window are registered), saves the registry, rewrites
 // index.md, and returns the rows.
-func collectItems(scan []neycontext.Project, now time.Time) []projects.Item {
+func collectItems(ctx context.Context, cfg *config.Config, scan []neycontext.Project, now time.Time) []projects.Item {
 	dir := projectsDir()
-	reg, _ := projects.LoadRegistry(dir)
-	for _, p := range scan {
-		if !p.LastCommit.IsZero() && now.Sub(p.LastCommit) <= projectActiveWindow {
-			reg.Upsert(projects.Entry{Path: p.Path, LastSeen: p.LastCommit})
+	update := func(r *projects.Registry) {
+		for _, p := range scan {
+			if p.LastCommit.IsZero() || now.Sub(p.LastCommit) > projectActiveWindow ||
+				hookRepoDisabled(cfg.Handoff.DisabledRepos, p.Path, p.Path) {
+				continue
+			}
+			e := projects.Entry{Path: p.Path, LastSeen: p.LastCommit}
+			if _, known := r.Lookup(p.Path, ""); !known {
+				e.Remote = neycontext.RepoRemote(ctx, p.Path) // re-link moved repos
+			}
+			upsertRepo(r, dir, e)
 		}
 	}
-	_ = reg.Save(dir)
+	reg, err := projects.UpdateRegistry(dir, mcpLockTimeout, update)
+	if err != nil { // locked or unwritable: show the merged view without saving
+		reg, _ = projects.LoadRegistry(dir)
+		update(&reg)
+	}
 	items := registryItems(reg)
 	_ = projects.WriteIndex(dir, items)
 	return items
@@ -194,9 +233,14 @@ func updateProjectCard(ctx context.Context, cwd, agent string, p projects.Patch,
 		return "", errors.New("cwd is not inside a git repository")
 	}
 	dir := projectsDir()
-	reg, _ := projects.LoadRegistry(dir)
 	remote := neycontext.RepoRemote(ctx, root)
-	e := reg.Upsert(projects.Entry{Path: root, Remote: remote, LastSeen: now})
+	var e projects.Entry
+	reg, err := projects.UpdateRegistry(dir, mcpLockTimeout, func(r *projects.Registry) {
+		e = upsertRepo(r, dir, projects.Entry{Path: root, Remote: remote, LastSeen: now})
+	})
+	if err != nil {
+		return "", fmt.Errorf("project registry: %w", err)
+	}
 	path := projects.CardPath(dir, e.Name)
 	c, err := projects.Load(path)
 	if err != nil {
@@ -208,9 +252,6 @@ func updateProjectCard(ctx context.Context, cwd, agent string, p projects.Patch,
 	c.Name, c.Path, c.Remote = e.Name, root, remote
 	c.Commit, c.Updated, c.UpdatedBy = neycontext.HeadCommit(ctx, root), now.UTC().Truncate(time.Second), agent
 	if err := projects.Save(path, c); err != nil {
-		return "", err
-	}
-	if err := reg.Save(dir); err != nil {
 		return "", err
 	}
 	_ = projects.WriteIndex(dir, registryItems(reg))

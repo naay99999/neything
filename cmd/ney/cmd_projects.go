@@ -18,7 +18,7 @@ var projectsCmd = &cobra.Command{
 			return err
 		}
 		now := time.Now()
-		items := collectItems(neycontext.ScanRepos(cmd.Context(), cfg.Context.DevRoots), now)
+		items := collectItems(cmd.Context(), cfg, neycontext.ScanRepos(cmd.Context(), cfg.Context.DevRoots), now)
 		fmt.Fprint(cmd.OutOrStdout(), renderProjectList(profileHeadline(), items, now))
 		return nil
 	},

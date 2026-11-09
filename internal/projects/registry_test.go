@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -120,5 +121,73 @@ func TestTOCLineAndIndex(t *testing.T) {
 	}
 	if got := FirstSentence(strings.Repeat("a", 130)); len([]rune(got)) != 120 || !strings.HasSuffix(got, "…") {
 		t.Errorf("FirstSentence long = %q", got)
+	}
+}
+
+func TestUpdateRegistryCorruptIsBackedUp(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".registry.json"), []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := UpdateRegistry(dir, time.Second, func(r *Registry) { r.Upsert(Entry{Path: "/a/x", LastSeen: t0}) })
+	if err != nil || len(r.Repos) != 1 {
+		t.Fatalf("UpdateRegistry = %+v, %v", r, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, ".registry.json.bak")); string(b) != "{bad" {
+		t.Errorf(".bak = %q", b)
+	}
+}
+
+func TestUpdateRegistryConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	done := make(chan error)
+	for i := 0; i < 20; i++ {
+		go func(i int) {
+			_, err := UpdateRegistry(dir, 5*time.Second, func(r *Registry) {
+				r.Upsert(Entry{Path: filepath.Join("/repos", itoa(i), "x"), LastSeen: t0})
+			})
+			done <- err
+		}(i)
+	}
+	for i := 0; i < 20; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, _ := LoadRegistry(dir)
+	if len(r.Repos) != 20 {
+		t.Fatalf("lost updates: %d entries, want 20", len(r.Repos))
+	}
+}
+
+func TestUpdateRegistryLockTimeoutAndStale(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, ".registry.lock")
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateRegistry(dir, 50*time.Millisecond, func(*Registry) {}); !errors.Is(err, ErrLocked) {
+		t.Fatalf("held lock: err = %v, want ErrLocked", err)
+	}
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateRegistry(dir, 50*time.Millisecond, func(*Registry) {}); err != nil {
+		t.Fatalf("stale lock not broken: %v", err)
+	}
+}
+
+func TestNewEntryAdoptsOrAvoidsExistingCards(t *testing.T) {
+	cards := []Card{{Name: "portfolio", Path: "/b/portfolio"}, {Name: "api", Remote: "github.com/u/api"}}
+	var r Registry
+	if e := r.UpsertKnowing(Entry{Path: "/a/portfolio", LastSeen: t0}, cards); e.Name == "portfolio" {
+		t.Errorf("/a/portfolio took the name of /b/portfolio's card")
+	}
+	if e := r.UpsertKnowing(Entry{Path: "/b/portfolio", LastSeen: t0}, cards); e.Name != "portfolio" {
+		t.Errorf("/b/portfolio did not adopt its card: %q", e.Name)
+	}
+	if e := r.UpsertKnowing(Entry{Path: "/moved/api2", Remote: "github.com/u/api", LastSeen: t0}, cards); e.Name != "api" {
+		t.Errorf("moved repo did not adopt its card by remote: %q", e.Name)
 	}
 }

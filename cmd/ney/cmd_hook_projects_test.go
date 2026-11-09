@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/projects"
 )
 
@@ -163,5 +165,65 @@ func TestHookDisabledRepoNotRegistered(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(projectsDir(), ".registry.json")); !os.IsNotExist(err) {
 		t.Errorf("registry written for a disabled repo: %v", err)
+	}
+}
+
+// TestHookProjectsGitCalls pins the spec's budget: with the repo already
+// registered and a card present, the projects part adds at most two git calls.
+func TestHookProjectsGitCalls(t *testing.T) {
+	repo := handoffFixture(t)
+	commitN(t, repo, 1)
+	writeCard(t, repo, projects.Card{Summary: "s", Commit: headOf(t, repo), Updated: time.Now()})
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := filepath.Join(t.TempDir(), "trace")
+	t.Setenv("GIT_TRACE", trace)
+	hookProjects(context.Background(), cfg, repo, true, time.Now())
+	b, _ := os.ReadFile(trace)
+	if n := strings.Count(string(b), "built-in: git "); n > 2 {
+		t.Errorf("projects part ran %d git commands, want ≤ 2:\n%s", n, b)
+	}
+}
+
+func TestHookSkipsRegistryWhenLocked(t *testing.T) {
+	repo := handoffFixture(t)
+	registerOther(t, "portfolio")
+	if err := os.WriteFile(filepath.Join(projectsDir(), ".registry.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	ctx := hookContext(t, repo)
+	if time.Since(start) > time.Second || !strings.Contains(ctx, ": portfolio\n") {
+		t.Errorf("locked registry: took %v, context:\n%s", time.Since(start), ctx)
+	}
+}
+
+func TestCollectItemsUsesRemoteAndSkipsDisabled(t *testing.T) {
+	setHome(t, t.TempDir())
+	base := t.TempDir()
+	moved := filepath.Join(base, "new", "x")
+	initGitFixtureRepo(t, moved, "c")
+	if out, err := exec.Command("git", "-C", moved, "remote", "add", "origin", "git@github.com:u/x.git").CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	secret := filepath.Join(base, "secret")
+	initGitFixtureRepo(t, secret, "c")
+	if _, err := projects.UpdateRegistry(projectsDir(), time.Second, func(r *projects.Registry) {
+		r.Upsert(projects.Entry{Path: filepath.Join(base, "old", "x"), Remote: "github.com/u/x", LastSeen: time.Now()})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeNeyConfig(t, "handoff:\n  disabled_repos: ['"+secret+"']\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan := neycontext.ScanRepos(context.Background(), []string{base})
+	collectItems(context.Background(), cfg, scan, time.Now())
+	r, _ := projects.LoadRegistry(projectsDir())
+	if len(r.Repos) != 1 || r.Repos[0].Name != "x" || !strings.HasSuffix(r.Repos[0].Path, filepath.Join("new", "x")) {
+		t.Errorf("registry = %+v, want the moved repo re-linked and the disabled one absent", r.Repos)
 	}
 }
