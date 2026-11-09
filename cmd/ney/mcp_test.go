@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
 )
 
@@ -121,7 +120,7 @@ func TestMCPListsTools(t *testing.T) {
 		got = append(got, tool.Name)
 	}
 	sort.Strings(got)
-	want := []string{"get_context", "get_handoff", "list_sessions", "remember", "update_profile", "write_handoff"}
+	want := []string{"get_handoff", "get_project", "list_projects", "list_sessions", "update_profile", "update_project", "write_handoff"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
@@ -158,83 +157,6 @@ func initGitFixtureRepo(t *testing.T, dir, subject string) {
 	run("commit", "-q", "-m", subject)
 }
 
-// TestMCPGetContextListsScannedProjects: get_context needs no DB — projects
-// come straight from the live scan of cfg.Context.DevRoots.
-func TestMCPGetContextListsScannedProjects(t *testing.T) {
-	requireGitForMCPTest(t)
-	setHome(t, t.TempDir())
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	initGitFixtureRepo(t, filepath.Join(home, "workspace", "myproject"), "initial commit")
-
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Context.DevRoots) != 1 {
-		t.Fatalf("expected dev_roots to default to the freshly-created ~/workspace, got %v", cfg.Context.DevRoots)
-	}
-	env := connectMCPTestEnv(t, mcpDeps{cfg: cfg, scanCache: &neycontext.ScanCache{}})
-
-	out := callTool[getContextOutput](t, env, "get_context", getContextInput{})
-	for _, want := range []string{"myproject", "initial commit"} {
-		if !strings.Contains(out.Context, want) {
-			t.Fatalf("expected %q in get_context output:\n%s", want, out.Context)
-		}
-	}
-	if strings.Contains(out.Context, "indexed") {
-		t.Fatalf("get_context must not mention indexing:\n%s", out.Context)
-	}
-}
-
-func TestMCPGetContextWithoutScanCache(t *testing.T) {
-	setHome(t, t.TempDir())
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	env := connectMCPTestEnv(t, mcpDeps{cfg: cfg})
-	out := callTool[getContextOutput](t, env, "get_context", getContextInput{})
-	if !strings.Contains(out.Context, "Who you're working with") {
-		t.Fatalf("expected the profile section, got:\n%s", out.Context)
-	}
-}
-
-func TestMCPRememberWritesMemoryFile(t *testing.T) {
-	env := newMCPTestEnv(t)
-
-	out := callTool[rememberOutput](t, env, "remember", rememberInput{
-		Title:   "remember test",
-		Content: "a fact worth keeping",
-	})
-	if out.Path == "" {
-		t.Fatal("expected a non-empty path")
-	}
-	data, err := os.ReadFile(out.Path)
-	if err != nil {
-		t.Fatalf("expected the memory file to exist at %s: %v", out.Path, err)
-	}
-	if !strings.Contains(string(data), "a fact worth keeping") {
-		t.Fatalf("expected the written file to contain the memory content, got: %s", data)
-	}
-	wantDir := filepath.Join(config.NeyDir(), "memory")
-	if filepath.Dir(out.Path) != wantDir {
-		t.Fatalf("expected the memory to be written under %s, got %s", wantDir, out.Path)
-	}
-}
-
-func TestMCPRememberRequiresTitleAndContent(t *testing.T) {
-	env := newMCPTestEnv(t)
-	if msg := callToolExpectError(t, env, "remember", rememberInput{Content: "no title"}); !strings.Contains(msg, "title is required") {
-		t.Fatalf("expected 'title is required', got: %s", msg)
-	}
-	if msg := callToolExpectError(t, env, "remember", rememberInput{Title: "no content"}); !strings.Contains(msg, "content is required") {
-		t.Fatalf("expected 'content is required', got: %s", msg)
-	}
-}
-
 func TestMCPUpdateProfileRoundTrip(t *testing.T) {
 	env := newMCPTestEnv(t)
 
@@ -253,9 +175,8 @@ func TestMCPUpdateProfileRoundTrip(t *testing.T) {
 		t.Fatalf("expected profile.md to contain the update, got: %s", data)
 	}
 
-	ctxOut := callTool[getContextOutput](t, env, "get_context", getContextInput{})
-	if !strings.Contains(ctxOut.Context, "Building the layered context MCP surface.") {
-		t.Fatalf("expected get_context to reflect the profile update, got: %s", ctxOut.Context)
+	if out := callText(t, env, "list_projects", map[string]any{}); !strings.Contains(out, "Building the layered context MCP surface.") {
+		t.Fatalf("expected list_projects to reflect the profile update, got: %s", out)
 	}
 }
 
@@ -290,8 +211,11 @@ func TestMCPStdoutHygiene(t *testing.T) {
 	defer restore()
 
 	env := newMCPTestEnv(t)
-	_ = callTool[getContextOutput](t, env, "get_context", getContextInput{})
-	_ = callTool[rememberOutput](t, env, "remember", rememberInput{Title: "t", Content: "c"})
+	repo := filepath.Join(t.TempDir(), "hyg")
+	initGitFixtureRepo(t, repo, "c")
+	_ = callText(t, env, "list_projects", map[string]any{})
+	_ = callText(t, env, "update_project", map[string]any{"cwd": repo, "agent": "test", "summary": "s"})
+	_ = callText(t, env, "get_project", map[string]any{"name": "hyg"})
 	_ = callTool[updateProfileOutput](t, env, "update_profile", updateProfileInput{Section: "s", Content: "c"})
 
 	restore()

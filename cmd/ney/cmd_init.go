@@ -64,7 +64,7 @@ func runSetupWizard(_ context.Context) error {
 	markSetupComplete()
 	fmt.Println()
 	fmt.Println(Bold("✓ Setup complete"))
-	fmt.Println(Dim("  Memory: tell your AI \"remember that ...\" and it saves a file under " + displayPath(memoryDir()) +
+	fmt.Println(Dim("  Project memory: agents keep a short card per project under " + displayPath(projectsDir()) +
 		". Edit your profile any time at " + displayPath(filepath.Join(config.NeyDir(), "profile.md")) + "."))
 	return nil
 }
