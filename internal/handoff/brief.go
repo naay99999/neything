@@ -25,6 +25,7 @@ type Brief struct {
 	Git      neycontext.GitState
 	GitOK    bool
 	Now      time.Time
+	Projects Projects // set by AddProjects; only the inject brief renders it
 }
 
 // Build assembles a Brief. sessions are newest End first. Every string is
@@ -51,8 +52,11 @@ func Build(repoName string, sessions []session.Session, notes []Note, git neycon
 	return b
 }
 
-// Empty reports whether there is nothing worth handing over.
-func (b Brief) Empty() bool { return b.Primary == nil && b.Note == nil }
+// Empty reports whether there is nothing worth handing over or injecting.
+func (b Brief) Empty() bool { return b.handoffEmpty() && b.Projects.empty() }
+
+// handoffEmpty reports whether there is no session or note to hand over.
+func (b Brief) handoffEmpty() bool { return b.Primary == nil && b.Note == nil }
 
 // scrub redacts before the final trim: a secret straddling the 8 KiB cut would
 // otherwise leave an unmatchable fragment. A 2x window is redacted first.

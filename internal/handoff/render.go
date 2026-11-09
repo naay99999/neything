@@ -205,8 +205,13 @@ func lastFailed(cmds []session.CommandRun, n int) []string {
 // RenderInject renders the compact brief for SessionStart injection, at most
 // 3072 bytes; "" when there is nothing to hand over.
 func (b Brief) RenderInject() string {
-	if b.Empty() {
-		return ""
+	sec := projectsSection(b.Projects)
+	if b.handoffEmpty() {
+		return sec
+	}
+	budget := injectCap
+	if sec != "" {
+		budget -= len(sec) + 1
 	}
 	steps := []injectOpts{
 		{true, maxFilesInj, true, endedMax},
@@ -218,18 +223,21 @@ func (b Brief) RenderInject() string {
 	}
 	var out string
 	for _, o := range steps {
-		out = b.renderInjectWith(o)
-		if len(out) <= injectCap {
-			return out
+		if out = b.renderInjectWith(o); len(out) <= budget {
+			break
 		}
 	}
-	return trimBytes(out, injectCap)
+	out = trimBytes(out, budget)
+	if sec == "" {
+		return out
+	}
+	return out + "\n" + sec
 }
 
 // RenderFull renders the detailed brief, at most 32768 bytes; oldest tail
 // entries are dropped first. "" when there is nothing to hand over.
 func (b Brief) RenderFull() string {
-	if b.Empty() {
+	if b.handoffEmpty() {
 		return ""
 	}
 	var head strings.Builder
