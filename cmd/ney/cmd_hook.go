@@ -13,6 +13,7 @@ import (
 
 	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
+	"github.com/naay99999/neything/internal/handoff"
 	"github.com/naay99999/neything/internal/session"
 )
 
@@ -126,7 +127,8 @@ func hookSessionStart(cmd *cobra.Command) string {
 	}
 	ctx, cancel := context.WithTimeout(parent, handoffGitTimeout)
 	defer cancel()
-	if root, _ := neycontext.ResolveRepo(ctx, cwd); hookRepoDisabled(cfg.Handoff.DisabledRepos, root, cwd) {
+	root, inRepo := neycontext.ResolveRepo(ctx, cwd)
+	if hookRepoDisabled(cfg.Handoff.DisabledRepos, root, cwd) {
 		return ""
 	}
 
@@ -138,6 +140,7 @@ func hookSessionStart(cmd *cobra.Command) string {
 	if err != nil {
 		return "build brief: " + err.Error()
 	}
+	addHookProjects(ctx, cmd, cfg, &brief, root, inRepo)
 	if brief.Empty() {
 		return ""
 	}
@@ -164,4 +167,15 @@ func hookRepoDisabled(disabled []string, root, cwd string) bool {
 		}
 	}
 	return false
+}
+
+// addHookProjects attaches the projects section. A panic in it must not take
+// the handoff part down with it: it is reported on stderr and dropped.
+func addHookProjects(ctx context.Context, cmd *cobra.Command, cfg *config.Config, brief *handoff.Brief, root string, inRepo bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "ney hook: projects: %v\n", r)
+		}
+	}()
+	brief.AddProjects(hookProjects(ctx, cfg, root, inRepo, time.Now()))
 }

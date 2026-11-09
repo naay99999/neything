@@ -76,8 +76,8 @@ func TestHookInjects(t *testing.T) {
 func TestHookExcludesCurrentSession(t *testing.T) {
 	repo := handoffFixture(t)
 	out, _, err := execHook(t, hookStdin(t, repo, "startup", "s1"))
-	if err != nil || out != "" {
-		t.Errorf("err=%v out=%q, want empty", err, out)
+	if err != nil || strings.Contains(out, "unfinished work") {
+		t.Errorf("err=%v out=%q, want no handoff (the projects section may remain)", err, out)
 	}
 }
 
