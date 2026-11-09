@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -80,14 +81,14 @@ func TestRegisterCodexNoDuplicateTable(t *testing.T) {
 		if n := strings.Count(string(data), "mcp_servers"); n != 1 {
 			t.Errorf("%q: %d ney tables:\n%s", header, n, data)
 		}
-		if fi, _ := os.Stat(cfg); fi.Mode().Perm() != 0o644 {
+		if fi, _ := os.Stat(cfg); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o644 {
 			t.Errorf("mode changed to %v", fi.Mode().Perm())
 		}
 	}
 }
 
 func TestPreviewsDiscloseRewrite(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 	for _, c := range detectClients("/bin/ney") {
 		n := 0
 		for _, ch := range c.Changes {

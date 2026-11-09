@@ -13,7 +13,7 @@ import (
 func codexEnv(t *testing.T) (home string) {
 	t.Helper()
 	home = t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("PATH", t.TempDir())
 	return home

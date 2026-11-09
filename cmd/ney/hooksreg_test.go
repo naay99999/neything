@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -115,7 +116,7 @@ func TestRegisterHookPreservesUserHooks(t *testing.T) {
 	if err != nil || string(bak) != orig {
 		t.Errorf("backup missing or wrong: %v", err)
 	}
-	if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o640 {
+	if fi, _ := os.Stat(path); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o640 {
 		t.Errorf("mode not preserved: %v", fi.Mode().Perm())
 	}
 }
@@ -219,7 +220,7 @@ func captureStdout(t *testing.T, fn func()) string {
 
 func TestDoctorReportsHook(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("PATH", t.TempDir()) // no `claude` on PATH
 	flagJSON = false
 

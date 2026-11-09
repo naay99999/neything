@@ -34,7 +34,7 @@ func handoffFixture(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	repo := filepath.Join(home, "work", "payrepo")
 	gitInit(t, repo)
 	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "session", "claudecode", "testdata", "basic.jsonl"))
@@ -43,7 +43,7 @@ func handoffFixture(t *testing.T) string {
 	}
 	// "/repo/" first so the bare "/repo" replacement can't double-rewrite.
 	data := strings.ReplaceAll(string(raw), "/repo/", repo+"/")
-	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+repo+`"`)
+	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+jsonPath(repo)+`"`)
 	dir := filepath.Join(home, ".claude", "projects", claudecode.Slug(repo))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func writeSession(t *testing.T, repo, fixture, id, goal string, mtime time.Time)
 		t.Fatal(err)
 	}
 	data := strings.ReplaceAll(string(raw), "/repo/", repo+"/")
-	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+repo+`"`)
+	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+jsonPath(repo)+`"`)
 	if goal != "" {
 		data = strings.ReplaceAll(data, "Fix the payment flow so refunds work", goal)
 	}
@@ -188,3 +188,7 @@ func TestHandoffCommandNoSessions(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+// jsonPath escapes a filesystem path for a hand-built JSON string literal
+// (Windows paths carry backslashes).
+func jsonPath(p string) string { return strings.ReplaceAll(p, `\`, `\\`) }

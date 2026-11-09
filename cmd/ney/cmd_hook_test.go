@@ -90,8 +90,8 @@ func TestHookSkips(t *testing.T) {
 		{"compact", "compact", nil},
 		{"fork", "fork", nil},
 		{"auto false", "startup", func(string) string { return "handoff:\n  auto: false\n" }},
-		{"disabled repo", "startup", func(r string) string { return "handoff:\n  disabled_repos: [\"" + r + "\"]\n" }},
-		{"disabled parent", "startup", func(r string) string { return "handoff:\n  disabled_repos: [\"" + filepath.Dir(r) + "/\"]\n" }},
+		{"disabled repo", "startup", func(r string) string { return "handoff:\n  disabled_repos: ['" + r + "']\n" }},
+		{"disabled parent", "startup", func(r string) string { return "handoff:\n  disabled_repos: ['" + filepath.Dir(r) + "/']\n" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

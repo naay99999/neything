@@ -46,7 +46,7 @@ context:
 func writeTestConfig(t *testing.T, yaml string) *Config {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 	neyDir := filepath.Join(dir, ".ney")
 	if err := os.MkdirAll(neyDir, 0700); err != nil {
 		t.Fatal(err)
@@ -90,7 +90,7 @@ func TestLoadDefaultsActiveDaysTo14(t *testing.T) {
 
 func TestLoadDevRootsDefaultsToWorkspaceIfExists(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestLoadDevRootsExplicitValueOverridesDefault(t *testing.T) {
 // Load must never write to stdout or stderr. The first-run hint belongs in
 // cmd/ney's loadConfig, gated on CreatedDefault and a TTY.
 func TestLoadIsSilentOnFirstRun(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 
 	r, w, err := os.Pipe()
 	if err != nil {
