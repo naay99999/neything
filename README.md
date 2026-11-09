@@ -23,6 +23,21 @@ Other recent: claude-code · 3d ago · "Docs pass"
 
 The agent can call `get_handoff` for the full brief (the last 30 steps of the session, more detail).
 
+## Quick start
+
+Requires [Claude Code](https://claude.com/claude-code) and/or [Codex CLI](https://github.com/openai/codex), and git.
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.sh | sh
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.ps1 | iex
+```
+
+The installer runs the setup wizard (`ney init`) for you. Then just open Claude Code or Codex in a repo you've worked in: the brief appears at session start. Check everything with `ney doctor`.
+
 ---
 
 ## Install
@@ -41,6 +56,8 @@ irm https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.ps
 ```
 Same behaviour: verifies the SHA-256, installs `ney.exe` to `%LOCALAPPDATA%\Programs\ney`, adds it to your user `PATH`, and starts `ney init` on a first install. The same environment variables apply (`$env:NEY_VERSION = "v0.1.0"` before running, and so on). Restart your AI apps after a first install so they pick up the new `PATH`.
 
+**Update:** run the same install command again. It replaces the binary in place; no further setup.
+
 **Moving from Homebrew:** ney is no longer published to Homebrew. Run the curl command above (it re-runs `ney init` so your AI clients point at the new binary), then `brew uninstall ney`.
 
 **Go users:**
@@ -54,6 +71,14 @@ Make sure `$(go env GOPATH)/bin` is in your `PATH`.
 git clone https://github.com/naay99999/neything
 cd neything && go build -o ney ./cmd/ney
 ```
+
+**Upgrading from v0.10 or earlier:** the document indexing and search features were removed in v0.11. Old `config.yaml` keys are ignored, and `~/.ney/index.db` is no longer used and can be deleted.
+
+### Uninstall
+
+1. Unregister from your agents: `claude mcp remove --scope user ney`, and delete the ney `SessionStart` entry from `~/.claude/settings.json`. For Codex, delete the `[mcp_servers.ney]` section from `config.toml` and the ney entry from `hooks.json` (in `$CODEX_HOME`, default `~/.codex`).
+2. Remove the binary: `rm ~/.local/bin/ney` (Windows: `Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\ney"`, then remove that folder from your user `PATH`), and the PATH line the installer added to your shell rc, marked `# added by the ney installer`.
+3. Remove your data: `rm -rf ~/.ney` (Windows: `%USERPROFILE%\.ney`).
 
 ---
 
@@ -106,7 +131,7 @@ Other commands: `ney config show|edit`, `ney version`.
 
 ## Configuration
 
-`~/.ney/config.yaml` is yours; ney never rewrites it except to set `context.dev_roots` during `ney init` (comments and unknown keys are preserved).
+`~/.ney/config.yaml` (Windows: `%USERPROFILE%\.ney\config.yaml`) is yours: ney creates it with defaults on first run and never rewrites it after that. Edit it with `ney config edit`.
 
 ```yaml
 handoff:
@@ -129,7 +154,7 @@ Keys left over from older versions are ignored.
 - It reads only: the transcript directories above (`~/.claude/projects`, Codex `sessions/`), `~/.ney`, the repo you are in (its git state), and (for `get_context`) repos under `context.dev_roots`.
 - Every string in a brief passes through a redactor first (API keys, tokens, JWTs, private keys, `Bearer` values, and values of secret-named keys like `password=` become `[redacted]`). **Redaction is best-effort**, not a guarantee; do not rely on it for secrets you would not want an agent to see.
 - The injected text is labelled as a record of earlier sessions, not instructions.
-- At runtime ney writes only under `~/.ney`: handoff notes (`handoff/`), memories (`memory/`), `profile.md`, `config.yaml`. `ney init` additionally edits the agent config files listed above (with `.bak` backups).
+- At runtime ney writes only under `~/.ney`: handoff notes (`handoff/`), memories (`memory/`), `profile.md`, `config.yaml`, and a `setup-complete` marker. `ney init` additionally edits the agent config files listed above (with `.bak` backups).
 
 ### Disable it
 
