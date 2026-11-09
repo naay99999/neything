@@ -3,6 +3,7 @@ package neycontext
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -217,7 +218,7 @@ func TestWriteMemory_CreatesDirIfMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat dir: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o700 {
 		t.Errorf("dir perm = %o, want 0700", perm)
 	}
 }

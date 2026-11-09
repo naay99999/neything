@@ -45,7 +45,7 @@ func hookBenchFixture(tb testing.TB) (repo string) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	tb.Setenv("HOME", home)
+	setHome(tb, home)
 	repo = filepath.Join(home, "work", "bigrepo")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		tb.Fatal(err)

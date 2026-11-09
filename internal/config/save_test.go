@@ -11,7 +11,7 @@ import (
 func writeRawConfig(t *testing.T, body string) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	dir := filepath.Join(home, ".ney")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func TestSetDevRootsEmptyIsNoOp(t *testing.T) {
 
 func TestSetDevRootsCreatesConfigWhenMissing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 
 	if err := SetDevRoots([]string{"/tmp/code"}); err != nil {
 		t.Fatalf("SetDevRoots: %v", err)

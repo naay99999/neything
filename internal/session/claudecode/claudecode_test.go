@@ -255,7 +255,7 @@ func TestRecent(t *testing.T) {
 	pd := t.TempDir()
 	now := time.Now()
 	entry := func(cwd string) string {
-		return `{"type":"mode","x":1}` + "\n" + `{"type":"user","cwd":"` + cwd + `","message":{"role":"user","content":"hi"}}` + "\n"
+		return `{"type":"mode","x":1}` + "\n" + `{"type":"user","cwd":"` + jsonPath(cwd) + `","message":{"role":"user","content":"hi"}}` + "\n"
 	}
 	write := func(dir, name, content string, age time.Duration) string {
 		d := filepath.Join(pd, dir)
@@ -321,7 +321,7 @@ func TestRecentSymlinkedRoot(t *testing.T) {
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"type":"user","cwd":"` + real + `/sub","message":{"role":"user","content":"hi"}}` + "\n"
+	body := `{"type":"user","cwd":"` + jsonPath(real+"/sub") + `","message":{"role":"user","content":"hi"}}` + "\n"
 	if err := os.WriteFile(filepath.Join(d, "s.jsonl"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -332,3 +332,7 @@ func TestRecentSymlinkedRoot(t *testing.T) {
 		}
 	}
 }
+
+// jsonPath escapes a filesystem path for a hand-built JSON string literal
+// (Windows paths carry backslashes).
+func jsonPath(p string) string { return strings.ReplaceAll(p, `\`, `\\`) }
