@@ -6,31 +6,45 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 const hookTimeoutSeconds = 10
 
 // hookCommand is the exact command string ney writes for agent, and the shape
-// used to recognise its own entry later. neyBin is single-quoted only when it
-// contains characters outside [A-Za-z0-9_./-].
+// used to recognise its own entry later. neyBin is quoted only when it
+// contains characters outside [A-Za-z0-9_./-] (plus ':' on Windows).
 func hookCommand(neyBin, agent string) string {
-	return shellQuote(neyBin) + hookSuffix(agent)
+	return shellQuoteFor(runtime.GOOS, neyBin) + hookSuffix(agent)
 }
 
 func hookSuffix(agent string) string { return " hook session-start --agent " + agent }
 
-func shellQuote(s string) string {
+// shellQuoteFor quotes s for the shell an agent runs hook commands in.
+//
+// POSIX: single quotes, only when needed. Windows: agents may run the hook
+// through Git Bash, cmd.exe or PowerShell, so the path is written with forward
+// slashes (accepted by all three and by Windows itself) and, only when it
+// holds unsafe characters such as a space, wrapped in double quotes — the one
+// quoting style bash and cmd.exe both understand.
+func shellQuoteFor(goos, s string) string {
+	if goos == "windows" {
+		s = strings.ReplaceAll(s, `\`, "/")
+	}
 	safe := s != ""
 	for _, r := range s {
 		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '_' || r == '.' || r == '/' || r == '-') {
+			r == '_' || r == '.' || r == '/' || r == '-' || goos == "windows" && r == ':') {
 			safe = false
 			break
 		}
 	}
 	if safe {
 		return s
+	}
+	if goos == "windows" {
+		return `"` + s + `"`
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
@@ -40,6 +54,8 @@ func hookBinary(cmd, agent string) string {
 	bin := strings.TrimSuffix(cmd, hookSuffix(agent))
 	if len(bin) >= 2 && bin[0] == '\'' && bin[len(bin)-1] == '\'' {
 		bin = strings.ReplaceAll(bin[1:len(bin)-1], `'\''`, "'")
+	} else if len(bin) >= 2 && bin[0] == '"' && bin[len(bin)-1] == '"' {
+		bin = bin[1 : len(bin)-1]
 	}
 	return bin
 }

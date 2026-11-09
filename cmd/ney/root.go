@@ -56,7 +56,7 @@ func main() {
 	// Bare `ney` on a machine that has never completed setup offers the
 	// wizard (interactive terminals only); everywhere else it falls through
 	// to cobra's help.
-	if len(os.Args) == 1 && !setupCompleted() && isatty.IsTerminal(os.Stdin.Fd()) {
+	if len(os.Args) == 1 && !setupCompleted() && isInteractive() {
 		ans := strings.ToLower(promptLine("Ney isn't set up on this machine yet — start setup now? [Y/n] "))
 		if ans == "" || strings.HasPrefix(ans, "y") {
 			if err := runSetupWizard(context.Background()); err != nil {

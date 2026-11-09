@@ -31,8 +31,9 @@ OS="$(uname -s)"
 case "$OS" in
   Linux)  os="linux"  ;;
   Darwin) os="darwin" ;;
-  *) die "Unsupported OS: $OS (this installer covers macOS and Linux).
-On Windows use WSL2, or: go install github.com/naay99999/neything/cmd/ney@latest" ;;
+  MINGW*|MSYS*|CYGWIN*) die "On Windows, install from PowerShell instead:
+  irm https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.ps1 | iex" ;;
+  *) die "Unsupported OS: $OS (this installer covers macOS and Linux)." ;;
 esac
 
 ARCH="$(uname -m)"

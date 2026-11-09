@@ -6,6 +6,7 @@ package session
 import (
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -85,6 +86,9 @@ func Within(cwd, root string) bool {
 		return false
 	}
 	in := func(c, r string) bool {
+		if runtime.GOOS == "windows" { // NTFS paths are case-insensitive; drive letters vary in case
+			c, r = strings.ToLower(c), strings.ToLower(r)
+		}
 		return c == r || strings.HasPrefix(c, r+string(filepath.Separator))
 	}
 	return in(filepath.Clean(cwd), filepath.Clean(root)) || in(Canon(cwd), Canon(root))

@@ -15,6 +15,7 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
       - arm64
@@ -24,6 +25,10 @@ archives:
     name_template: "ney_{{.Version}}_{{.Os}}_{{.Arch}}"
     formats:
       - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
     files:
       - README.md
 
