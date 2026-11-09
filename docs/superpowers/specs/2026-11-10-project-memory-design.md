@@ -194,7 +194,7 @@ only. Any git error → treat the card as fresh (never nag on errors).
 | Unit | Responsibility | Depends on |
 |---|---|---|
 | `internal/projects` (new) | `Card` type; `Load`/`Save` (tolerant parse, atomic write, caps); `Patch` (apply an `update_project` input); `Name` (naming + collisions); `Registry` (load/upsert/save); `Index` (render TOC lines and `index.md`); `Staleness` (pure: inputs are counts/changed files/time) | `internal/redact` |
-| `internal/handoff` | `Build` gains a `Projects` input (names, current-card state + stale reason) and redacts/`inline`s it like every other brief string; `RenderInject` renders the projects section first, then the handoff part within the remaining budget. `Brief.Empty()` is false when either part has content | — |
+| `internal/handoff` | `Build` gains a `Projects` input (names, current-card state + stale reason) and redacts/`inline`s it like every other brief string; `RenderInject` sizes the projects section first, renders the handoff part within the remaining budget, and places the section after it. `Brief.Empty()` is false when either part has content | — |
 | `cmd/ney` | `mcp_projects.go` (three tools), `cmd_projects.go` (CLI), hook wiring (registry upsert, staleness git calls, projects line), doctor checks; removal of `get_context`/`remember` wiring | `internal/projects`, `internal/context` (`ScanRepos`, `gitCmd`, `LoadProfile`) |
 | `internal/context` | Loses `Render`/`WriteMemory` (Layer-1 render and memory writer). Keeps `ScanRepos`, `ResolveRepo`, profile, `ScanCache`, git state | — |
 
