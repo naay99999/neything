@@ -11,9 +11,11 @@ func skillChecks(home string) []checkResult {
 	var res []checkResult
 	for _, dir := range skills.Targets(home) {
 		st := skills.Status(dir).State
+		// Only an outdated copy needs action; not installing the skill or
+		// editing it on purpose are the user's choices, reported as information.
 		c := checkResult{
 			Check:   "skill_" + skills.Name,
-			OK:      st == skills.UpToDate,
+			OK:      st != skills.Outdated,
 			Message: fmt.Sprintf("%s skill (%s): %s", skills.Name, displayPath(dir), st),
 		}
 		if st == skills.Absent || st == skills.Outdated {

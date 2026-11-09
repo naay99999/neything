@@ -92,6 +92,11 @@ func readMarker(dir string) (marker, bool) {
 	if json.Unmarshal(b, &m) != nil || m.Skill != Name || m.Files == nil {
 		return marker{}, false
 	}
+	for rel := range m.Files {
+		if !filepath.IsLocal(filepath.FromSlash(rel)) {
+			return marker{}, false // a damaged marker is not ours to trust
+		}
+	}
 	return m, true
 }
 
@@ -111,6 +116,15 @@ func inspect(dir string) State {
 		}
 	}
 	files := Files()
+	// Every file Sync would write must be vouched for by the marker; one that
+	// exists but is not listed may be the user's, so it blocks the update.
+	for rel := range files {
+		if _, listed := m.Files[rel]; !listed {
+			if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); err == nil {
+				return Modified
+			}
+		}
+	}
 	if len(files) != len(m.Files) {
 		return Outdated
 	}

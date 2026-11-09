@@ -69,7 +69,7 @@ func TestDoctorSkillModified(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := skillChecks(home)
-	if len(res) != 2 || !res[0].OK || res[1].OK ||
+	if len(res) != 2 || !res[0].OK || !res[1].OK ||
 		res[1].Message != "ney-handoff skill ("+displayPath(skills.Targets(home)[1])+"): modified locally — not updated" {
 		t.Fatalf("checks = %+v", res)
 	}
@@ -79,7 +79,26 @@ func TestDoctorSkillAbsent(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
 	res := skillChecks(home)
-	if len(res) != 2 || res[0].OK || res[0].Hint != "Run: ney skills sync" {
+	if len(res) != 2 || !res[0].OK || res[0].Hint != "Run: ney skills sync" {
 		t.Fatalf("checks = %+v", res)
+	}
+}
+
+func TestDoctorSkillDeclinedOrEditedIsInformational(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	for _, c := range skillChecks(home) { // never installed (declined at init)
+		if !c.OK {
+			t.Errorf("absent skill fails doctor: %+v", c)
+		}
+	}
+	if _, err := syncSkills(home, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skills.Targets(home)[0], "SKILL.md"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c := skillChecks(home)[0]; !c.OK {
+		t.Errorf("deliberately edited skill fails doctor: %+v", c)
 	}
 }

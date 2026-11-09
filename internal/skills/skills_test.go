@@ -175,3 +175,42 @@ func TestTargets(t *testing.T) {
 		t.Errorf("Targets = %v", got)
 	}
 }
+
+func TestSyncMarkerMissingEntryCountsAsModified(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ney-handoff")
+	if _, err := Sync(dir, "1", false); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "agents", "openai.yaml")
+	if err := os.WriteFile(p, []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := markerOf(t, dir)
+	delete(m.Files, "agents/openai.yaml") // hand-edited / damaged marker
+	b, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(dir, markerFile), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := Sync(dir, "2", false); err != nil || r.State != Modified {
+		t.Fatalf("sync = %+v, %v", r, err)
+	}
+	if got, _ := os.ReadFile(p); string(got) != "mine" {
+		t.Error("file not covered by the marker was overwritten")
+	}
+}
+
+func TestStatusRejectsNonLocalMarkerPaths(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ney-handoff")
+	if _, err := Sync(dir, "1", false); err != nil {
+		t.Fatal(err)
+	}
+	m := markerOf(t, dir)
+	m.Files["../outside"] = "x"
+	b, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(dir, markerFile), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s := Status(dir); s.State != Unmanaged {
+		t.Errorf("marker with ../ path: %v, want Unmanaged", s.State)
+	}
+}
