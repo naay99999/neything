@@ -42,7 +42,7 @@ func handoffFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	// "/repo/" first so the bare "/repo" replacement can't double-rewrite.
-	data := strings.ReplaceAll(string(raw), "/repo/", repo+"/")
+	data := strings.ReplaceAll(string(raw), "/repo/", jsonPath(repo)+"/")
 	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+jsonPath(repo)+`"`)
 	dir := filepath.Join(home, ".claude", "projects", claudecode.Slug(repo))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -122,7 +122,7 @@ func writeSession(t *testing.T, repo, fixture, id, goal string, mtime time.Time)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := strings.ReplaceAll(string(raw), "/repo/", repo+"/")
+	data := strings.ReplaceAll(string(raw), "/repo/", jsonPath(repo)+"/")
 	data = strings.ReplaceAll(data, `"cwd":"/repo"`, `"cwd":"`+jsonPath(repo)+`"`)
 	if goal != "" {
 		data = strings.ReplaceAll(data, "Fix the payment flow so refunds work", goal)
