@@ -22,7 +22,10 @@ var initCmd = &cobra.Command{
 }
 
 // isInteractive is a var so tests can drive the wizard's TTY guard.
-var isInteractive = func() bool { return isatty.IsTerminal(os.Stdin.Fd()) }
+// isInteractive also accepts a Cygwin/MSYS pty (Git Bash's mintty on Windows).
+var isInteractive = func() bool {
+	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+}
 
 // setupMarkerName is written at the end of a successful `ney init`. profile.md
 // is not a usable marker: get_context creates it on its own.

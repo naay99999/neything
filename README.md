@@ -35,7 +35,11 @@ The installer verifies the release SHA-256, installs `ney` to `~/.local/bin`, ad
 
 Options (set before `sh`, e.g. `curl ... | NEY_VERSION=v0.1.0 sh`): `NEY_VERSION` pins a version, `NEY_INSTALL_DIR` changes the target directory, `NEY_NO_MODIFY_PATH=1` leaves shell rc files alone, `NEY_NO_INIT=1` skips the setup wizard.
 
-There is no Windows build yet; use WSL2 or `go install`.
+**Windows** (PowerShell, no admin):
+```powershell
+irm https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.ps1 | iex
+```
+Same behaviour: verifies the SHA-256, installs `ney.exe` to `%LOCALAPPDATA%\Programs\ney`, adds it to your user `PATH`, and starts `ney init` on a first install. The same environment variables apply (`$env:NEY_VERSION = "v0.1.0"` before running, and so on). Restart your AI apps after a first install so they pick up the new `PATH`.
 
 **Moving from Homebrew:** ney is no longer published to Homebrew. Run the curl command above (it re-runs `ney init` so your AI clients point at the new binary), then `brew uninstall ney`.
 

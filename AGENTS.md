@@ -11,7 +11,7 @@ go test ./...                # run all tests
 go test ./internal/handoff -run TestName   # run a single test
 ```
 
-No database, no network, no LLM calls anywhere. CI (.github/workflows/release.yml) only cuts GitHub releases (binaries for `scripts/install.sh`; no Homebrew) — there is **no lint/test gate**, so run gofmt + vet + tests locally before pushing.
+No database, no network, no LLM calls anywhere. CI: `.github/workflows/ci.yml` runs gofmt + vet + tests on Linux, macOS and Windows, and smoke-tests `scripts/install.ps1` on Windows; `.github/workflows/release.yml` cuts GitHub releases (tar.gz for macOS/Linux, zip for Windows) consumed by `scripts/install.sh` / `scripts/install.ps1` — no Homebrew. Still run gofmt + vet + tests locally before pushing. Code that builds paths or shell commands must work on Windows too (see `shellQuoteFor`, `session.Within`).
 
 ## Architecture
 

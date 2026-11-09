@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -485,7 +486,13 @@ func clip(s string, max int) string {
 }
 
 func matchesSlug(name string, slugs []string) bool {
+	if runtime.GOOS == "windows" { // drive letter / folder case may differ from the transcript dir
+		name = strings.ToLower(name)
+	}
 	for _, slug := range slugs {
+		if runtime.GOOS == "windows" {
+			slug = strings.ToLower(slug)
+		}
 		if name == slug || strings.HasPrefix(name, slug+"-") {
 			return true
 		}

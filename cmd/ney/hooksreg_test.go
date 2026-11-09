@@ -41,11 +41,26 @@ func neyCommands(t *testing.T, m map[string]any) []string {
 }
 
 func TestHookCommandQuoting(t *testing.T) {
-	if got := hookCommand("/usr/local/bin/ney", "claude-code"); got != "/usr/local/bin/ney hook session-start --agent claude-code" {
-		t.Errorf("plain path: %q", got)
+	cases := []struct{ goos, bin, want string }{
+		{"darwin", "/usr/local/bin/ney", "/usr/local/bin/ney"},
+		{"linux", "/Users/a b/it's/ney", `'/Users/a b/it'\''s/ney'`},
+		{"windows", `C:\Users\naay\AppData\Local\Programs\ney\ney.exe`, "C:/Users/naay/AppData/Local/Programs/ney/ney.exe"},
+		{"windows", `C:\Users\John Smith\ney\ney.exe`, `"C:/Users/John Smith/ney/ney.exe"`},
 	}
-	if got := hookCommand("/Users/a b/it's/ney", "codex"); got != `'/Users/a b/it'\''s/ney' hook session-start --agent codex` {
-		t.Errorf("quoted path: %q", got)
+	for _, c := range cases {
+		if got := shellQuoteFor(c.goos, c.bin); got != c.want {
+			t.Errorf("%s %q: got %q, want %q", c.goos, c.bin, got, c.want)
+		}
+		cmd := shellQuoteFor(c.goos, c.bin) + hookSuffix("codex")
+		if back := hookBinary(cmd, "codex"); back != strings.Trim(c.want, `"'`) && !strings.Contains(c.want, `'\''`) {
+			t.Errorf("hookBinary(%q) = %q", cmd, back)
+		}
+	}
+	if got := hookCommand("/usr/local/bin/ney", "claude-code"); !strings.HasSuffix(got, " hook session-start --agent claude-code") {
+		t.Errorf("hookCommand: %q", got)
+	}
+	if back := hookBinary(`'/Users/a b/it'\''s/ney' hook session-start --agent codex`, "codex"); back != "/Users/a b/it's/ney" {
+		t.Errorf("hookBinary single-quoted: %q", back)
 	}
 }
 
