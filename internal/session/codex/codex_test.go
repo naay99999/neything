@@ -183,7 +183,7 @@ func TestCodexRecent(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := filepath.Join(dir, name)
-		body := strings.Replace(string(data), `"cwd":"/repo"`, `"cwd":"`+cwd+`"`, -1)
+		body := strings.Replace(string(data), `"cwd":"/repo"`, `"cwd":"`+jsonPath(cwd)+`"`, -1)
 		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -223,7 +223,7 @@ func TestCodexRecent(t *testing.T) {
 
 func TestHomeHonorsCodexHome(t *testing.T) {
 	fake := t.TempDir()
-	t.Setenv("HOME", fake)
+	setHome(t, fake)
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
 	if got, ok := Home(); !ok || got != dir {
@@ -269,7 +269,7 @@ func TestCodexRecentSymlinkedRoot(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := strings.Replace(string(data), `"cwd":"/repo"`, `"cwd":"`+real+`"`, -1)
+	body := strings.Replace(string(data), `"cwd":"/repo"`, `"cwd":"`+jsonPath(real)+`"`, -1)
 	p := filepath.Join(dir, "rollout-2026-11-02T09-00-00-0190bbbb-0000-0000-0000-000000000001.jsonl")
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -283,3 +283,7 @@ func TestCodexRecentSymlinkedRoot(t *testing.T) {
 		t.Fatalf("refs=%v err=%v", refs, err)
 	}
 }
+
+// jsonPath escapes a filesystem path for a hand-built JSON string literal
+// (Windows paths carry backslashes).
+func jsonPath(p string) string { return strings.ReplaceAll(p, `\`, `\\`) }

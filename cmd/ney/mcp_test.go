@@ -24,7 +24,7 @@ type mcpTestEnv struct {
 
 func newMCPTestEnv(t *testing.T) *mcpTestEnv {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -162,7 +162,7 @@ func initGitFixtureRepo(t *testing.T, dir, subject string) {
 // come straight from the live scan of cfg.Context.DevRoots.
 func TestMCPGetContextListsScannedProjects(t *testing.T) {
 	requireGitForMCPTest(t)
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestMCPGetContextListsScannedProjects(t *testing.T) {
 }
 
 func TestMCPGetContextWithoutScanCache(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatal(err)

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,7 +14,7 @@ import (
 func codexEnv(t *testing.T) (home string) {
 	t.Helper()
 	home = t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("PATH", t.TempDir())
 	return home
@@ -104,7 +105,11 @@ func TestDetectCodexWithoutHome(t *testing.T) {
 func TestDetectCodexOnPath(t *testing.T) {
 	codexEnv(t)
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+	name := "codex"
+	if runtime.GOOS == "windows" { // LookPath needs a PATHEXT extension there
+		name = "codex.exe"
+	}
+	if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)

@@ -13,7 +13,7 @@ import (
 // Claude Desktop / Codex configs with no human present.
 func TestRunSetupWizardRefusesNonInteractive(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 
 	orig := isInteractive
 	isInteractive = func() bool { return false }
@@ -42,7 +42,7 @@ func TestRunSetupWizardRefusesNonInteractive(t *testing.T) {
 // so only the marker written by a finished `ney init` counts.
 func TestSetupCompletedFollowsMarker(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 
 	if setupCompleted() {
 		t.Fatal("setupCompleted = true on a machine with nothing set up")
