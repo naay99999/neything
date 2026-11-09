@@ -1,0 +1,5 @@
+interface:
+  display_name: "ney handoff"
+  short_description: "Hand off to the next agent session through ney"
+policy:
+  allow_implicit_invocation: true
