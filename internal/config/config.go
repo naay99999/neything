@@ -10,9 +10,10 @@ import (
 )
 
 type Config struct {
-	Context   ContextConfig `mapstructure:"context"`
-	Handoff   HandoffConfig `mapstructure:"handoff"`
-	Telemetry bool          `mapstructure:"telemetry"`
+	Context   ContextConfig  `mapstructure:"context"`
+	Handoff   HandoffConfig  `mapstructure:"handoff"`
+	Projects  ProjectsConfig `mapstructure:"projects"`
+	Telemetry bool           `mapstructure:"telemetry"`
 	// Sources lists the agent transcript sources handoff reads. Defaults to
 	// ["claude-code", "codex"].
 	Sources []string `mapstructure:"sources"`
@@ -50,25 +51,45 @@ type HandoffConfig struct {
 	DisabledRepos []string `mapstructure:"disabled_repos"`
 }
 
+// ProjectsConfig controls project memory: the projects section injected at
+// session start and when a project's card counts as stale.
+type ProjectsConfig struct {
+	// Inject adds the projects section at SessionStart. Defaults to true.
+	Inject bool `mapstructure:"inject"`
+	// StaleCommits: a card is stale once this many commits landed after it
+	// was written. Defaults to 30.
+	StaleCommits int `mapstructure:"stale_commits"`
+	// StaleDays: a card is stale once it is this many days old. Defaults to 60.
+	StaleDays int `mapstructure:"stale_days"`
+	// NamesInBrief caps the project names listed at session start. Defaults to 20.
+	NamesInBrief int `mapstructure:"names_in_brief"`
+}
+
 // knownSources are the valid names for Config.Sources.
 var knownSources = map[string]bool{"claude-code": true, "codex": true}
 
 const defaultConfig = `# Ney configuration (~/.ney/config.yaml)
 #
 # ney is a local-first personal context server for AI clients (MCP).
-# 'ney mcp' gives Claude Code/Desktop/Cursor/Codex get_context, remember
-# and update_profile. Everything runs on your machine — no API key, no
-# model server, no network.
+# 'ney mcp' gives Claude Code / Codex session handoff and project memory.
+# Everything runs on your machine — no API key, no model server, no network.
 #
 # Run 'ney init' for guided setup. See README.md.
 
-# layered context (get_context): where to look for git repos,
+# where to look for git repos (feeds list_projects),
 # and how recent a project's last commit must be to count as "active"
 context:
   # dev_roots defaults to ["~/workspace"] if that directory exists (checked
   # fresh on every load), else no repo scan runs — uncomment to override:
   # dev_roots: ["~/workspace", "~/code"]
   active_days: 14
+
+# project memory — defaults shown; uncomment to override
+# projects:
+#   inject: true          # list your projects at session start
+#   stale_commits: 30     # a card is stale after this many new commits
+#   stale_days: 60        # ... or after this many days
+#   names_in_brief: 20    # max project names listed at session start
 
 # privacy — off by default
 telemetry: false
@@ -144,6 +165,18 @@ func Load() (*Config, error) {
 	for i, r := range cfg.Handoff.DisabledRepos {
 		cfg.Handoff.DisabledRepos[i] = expandTilde(r)
 	}
+	if !v.IsSet("projects.inject") {
+		cfg.Projects.Inject = true
+	}
+	if !v.IsSet("projects.stale_commits") {
+		cfg.Projects.StaleCommits = 30
+	}
+	if !v.IsSet("projects.stale_days") {
+		cfg.Projects.StaleDays = 60
+	}
+	if !v.IsSet("projects.names_in_brief") {
+		cfg.Projects.NamesInBrief = 20
+	}
 	if !v.IsSet("sources") {
 		cfg.Sources = []string{"claude-code", "codex"}
 	}
@@ -167,6 +200,15 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.Handoff.MaxAgeDays < 0 {
 		return fmt.Errorf("handoff.max_age_days must not be negative, got %d", cfg.Handoff.MaxAgeDays)
+	}
+	for key, n := range map[string]int{
+		"projects.stale_commits":  cfg.Projects.StaleCommits,
+		"projects.stale_days":     cfg.Projects.StaleDays,
+		"projects.names_in_brief": cfg.Projects.NamesInBrief,
+	} {
+		if n < 0 {
+			return fmt.Errorf("%s must not be negative, got %d", key, n)
+		}
 	}
 	for _, name := range cfg.Sources {
 		if !knownSources[name] {
