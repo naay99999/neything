@@ -11,7 +11,7 @@ go test ./...                # run all tests
 go test ./internal/handoff -run TestName   # run a single test
 ```
 
-No database, no network, no LLM calls anywhere. CI (.github/workflows/release.yml) only cuts releases — there is **no lint/test gate**, so run gofmt + vet + tests locally before pushing.
+No database, no network, no LLM calls anywhere. CI (.github/workflows/release.yml) only cuts GitHub releases (binaries for `scripts/install.sh`; no Homebrew) — there is **no lint/test gate**, so run gofmt + vet + tests locally before pushing.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ MCP:     ney mcp → newMCPServer(mcpDeps) → stdio. get_handoff / list_session
 - Existing users' `config.yaml` may still hold keys of removed features (`retrieval:`, `index:`, `chunking:`, …). `Load` must keep ignoring unknown keys and never validate them.
 - `internal/config.Load()` is silent — no stdout, no stderr. It is reachable from `ney mcp` and the hook. First-run hints belong in `cmd/ney/root.go`'s `loadConfig()`, gated on `cfg.CreatedDefault` and a TTY.
 - `ney init` refuses to run when stdin is not a TTY, and `promptLine`/`promptDefault` latch on EOF so a default can never be auto-accepted — an exhausted stdin used to answer "y" to every AI-client registration prompt. Each client change is shown and confirmed separately.
-- `resolveNeyBinary()` (`cmd/ney/neybin.go`) prefers the stable PATH entry and **never** calls `EvalSymlinks` — a Homebrew cask's `bin/ney` symlink points into a versioned Caskroom directory that `brew upgrade` deletes. Clients are registered args-less (`ney mcp`) and the hook as `ney hook session-start --agent <agent>`.
+- `resolveNeyBinary()` (`cmd/ney/neybin.go`) prefers the stable PATH entry and **never** calls `EvalSymlinks` — a package manager's `bin/ney` symlink (e.g. a Homebrew cask) points into a versioned directory that the next upgrade deletes. Clients are registered args-less (`ney mcp`) and the hook as `ney hook session-start --agent <agent>`.
 - `ScanCache` belongs to long-running processes only (`ney mcp`); CLI one-shot paths and the hook must call `ScanRepos` directly. `ScanRepos` and live git state go through the hardened `gitCmd`; any per-repo git error just skips that repo. Keep that hardening.
 - `get_context` must never fail as an MCP tool: every failure degrades into a note in the rendered text.
 - Codex only runs a newly added hook after the user trusts it with `/hooks`; `ney init` says so, do not try to automate it.

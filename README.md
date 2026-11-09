@@ -27,18 +27,17 @@ The agent can call `get_handoff` for the full brief (the last 30 steps of the se
 
 ## Install
 
-**macOS / Linux, curl:**
+**macOS / Linux** (one command, no sudo):
 ```bash
-curl -sSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/naay99999/neything/main/scripts/install.sh | sh
 ```
-The installer verifies the release SHA-256 before installing and offers to run `ney init` for you. Pin a version with `NEY_VERSION=v0.1.0`, change the target with `NEY_INSTALL_DIR=~/bin`, or skip the setup prompt with `NEY_NO_INIT=1`. There is no Windows build; use WSL2 or `go install`.
+The installer verifies the release SHA-256, installs `ney` to `~/.local/bin`, adds that directory to `PATH` in your shell rc if it isn't there yet, and starts `ney init` on a first install. Re-run the same command to update; an update needs no further setup.
 
-**macOS, Homebrew:**
-```bash
-brew trust naay99999/tap   # required once for new taps
-brew tap naay99999/tap
-brew install naay99999/tap/ney
-```
+Options (set before `sh`, e.g. `curl ... | NEY_VERSION=v0.1.0 sh`): `NEY_VERSION` pins a version, `NEY_INSTALL_DIR` changes the target directory, `NEY_NO_MODIFY_PATH=1` leaves shell rc files alone, `NEY_NO_INIT=1` skips the setup wizard.
+
+There is no Windows build yet; use WSL2 or `go install`.
+
+**Moving from Homebrew:** ney is no longer published to Homebrew. Run the curl command above (it re-runs `ney init` so your AI clients point at the new binary), then `brew uninstall ney`.
 
 **Go users:**
 ```bash

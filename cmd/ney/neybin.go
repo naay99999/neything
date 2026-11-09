@@ -37,11 +37,12 @@ func sameFile(a, b string) bool {
 
 // resolve returns the path to record in AI-client MCP configs.
 //
-// It deliberately never calls filepath.EvalSymlinks. A Homebrew cask installs
-// /opt/homebrew/bin/ney as a symlink into a VERSIONED Caskroom directory that
-// `brew upgrade` deletes — so the symlink is the stable path and its target is
-// the unstable one. Resolving it would write a path that dies on the next
-// upgrade, silently breaking every registered client.
+// It deliberately never calls filepath.EvalSymlinks. Package managers
+// (Homebrew casks, version managers, Nix profiles) install bin/ney as a
+// symlink into a VERSIONED directory that the next upgrade deletes — so the
+// symlink is the stable path and its target is the unstable one. Resolving it
+// would write a path that dies on the next upgrade, silently breaking every
+// registered client.
 //
 // Order: explicit override → a `ney` on PATH that is this same binary → this
 // process's own path, unresolved → the bare name.
@@ -53,7 +54,7 @@ func (r binResolver) resolve() string {
 	self, selfErr := r.Executable()
 
 	// A `ney` on PATH is the stable, upgrade-surviving entry
-	// (/opt/homebrew/bin/ney, /usr/local/bin/ney, ~/go/bin/ney). Only trust it
+	// (~/.local/bin/ney, /usr/local/bin/ney, ~/go/bin/ney). Only trust it
 	// when it names this same binary, so a different ney elsewhere on PATH
 	// can't hijack the registration.
 	//
