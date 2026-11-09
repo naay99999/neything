@@ -41,7 +41,9 @@ func registerHandoffTools(server *mcp.Server, deps mcpDeps) {
 		Name: "write_handoff",
 		Description: "Leave a handoff note for the next session in this repo; it is shown first in the next brief. Use it " +
 			"when stopping mid-task to record what is done, what is left, and decisions made. Pass your current " +
-			"working directory as `cwd` (required; absolute path), your agent name, and the note (max 8000 characters).",
+			"working directory as `cwd` (required; absolute path), your agent name, and the note (max 8000 characters). " +
+			"If the user asked for a handoff: ask what the next session will do if they have not said, show the draft, " +
+			"and save only after they approve.",
 	}, writeHandoffHandler())
 }
 
