@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
+	"time"
 
 	"github.com/naay99999/neything/internal/config"
 	"github.com/spf13/cobra"
@@ -47,13 +50,20 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	results = append(results, checkResult{
 		Check:   "mcp",
 		OK:      true,
-		Message: "MCP server available — point an AI client at ney for get_context, remember and update_profile",
+		Message: "MCP server available — point an AI client at ney for session handoff and project memory",
 		// Args-less on purpose: `ney mcp` needs no configuration.
 		Hint: fmt.Sprintf("claude mcp add --scope user ney -- %s mcp", resolveNeyBinary()),
 	})
 
 	results = append(results, claudeCodeChecks(cfg)...)
 	results = append(results, codexChecks(cfg)...)
+	if cwd, err := filepath.Abs("."); err == nil {
+		ctx := context.Background()
+		if cmd != nil && cmd.Context() != nil {
+			ctx = cmd.Context()
+		}
+		results = append(results, projectChecks(ctx, cfg, cwd, time.Now())...)
+	}
 
 	printDoctorResults(results)
 	return nil

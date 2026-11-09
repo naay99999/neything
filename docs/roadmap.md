@@ -7,7 +7,24 @@
 |---|---|
 | Current version | 0.1 (MVP) |
 | Status | Active |
-| Last updated | 2026-11-08 |
+| Last updated | 2026-11-10 |
+
+---
+
+## 2026-11 — Project memory
+
+Handoff only knew the repo you were in. In a session in `portfolio`, nothing told the agent what
+`neything` is. Spec: `docs/superpowers/specs/2026-11-10-project-memory-design.md`.
+
+- **Cards**: one agent-written card per repo in `~/.ney/projects/<name>.md` (summary, stack,
+  status, files to read, ≤8 facts; hard caps, under 2 KB). `internal/projects` owns the format,
+  patching (`update_project` sends only changed fields), redaction, the repo registry and
+  `index.md` (Obsidian `[[wikilinks]]`).
+- **Session start**: a ≤600-byte `## ney — projects` section lists the user's other projects and
+  asks for a card only when the current one is missing or stale (commits, key files, age).
+- **MCP**: `list_projects`, `get_project`, `update_project` replace `get_context` and the
+  write-only `remember`. CLI: `ney projects [show <name>]`; `ney doctor` reports card state.
+- Still no LLM calls: ney decides *when* to ask; the agent writes the card.
 
 ---
 

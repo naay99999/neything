@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -124,8 +125,8 @@ func renderSections(preamble string, sections []profileSection) string {
 // frontmatter values, and for the same reason. This name reaches us from the
 // MCP update_profile tool, i.e. from the LLM, i.e. potentially from
 // attacker-planted text the LLM was reading. A newline in it would close the
-// heading and forge additional "## " sections in profile.md, which get_context
-// re-serves to every connected client at the start of every session.
+// heading and forge additional "## " sections in profile.md, which ney
+// re-serves to every connected client (list_projects shows it).
 func UpdateProfile(path, section, content string, appendMode bool) error {
 	section = sanitizeScalar(section)
 	if section == "" {
@@ -166,3 +167,31 @@ func UpdateProfile(path, section, content string, appendMode bool) error {
 	}
 	return WriteFileAtomic(path, []byte(out), 0o600)
 }
+
+// sanitizeScalar makes s safe to emit as a single-line YAML value.
+//
+// Section names reach us through the MCP `update_profile` tool, i.e. from
+// the LLM, i.e. potentially from attacker-planted text the LLM was reading
+// (indirect prompt injection). A value carrying a line break could close the
+// frontmatter block early and inject arbitrary keys — or a whole second
+// document — into a file ney re-serves to every connected client
+// on every later session, so this collapses every character that a parser
+// could read as a line break (CR/LF, NUL and the rest of C0/C1, DEL, NEL,
+// U+2028/U+2029) to a plain space. After this the value is guaranteed to be
+// one line, which is what makes the quoting in yamlScalar unescapable.
+func sanitizeScalar(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range strings.ToValidUTF8(s, "") {
+		switch {
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f,
+			r == '\u2028', r == '\u2029', r == '\ufeff':
+			b.WriteByte(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(multiSpace.ReplaceAllString(b.String(), " "))
+}
+
+var multiSpace = regexp.MustCompile(` +`)
