@@ -10,6 +10,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
+	"github.com/naay99999/neything/internal/skills"
 	"github.com/spf13/cobra"
 )
 
@@ -61,6 +62,8 @@ func runSetupWizard(_ context.Context) error {
 
 	stepClients()
 
+	stepSkills()
+
 	markSetupComplete()
 	fmt.Println()
 	fmt.Println(Bold("✓ Setup complete"))
@@ -77,7 +80,7 @@ func runSetupWizard(_ context.Context) error {
 // file is user-owned from then on (AI edits it via update_profile).
 func stepProfile() {
 	fmt.Println()
-	fmt.Println(Bold("[1/2] Setting up your profile (~/.ney/profile.md)"))
+	fmt.Println(Bold("[1/3] Setting up your profile (~/.ney/profile.md)"))
 
 	profilePath := filepath.Join(config.NeyDir(), "profile.md")
 	if _, err := os.Stat(profilePath); err == nil {
@@ -109,7 +112,7 @@ func stepProfile() {
 
 func stepClients() {
 	fmt.Println()
-	fmt.Println(Bold("[2/2] Connecting your AI clients"))
+	fmt.Println(Bold("[2/3] Connecting your AI clients"))
 
 	neyBin := resolveNeyBinary()
 
@@ -171,4 +174,39 @@ func promptDefault(question, def string) string {
 		return def
 	}
 	return ans
+}
+
+// --- step 3: ney skills -------------------------------------------------------------
+
+// stepSkills offers to install ney's skills (ney-handoff) into the agent
+// skill directories. EOF on stdin installs nothing.
+func stepSkills() {
+	fmt.Println()
+	fmt.Println(Bold("[3/3] Installing ney skills"))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Println(Yellow("      Could not find your home directory: " + err.Error()))
+		return
+	}
+	fmt.Println(Dim("      ney-handoff: say \"handoff\" to an agent to leave a note for the next session"))
+	for _, dir := range skills.Targets(home) {
+		fmt.Println(Dim("        " + displayPath(dir)))
+	}
+	for _, old := range []string{filepath.Join(home, ".agents", "skills", "handoff"), filepath.Join(home, ".claude", "skills", "handoff")} {
+		if _, err := os.Stat(old); err == nil {
+			fmt.Println(Yellow(`      You also have a "handoff" skill; ney-handoff replaces it. Remove ~/.agents/skills/handoff if you no longer need it.`))
+			break
+		}
+	}
+	if ans := strings.ToLower(promptDefault("        Apply? (y/n)", "y")); ans != "y" && ans != "yes" {
+		fmt.Println(Dim("        Skipped"))
+		return
+	}
+	results, err := syncSkills(home, false)
+	for _, r := range results {
+		fmt.Printf("        %s: %s\n", r.State, displayPath(r.Dir))
+	}
+	if err != nil {
+		fmt.Println(Yellow("        Failed: " + err.Error()))
+	}
 }

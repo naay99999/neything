@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -63,6 +64,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			ctx = cmd.Context()
 		}
 		results = append(results, projectChecks(ctx, cfg, cwd, time.Now())...)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		results = append(results, skillChecks(home)...)
 	}
 
 	printDoctorResults(results)
