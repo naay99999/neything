@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 )
 
-// writeFileAtomic writes data to path by creating a temp file in the same
+// WriteFileAtomic writes data to path by creating a temp file in the same
 // directory, writing and chmod'ing it, then renaming it over path — so
 // readers never observe a partial write. It cleans up the temp file on any
 // failure; on success there is nothing left behind but the final file.
-func writeFileAtomic(path string, data []byte, perm fs.FileMode) error {
+func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {

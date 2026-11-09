@@ -172,7 +172,7 @@ func WriteMemory(dir string, m Memory) (path string, err error) {
 	b.WriteString(strings.TrimSpace(m.Content))
 	b.WriteString("\n")
 
-	if err := writeFileAtomic(fullPath, []byte(b.String()), 0o600); err != nil {
+	if err := WriteFileAtomic(fullPath, []byte(b.String()), 0o600); err != nil {
 		return "", err
 	}
 	return fullPath, nil

@@ -39,7 +39,7 @@ func LoadProfile(path string) (content string, created bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", false, err
 	}
-	if err := writeFileAtomic(path, []byte(profileTemplate), 0o600); err != nil {
+	if err := WriteFileAtomic(path, []byte(profileTemplate), 0o600); err != nil {
 		return "", false, err
 	}
 	return profileTemplate, true, nil
@@ -164,5 +164,5 @@ func UpdateProfile(path, section, content string, appendMode bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return writeFileAtomic(path, []byte(out), 0o600)
+	return WriteFileAtomic(path, []byte(out), 0o600)
 }
