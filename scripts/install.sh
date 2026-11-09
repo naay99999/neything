@@ -174,6 +174,9 @@ if [ -z "$SETUP_DONE" ] || [ -n "$OTHER_NEY" ]; then
 fi
 
 if [ -z "$NEED_INIT" ]; then
+  # Keep ney's skills (ney-handoff) in step with the new binary — only where
+  # they are already installed; never installs anything unasked.
+  "$TARGET" skills sync --installed-only --quiet || true
   say ""
   say "Updated. Your AI clients keep using ${TARGET}; nothing else to do."
   exit 0

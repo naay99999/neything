@@ -84,6 +84,14 @@ jobs:
           Get-Content scripts/install.ps1 -Raw | Invoke-Expression
           $count = @(([Environment]::GetEnvironmentVariable('Path', 'User')) -split ';' | Where-Object { $_ -like "*Programs\ney" }).Count
           if ($count -ne 1) { Write-Error "PATH entry count = $count"; exit 1 }
+          # update path (setup done): never installs skills unasked, keeps installed ones
+          New-Item -ItemType Directory -Force "$env:USERPROFILE\.ney" | Out-Null
+          Set-Content "$env:USERPROFILE\.ney\setup-complete" "ok"
+          Get-Content scripts/install.ps1 -Raw | Invoke-Expression
+          if (Test-Path "$env:USERPROFILE\.agents\skills\ney-handoff") { Write-Error "skills installed unasked"; exit 1 }
+          & $exe skills sync; if ($LASTEXITCODE) { exit 1 }
+          Get-Content scripts/install.ps1 -Raw | Invoke-Expression
+          if (-not (Test-Path "$env:USERPROFILE\.agents\skills\ney-handoff\.ney-managed")) { Write-Error "skill marker lost on update"; exit 1 }
 
       - name: Bad checksum is refused
         shell: pwsh

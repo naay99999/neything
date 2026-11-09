@@ -83,6 +83,7 @@ cd neything && go build -o ney ./cmd/ney
 1. Unregister from your agents: `claude mcp remove --scope user ney`, and delete the ney `SessionStart` entry from `~/.claude/settings.json`. For Codex, delete the `[mcp_servers.ney]` section from `config.toml` and the ney entry from `hooks.json` (in `$CODEX_HOME`, default `~/.codex`).
 2. Remove the binary: `rm ~/.local/bin/ney` (Windows: `Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\ney"`, then remove that folder from your user `PATH`), and the PATH line the installer added to your shell rc, marked `# added by the ney installer`.
 3. Remove your data: `rm -rf ~/.ney` (Windows: `%USERPROFILE%\.ney`).
+4. Remove the handoff skill: `rm -rf ~/.agents/skills/ney-handoff ~/.claude/skills/ney-handoff`.
 
 ---
 
@@ -93,6 +94,7 @@ cd neything && go build -o ney ./cmd/ney
 1. Bootstraps `~/.ney/profile.md` from a template with 2-3 short questions (skipped if a profile exists).
 2. For **Claude Code**: registers the MCP server (`claude mcp add --scope user ney -- ney mcp`) and adds a `SessionStart` command hook to `~/.claude/settings.json`.
 3. For **Codex**: adds an `[mcp_servers.ney]` section to `config.toml` and a `SessionStart` hook to `hooks.json` in `$CODEX_HOME` (default `~/.codex`). Codex only runs new hooks after you trust them: run `/hooks` inside Codex once.
+4. Installs the `ney-handoff` skill (see [Handoff skill](#handoff-skill)) into `~/.agents/skills` and `~/.claude/skills`.
 
 Edited files are backed up to `.bak` first, unparseable files are refused rather than overwritten, existing keys are preserved, and re-running is idempotent. The binary path registered is the stable one on your `PATH`.
 
@@ -110,11 +112,23 @@ ney handoff --session <id>  # make a specific session the primary one
 
 If there are no recent sessions it prints a one-line note to stderr and exits 0.
 
+## Handoff skill
+
+The automatic brief is extracted without an LLM, so on long sessions it can miss what matters. When you are about to switch, ask for a real handoff in plain words: "handoff", "ok เดี๋ยวเราไปทำต่อใน codex นะ", "leave a note for the next session". The `ney-handoff` skill then:
+
+1. asks what the next session will do, only if you have not said;
+2. drafts a note (next steps first, then state, pitfalls, decisions, what is done, suggested skills, references), linking specs, plans and commits instead of copying them, with secrets redacted;
+3. shows you the draft and saves it with `write_handoff` once you approve.
+
+The next session in that repo starts with the note, shown intact in place of ney's extracted fields (in agents with ney's hook; elsewhere, ask the agent to call `get_handoff`).
+
+`ney init` installs the skill into `~/.agents/skills/ney-handoff` and `~/.claude/skills/ney-handoff`; updating ney keeps it current. `ney skills sync` installs or updates it by hand. If you edit the installed `SKILL.md`, ney stops updating that copy (and `ney doctor` says so); ney never touches a skill folder it did not install.
+
 ## `ney doctor`
 
 Checks that the config is valid and, for each agent, that the `ney` MCP server and SessionStart hook are installed, that transcripts are found, and that a brief can be built for the current repo. It also counts project cards and reports whether the current repo's card is missing, stale or fresh.
 
-Other commands: `ney projects [show <name>]`, `ney config show|edit`, `ney version`.
+Other commands: `ney projects [show <name>]`, `ney skills sync`, `ney config show|edit`, `ney version`.
 
 ---
 

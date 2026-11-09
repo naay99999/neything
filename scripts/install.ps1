@@ -143,6 +143,8 @@ function Install-Ney {
   # First install, or moving from another location (clients still point at
   # the old binary): run `ney init`. A plain update needs nothing more.
   if ($setupDone -and -not $otherNey) {
+    # Keep ney's skills in step with the new binary, only where installed.
+    try { & $target skills sync --installed-only --quiet 2>$null | Out-Null } catch { }
     Write-Host ""
     Write-Host "Updated. Your AI clients keep using $target; nothing else to do."
     return
