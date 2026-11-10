@@ -75,11 +75,12 @@ func TestRegistryRoundTrip(t *testing.T) {
 }
 
 func TestFind(t *testing.T) {
-	r := Registry{Repos: []Entry{{Path: "/a/neything", Name: "neything"}}}
-	if e, ok := r.Find("NeyThing"); !ok || e.Path != "/a/neything" {
+	repo := filepath.Join(t.TempDir(), "neything") // absolute on every OS
+	r := Registry{Repos: []Entry{{Path: repo, Name: "neything"}}}
+	if e, ok := r.Find("NeyThing"); !ok || e.Path != repo {
 		t.Errorf("by name: %+v %v", e, ok)
 	}
-	if e, ok := r.Find("/a/neything"); !ok || e.Name != "neything" {
+	if e, ok := r.Find(repo); !ok || e.Name != "neything" {
 		t.Errorf("by path: %+v %v", e, ok)
 	}
 	if _, ok := r.Find("nope"); ok {
