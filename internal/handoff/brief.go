@@ -52,6 +52,13 @@ func Build(repoName string, sessions []session.Session, notes []Note, git neycon
 	return b
 }
 
+// PinNote makes n the brief's note even when a later session would hide it:
+// the user picked it on purpose. n is redacted here, like everything in Build.
+func (b *Brief) PinNote(n Note) {
+	p := Note{ID: n.ID, Agent: scrub(n.Agent), At: n.At, Body: scrub(n.Body)}
+	b.Note = &p
+}
+
 // Empty reports whether there is nothing worth handing over or injecting.
 func (b Brief) Empty() bool { return b.handoffEmpty() && b.Projects.empty() }
 

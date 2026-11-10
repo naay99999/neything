@@ -64,7 +64,7 @@ func TestEmbeddedSkills(t *testing.T) {
 		}
 	}
 	resume := string(Files("ney-resume")["SKILL.md"])
-	for _, want := range []string{"get_handoff", "ทำต่อ", "pick up"} {
+	for _, want := range []string{"list_handoffs", "get_handoff", "note_id", "ทำต่อ", "pick up"} {
 		if !strings.Contains(resume, want) {
 			t.Errorf("ney-resume SKILL.md lacks %q", want)
 		}

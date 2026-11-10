@@ -122,7 +122,7 @@ The automatic brief is extracted without an LLM, so on long sessions it can miss
 
 The next session in that repo starts with the note, shown intact in place of ney's extracted fields (in agents with ney's hook).
 
-To pick it up on purpose, say so in the new session: "resume", "pick up where we left off", "ทำต่อจากเมื่อกี้", or `/ney-resume`. The `ney-resume` skill loads the full note and recent sessions with `get_handoff`, checks what changed in git since, briefs you on where the work stopped and the next step, and waits for you to confirm before it changes anything. Use it after resuming or compacting a session (the hook stays quiet then), in agents without ney's hook, or when the injected note was cut short. Notes belong to a repo, so open the same repo.
+To pick a note up on purpose, from any session: say "resume", "ทำต่อจากเมื่อกี้", or type `/ney-resume`. The `ney-resume` skill lists your saved handoff notes across all projects, newest first (project · title · agent · when), and asks which one to open. `/ney-resume portfolio` lists only that project's notes. For the note you pick, it loads the full note with `get_handoff`, checks what changed in git since, briefs you on where the work stopped and the next step, and waits for you to confirm before it changes anything. If the note belongs to another repo, it suggests opening a session there. Older notes stay listed, so a handoff from last week can still be resumed.
 
 `ney init` installs both skills into `~/.agents/skills/` and `~/.claude/skills/`; updating ney keeps them current, and adds new ney skills to the folders where ney's skills are already installed. `ney skills sync` installs or updates them by hand. If you edit an installed `SKILL.md`, ney stops updating that copy (and `ney doctor` says so); ney never touches a skill folder it did not install.
 
@@ -140,7 +140,8 @@ Other commands: `ney projects [show <name>]`, `ney skills sync`, `ney config sho
 
 | Tool | What it does |
 |---|---|
-| `get_handoff` | Handoff brief for the repo at `cwd` (full by default; `full=false` for compact; `session_id` picks a session) |
+| `get_handoff` | Handoff brief for the repo at `cwd` (full by default; `full=false` for compact; `session_id` picks a session; `note_id` shows a specific note) |
+| `list_handoffs` | Saved handoff notes across all repos, newest first (JSON: n, project, cwd, title, agent, written, note_id, current); `project` filters |
 | `list_sessions` | Recent sessions across agents for the repo at `cwd`, newest first (JSON: agent, id, title, branch, start, end, prompts) |
 | `write_handoff` | Leave a note for the next session (max 8000 chars); shown first in the next brief if written during or after the last session |
 | `list_projects` | Your profile headline plus every known project, one line each: name, path, what it is, last activity |

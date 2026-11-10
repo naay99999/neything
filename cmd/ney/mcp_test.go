@@ -120,7 +120,7 @@ func TestMCPListsTools(t *testing.T) {
 		got = append(got, tool.Name)
 	}
 	sort.Strings(got)
-	want := []string{"get_handoff", "get_project", "list_projects", "list_sessions", "update_profile", "update_project", "write_handoff"}
+	want := []string{"get_handoff", "get_project", "list_handoffs", "list_projects", "list_sessions", "update_profile", "update_project", "write_handoff"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", got, want)
 	}
