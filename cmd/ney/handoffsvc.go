@@ -29,6 +29,7 @@ type handoffRequest struct {
 	Cwd              string
 	ExcludeSessionID string
 	SessionID        string // when set, that session is primary
+	NoteID           string // when set, that note is shown whatever its age
 	Now              time.Time
 }
 
@@ -134,6 +135,14 @@ func relativizeFiles(s *session.Session, root string) {
 	s.Files = files
 }
 
+// errNoteNotFound is returned by buildBrief when req.NoteID matches no note
+// of the repo.
+type errNoteNotFound struct{ ID, Repo string }
+
+func (e errNoteNotFound) Error() string {
+	return fmt.Sprintf("note %s not found for %s", e.ID, e.Repo)
+}
+
 // buildBrief is the one place every surface builds a handoff brief.
 func buildBrief(ctx context.Context, cfg *config.Config, req handoffRequest, full bool) (handoff.Brief, string, error) {
 	now := req.Now
@@ -178,6 +187,18 @@ func buildBrief(ctx context.Context, cfg *config.Config, req handoffRequest, ful
 	}
 
 	notes, _ := handoff.ReadNotes(config.NeyDir(), root)
+	var pinned *handoff.Note
+	if req.NoteID != "" {
+		for i := range notes {
+			if notes[i].ID == req.NoteID {
+				pinned = &notes[i]
+				break
+			}
+		}
+		if pinned == nil {
+			return handoff.Brief{}, root, errNoteNotFound{ID: req.NoteID, Repo: repoName}
+		}
+	}
 
 	var git neycontext.GitState
 	gitOK := false
@@ -186,11 +207,18 @@ func buildBrief(ctx context.Context, cfg *config.Config, req handoffRequest, ful
 		if len(sessions) > 0 {
 			since = sessions[0].End
 		}
+		if pinned != nil {
+			since = pinned.At // what changed since the picked note
+		}
 		if st, err := neycontext.RepoState(gitCtx, root, since); err == nil {
 			git, gitOK = st, true
 		}
 	}
-	return handoff.Build(repoName, sessions, notes, git, gitOK, now), root, nil
+	brief := handoff.Build(repoName, sessions, notes, git, gitOK, now)
+	if pinned != nil {
+		brief.PinNote(*pinned)
+	}
+	return brief, root, nil
 }
 
 // listSessions returns up to limit recent sessions for the repo containing

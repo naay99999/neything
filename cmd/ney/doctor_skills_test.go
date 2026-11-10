@@ -69,7 +69,7 @@ func TestDoctorSkillModified(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := skillChecks(home)
-	if len(res) != 2 || !res[0].OK || !res[1].OK ||
+	if len(res) != 4 || !res[0].OK || !res[1].OK ||
 		res[1].Message != "ney-handoff skill ("+displayPath(skills.Targets(home)[1])+"): modified locally — not updated" {
 		t.Fatalf("checks = %+v", res)
 	}
@@ -79,7 +79,7 @@ func TestDoctorSkillAbsent(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
 	res := skillChecks(home)
-	if len(res) != 2 || !res[0].OK || res[0].Hint != "Run: ney skills sync" {
+	if len(res) != 4 || !res[3].OK || res[3].Hint != "Run: ney skills sync" || !strings.Contains(res[3].Message, "ney-resume skill") || !res[0].OK || res[0].Hint != "Run: ney skills sync" {
 		t.Fatalf("checks = %+v", res)
 	}
 }

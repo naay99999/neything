@@ -83,7 +83,7 @@ cd neything && go build -o ney ./cmd/ney
 1. Unregister from your agents: `claude mcp remove --scope user ney`, and delete the ney `SessionStart` entry from `~/.claude/settings.json`. For Codex, delete the `[mcp_servers.ney]` section from `config.toml` and the ney entry from `hooks.json` (in `$CODEX_HOME`, default `~/.codex`).
 2. Remove the binary: `rm ~/.local/bin/ney` (Windows: `Remove-Item -Recurse "$env:LOCALAPPDATA\Programs\ney"`, then remove that folder from your user `PATH`), and the PATH line the installer added to your shell rc, marked `# added by the ney installer`.
 3. Remove your data: `rm -rf ~/.ney` (Windows: `%USERPROFILE%\.ney`).
-4. Remove the handoff skill: `rm -rf ~/.agents/skills/ney-handoff ~/.claude/skills/ney-handoff`.
+4. Remove ney's skills: `rm -rf ~/.agents/skills/ney-handoff ~/.agents/skills/ney-resume ~/.claude/skills/ney-handoff ~/.claude/skills/ney-resume`.
 
 ---
 
@@ -94,7 +94,7 @@ cd neything && go build -o ney ./cmd/ney
 1. Bootstraps `~/.ney/profile.md` from a template with 2-3 short questions (skipped if a profile exists).
 2. For **Claude Code**: registers the MCP server (`claude mcp add --scope user ney -- ney mcp`) and adds a `SessionStart` command hook to `~/.claude/settings.json`.
 3. For **Codex**: adds an `[mcp_servers.ney]` section to `config.toml` and a `SessionStart` hook to `hooks.json` in `$CODEX_HOME` (default `~/.codex`). Codex only runs new hooks after you trust them: run `/hooks` inside Codex once.
-4. Installs the `ney-handoff` skill (see [Handoff skill](#handoff-skill)) into `~/.agents/skills` and `~/.claude/skills`.
+4. Installs the `ney-handoff` and `ney-resume` skills (see [Handoff skills](#handoff-skills)) into `~/.agents/skills` and `~/.claude/skills`.
 
 Edited files are backed up to `.bak` first, unparseable files are refused rather than overwritten, existing keys are preserved, and re-running is idempotent. The binary path registered is the stable one on your `PATH`.
 
@@ -112,7 +112,7 @@ ney handoff --session <id>  # make a specific session the primary one
 
 If there are no recent sessions it prints a one-line note to stderr and exits 0.
 
-## Handoff skill
+## Handoff skills
 
 The automatic brief is extracted without an LLM, so on long sessions it can miss what matters. When you are about to switch, ask for a real handoff in plain words: "handoff", "ok เดี๋ยวเราไปทำต่อใน codex นะ", "leave a note for the next session". The `ney-handoff` skill then:
 
@@ -120,9 +120,11 @@ The automatic brief is extracted without an LLM, so on long sessions it can miss
 2. drafts a note (next steps first, then state, pitfalls, decisions, what is done, suggested skills, references), linking specs, plans and commits instead of copying them, with secrets redacted;
 3. shows you the draft and saves it with `write_handoff` once you approve.
 
-The next session in that repo starts with the note, shown intact in place of ney's extracted fields (in agents with ney's hook; elsewhere, ask the agent to call `get_handoff`).
+The next session in that repo starts with the note, shown intact in place of ney's extracted fields (in agents with ney's hook).
 
-`ney init` installs the skill into `~/.agents/skills/ney-handoff` and `~/.claude/skills/ney-handoff`; updating ney keeps it current. `ney skills sync` installs or updates it by hand. If you edit the installed `SKILL.md`, ney stops updating that copy (and `ney doctor` says so); ney never touches a skill folder it did not install.
+To pick a note up on purpose, from any session: say "resume", "ทำต่อจากเมื่อกี้", or type `/ney-resume`. The `ney-resume` skill lists your saved handoff notes across all projects, newest first (project · title · agent · when), and asks which one to open. `/ney-resume portfolio` lists only that project's notes. For the note you pick, it loads the full note with `get_handoff`, checks what changed in git since, briefs you on where the work stopped and the next step, and waits for you to confirm before it changes anything. If the note belongs to another repo, it suggests opening a session there. Older notes stay listed, so a handoff from last week can still be resumed.
+
+`ney init` installs both skills into `~/.agents/skills/` and `~/.claude/skills/`; updating ney keeps them current, and adds new ney skills to the folders where ney's skills are already installed. `ney skills sync` installs or updates them by hand. If you edit an installed `SKILL.md`, ney stops updating that copy (and `ney doctor` says so); ney never touches a skill folder it did not install.
 
 ## `ney doctor`
 
@@ -138,7 +140,8 @@ Other commands: `ney projects [show <name>]`, `ney skills sync`, `ney config sho
 
 | Tool | What it does |
 |---|---|
-| `get_handoff` | Handoff brief for the repo at `cwd` (full by default; `full=false` for compact; `session_id` picks a session) |
+| `get_handoff` | Handoff brief for the repo at `cwd` (full by default; `full=false` for compact; `session_id` picks a session; `note_id` shows a specific note) |
+| `list_handoffs` | Saved handoff notes across all repos, newest first (JSON: n, project, cwd, title, agent, written, note_id, current); `project` filters |
 | `list_sessions` | Recent sessions across agents for the repo at `cwd`, newest first (JSON: agent, id, title, branch, start, end, prompts) |
 | `write_handoff` | Leave a note for the next session (max 8000 chars); shown first in the next brief if written during or after the last session |
 | `list_projects` | Your profile headline plus every known project, one line each: name, path, what it is, last activity |

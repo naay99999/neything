@@ -43,20 +43,69 @@ func ageInstall(t *testing.T, dir string) {
 	}
 }
 
-func TestEmbeddedSkill(t *testing.T) {
-	f := Files()
-	var names []string
-	for k := range f {
-		names = append(names, k)
+func TestEmbeddedSkills(t *testing.T) {
+	if !reflect.DeepEqual(Names, []string{"ney-handoff", "ney-resume"}) {
+		t.Fatalf("Names = %v", Names)
 	}
-	if len(f) != 2 || f["SKILL.md"] == nil || f["agents/openai.yaml"] == nil {
-		t.Fatalf("files = %v", names)
+	for _, name := range Names {
+		f := Files(name)
+		var files []string
+		for k := range f {
+			files = append(files, k)
+		}
+		if len(f) != 2 || f["SKILL.md"] == nil || f["agents/openai.yaml"] == nil {
+			t.Fatalf("%s files = %v", name, files)
+		}
+		if !strings.HasPrefix(string(f["SKILL.md"]), "---\nname: "+name+"\n") {
+			t.Errorf("%s SKILL.md frontmatter:\n%s", name, f["SKILL.md"][:80])
+		}
+		if !strings.Contains(string(f["agents/openai.yaml"]), "allow_implicit_invocation: true") {
+			t.Errorf("%s openai.yaml must allow implicit invocation", name)
+		}
 	}
-	if !strings.HasPrefix(string(f["SKILL.md"]), "---\nname: ney-handoff\n") {
-		t.Errorf("SKILL.md frontmatter:\n%s", f["SKILL.md"][:80])
+	resume := string(Files("ney-resume")["SKILL.md"])
+	for _, want := range []string{"list_handoffs", "get_handoff", "note_id", "ทำต่อ", "pick up"} {
+		if !strings.Contains(resume, want) {
+			t.Errorf("ney-resume SKILL.md lacks %q", want)
+		}
 	}
-	if !strings.Contains(string(f["agents/openai.yaml"]), "allow_implicit_invocation: true") {
-		t.Error("openai.yaml must allow implicit invocation")
+	if Files("nope") != nil {
+		t.Error("unknown skill has files")
+	}
+}
+
+func TestSyncUnknownSkillDirFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "other")
+	if _, err := Sync(dir, "1", false); err == nil {
+		t.Fatal("synced a directory that names no embedded skill")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("wrote an unknown skill dir")
+	}
+}
+
+func TestSyncResumeAndMarkerNamesSkill(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ney-resume")
+	if r, err := Sync(dir, "1", false); err != nil || r.State != Installed {
+		t.Fatalf("sync = %+v, %v", r, err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "SKILL.md")); string(got) != string(Files("ney-resume")["SKILL.md"]) {
+		t.Error("ney-resume SKILL.md not written")
+	}
+	if m := markerOf(t, dir); m.Skill != "ney-resume" {
+		t.Errorf("marker skill = %q", m.Skill)
+	}
+	// A ney-handoff marker inside the ney-resume dir is not ours.
+	other := filepath.Join(t.TempDir(), "ney-handoff")
+	if _, err := Sync(other, "1", false); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(other, markerFile))
+	if err := os.WriteFile(filepath.Join(dir, markerFile), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s := Status(dir); s.State != Unmanaged {
+		t.Errorf("foreign marker: %v, want Unmanaged", s.State)
 	}
 }
 
@@ -66,7 +115,7 @@ func TestSyncInstallsAndIsIdempotent(t *testing.T) {
 	if err != nil || r.State != Installed || r.Dir != dir {
 		t.Fatalf("first sync = %+v, %v", r, err)
 	}
-	for name, want := range Files() {
+	for name, want := range Files("ney-handoff") {
 		got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(name)))
 		if err != nil || string(got) != string(want) {
 			t.Errorf("%s differs from embedded: %v", name, err)
@@ -97,7 +146,7 @@ func TestSyncUpdatesUnmodified(t *testing.T) {
 	if err != nil || r.State != Updated {
 		t.Fatalf("sync = %+v, %v", r, err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(dir, "SKILL.md")); string(got) != string(Files()["SKILL.md"]) {
+	if got, _ := os.ReadFile(filepath.Join(dir, "SKILL.md")); string(got) != string(Files("ney-handoff")["SKILL.md"]) {
 		t.Error("SKILL.md not updated")
 	}
 	if markerOf(t, dir).Version != "2" {
@@ -111,7 +160,7 @@ func TestSyncSkipsModified(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := filepath.Join(dir, "SKILL.md")
-	edited := append(Files()["SKILL.md"], '!')
+	edited := append(Files("ney-handoff")["SKILL.md"], '!')
 	if err := os.WriteFile(p, edited, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +219,10 @@ func TestStatusFresh(t *testing.T) {
 }
 
 func TestTargets(t *testing.T) {
-	want := []string{filepath.Join("/h", ".agents", "skills", "ney-handoff"), filepath.Join("/h", ".claude", "skills", "ney-handoff")}
+	want := []string{
+		filepath.Join("/h", ".agents", "skills", "ney-handoff"), filepath.Join("/h", ".claude", "skills", "ney-handoff"),
+		filepath.Join("/h", ".agents", "skills", "ney-resume"), filepath.Join("/h", ".claude", "skills", "ney-resume"),
+	}
 	if got := Targets("/h"); !reflect.DeepEqual(got, want) {
 		t.Errorf("Targets = %v", got)
 	}

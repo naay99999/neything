@@ -1,0 +1,5 @@
+interface:
+  display_name: "ney resume"
+  short_description: "Pick up the work handed off through ney"
+policy:
+  allow_implicit_invocation: true

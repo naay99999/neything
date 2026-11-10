@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -13,12 +15,15 @@ import (
 	"github.com/naay99999/neything/internal/config"
 	neycontext "github.com/naay99999/neything/internal/context"
 	"github.com/naay99999/neything/internal/handoff"
+	"github.com/naay99999/neything/internal/projects"
 )
 
 const (
 	maxHandoffNoteRunes = 8000
 	defaultListSessions = 10
 	maxListSessions     = 50
+	defaultListHandoffs = 15
+	maxListHandoffs     = 50
 )
 
 func registerHandoffTools(server *mcp.Server, deps mcpDeps) {
@@ -27,8 +32,17 @@ func registerHandoffTools(server *mcp.Server, deps mcpDeps) {
 		Description: "Get the session handoff brief for a repo: what recent agent sessions (Claude Code, etc.) were doing, " +
 			"what changed in git since, and any explicit handoff notes. Call at the start of work to pick up where " +
 			"a previous session left off. Pass your current working directory as `cwd` (required; absolute path). " +
-			"`full` defaults to true; set false for the compact brief. `session_id` selects a specific session.",
+			"`full` defaults to true; set false for the compact brief. `session_id` selects a specific session. " +
+			"`note_id` (from list_handoffs) shows that handoff note even if it is older than the latest session.",
 	}, getHandoffHandler(deps))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "list_handoffs",
+		Description: "List saved handoff notes across all the user's repos, newest first, as JSON: n, project, cwd, " +
+			"title, agent, written, note_id, current (the note belongs to the repo at `cwd`). `project` keeps only " +
+			"that project's notes. To open one, call get_handoff with its `cwd` and `note_id`. Use it when the user " +
+			"wants to resume or pick up a handoff.",
+	}, listHandoffsHandler())
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "list_sessions",
@@ -71,6 +85,7 @@ type getHandoffInput struct {
 	Cwd       string `json:"cwd" jsonschema:"absolute path of your current working directory"`
 	SessionID string `json:"session_id,omitempty" jsonschema:"make this session primary instead of the newest"`
 	Full      *bool  `json:"full,omitempty" jsonschema:"full brief (default true) or compact"`
+	NoteID    string `json:"note_id,omitempty" jsonschema:"show this handoff note (an id from list_handoffs)"`
 }
 
 func getHandoffHandler(deps mcpDeps) mcp.ToolHandlerFor[getHandoffInput, any] {
@@ -79,10 +94,11 @@ func getHandoffHandler(deps mcpDeps) mcp.ToolHandlerFor[getHandoffInput, any] {
 			return r, nil, nil
 		}
 		full := in.Full == nil || *in.Full
-		brief, root, err := buildBrief(ctx, deps.cfg, handoffRequest{Cwd: in.Cwd, SessionID: in.SessionID}, full)
+		brief, root, err := buildBrief(ctx, deps.cfg, handoffRequest{Cwd: in.Cwd, SessionID: in.SessionID, NoteID: in.NoteID}, full)
 		if err != nil {
 			var nf errSessionNotFound
-			if errors.As(err, &nf) {
+			var nn errNoteNotFound
+			if errors.As(err, &nf) || errors.As(err, &nn) {
 				return handoffToolError("%s", err.Error()), nil, nil
 			}
 			return handoffToolError("handoff: %v", err), nil, nil
@@ -173,6 +189,104 @@ func writeHandoffHandler() mcp.ToolHandlerFor[writeHandoffInput, any] {
 			return handoffToolError("write handoff: %v", err), nil, nil
 		}
 		b, _ := json.Marshal(map[string]string{"path": path})
+		return handoffText(string(b)), nil, nil
+	}
+}
+
+// --- list_handoffs ---------------------------------------------------------------
+
+type listHandoffsInput struct {
+	Project string `json:"project,omitempty" jsonschema:"only this project's notes (a name from list_projects)"`
+	Cwd     string `json:"cwd,omitempty" jsonschema:"absolute path of your current working directory, to mark its notes current"`
+	Limit   int    `json:"limit,omitempty" jsonschema:"max notes (default 15, max 50)"`
+}
+
+type handoffListItem struct {
+	N       int    `json:"n"`
+	Project string `json:"project"`
+	Cwd     string `json:"cwd"`
+	Title   string `json:"title"`
+	Agent   string `json:"agent"`
+	Written string `json:"written"`
+	NoteID  string `json:"note_id"`
+	Current bool   `json:"current"`
+}
+
+func listHandoffsHandler() mcp.ToolHandlerFor[listHandoffsInput, any] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in listHandoffsInput) (*mcp.CallToolResult, any, error) {
+		limit := in.Limit
+		if limit <= 0 {
+			limit = defaultListHandoffs
+		}
+		if limit > maxListHandoffs {
+			limit = maxListHandoffs
+		}
+		refs, err := handoff.ListNotes(config.NeyDir())
+		if err != nil {
+			return handoffToolError("list handoffs: %v", err), nil, nil
+		}
+		if len(refs) == 0 {
+			return handoffText("no handoff notes yet"), nil, nil
+		}
+		// Notes written before ney recorded their repo root are matched to
+		// known repos by directory key.
+		reg, _ := projects.LoadRegistry(projectsDir())
+		byKey := map[string]projects.Entry{}
+		for _, e := range reg.Repos {
+			byKey[handoff.RepoKey(e.Path)] = e
+		}
+		currentKey := ""
+		if in.Cwd != "" && filepath.IsAbs(in.Cwd) {
+			gitCtx, cancel := context.WithTimeout(ctx, handoffGitTimeout)
+			root, _ := neycontext.ResolveRepo(gitCtx, in.Cwd)
+			cancel()
+			currentKey = handoff.RepoKey(root)
+		}
+		now := time.Now()
+		seen := map[string]bool{}
+		var names []string
+		var out []handoffListItem
+		for _, r := range refs {
+			root, name := r.Root, ""
+			if e, ok := byKey[r.Key]; ok {
+				name = e.Name
+				if root == "" {
+					root = e.Path
+				}
+			}
+			if name == "" && root != "" {
+				name = filepath.Base(root)
+			}
+			if name == "" {
+				name = r.Key
+			}
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+			if in.Project != "" && !strings.EqualFold(name, in.Project) {
+				continue
+			}
+			if len(out) == limit {
+				continue
+			}
+			out = append(out, handoffListItem{
+				N: len(out) + 1, Project: name, Cwd: root, Title: r.Title, Agent: r.Agent,
+				Written: neycontext.RelativeTime(r.At, now), NoteID: r.ID, Current: r.Key == currentKey,
+			})
+		}
+		if len(out) == 0 {
+			sort.Strings(names)
+			msg := fmt.Sprintf("no handoff notes for %q. Projects with notes: %s", in.Project, strings.Join(names, ", "))
+			if near := projects.Closest(names, in.Project, 3); len(near) > 0 {
+				msg += ". Did you mean: " + strings.Join(near, ", ") + "?"
+			}
+			return handoffText(msg), nil, nil
+		}
+		b, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return handoffToolError("list handoffs: %v", err), nil, nil
+		}
 		return handoffText(string(b)), nil, nil
 	}
 }

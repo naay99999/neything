@@ -178,7 +178,7 @@ func promptDefault(question, def string) string {
 
 // --- step 3: ney skills -------------------------------------------------------------
 
-// stepSkills offers to install ney's skills (ney-handoff) into the agent
+// stepSkills offers to install ney's skills (ney-handoff, ney-resume) into the agent
 // skill directories. EOF on stdin installs nothing.
 func stepSkills() {
 	fmt.Println()
@@ -189,6 +189,7 @@ func stepSkills() {
 		return
 	}
 	fmt.Println(Dim("      ney-handoff: say \"handoff\" to an agent to leave a note for the next session"))
+	fmt.Println(Dim("      ney-resume:  say \"resume\" in a new session to pick that note up"))
 	for _, dir := range skills.Targets(home) {
 		fmt.Println(Dim("        " + displayPath(dir)))
 	}
