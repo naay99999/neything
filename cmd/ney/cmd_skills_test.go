@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"github.com/naay99999/neything/internal/skills"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,12 +25,16 @@ func execSkills(t *testing.T, args ...string) (string, error) {
 func TestSkillsSyncCommand(t *testing.T) {
 	setHome(t, t.TempDir())
 	out, err := execSkills(t, "sync")
-	want := "installed: " + filepath.Join("~", ".agents", "skills", "ney-handoff") + "\ninstalled: " +
-		filepath.Join("~", ".claude", "skills", "ney-handoff") + "\n"
+	var want string
+	for _, name := range []string{"ney-handoff", "ney-resume"} {
+		for _, root := range []string{".agents", ".claude"} {
+			want += "installed: " + filepath.Join("~", root, "skills", name) + "\n"
+		}
+	}
 	if err != nil || out != want {
 		t.Fatalf("err=%v out=%q want %q", err, out, want)
 	}
-	if out, _ := execSkills(t, "sync"); strings.Count(out, "up to date: ") != 2 {
+	if out, _ := execSkills(t, "sync"); strings.Count(out, "up to date: ") != 4 {
 		t.Errorf("second run:\n%s", out)
 	}
 }
@@ -44,6 +49,27 @@ func TestSkillsSyncInstalledOnly(t *testing.T) {
 	for _, d := range []string{".agents", ".claude"} {
 		if _, err := os.Stat(filepath.Join(home, d, "skills", "ney-handoff")); !os.IsNotExist(err) {
 			t.Errorf("%s skill installed unasked", d)
+		}
+	}
+}
+
+// A user who installed ney's skills before ney-resume existed gets it on the
+// installer's update path, but only in the folders where ney's skills live.
+func TestSkillsSyncInstalledOnlyAddsNewSkillWhereOptedIn(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	if _, err := skills.Sync(filepath.Join(home, ".claude", "skills", "ney-handoff"), "0.12.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execSkills(t, "sync", "--installed-only", "--quiet"); err != nil {
+		t.Fatal(err)
+	}
+	if s := skills.Status(filepath.Join(home, ".claude", "skills", "ney-resume")); s.State != skills.UpToDate {
+		t.Errorf("ney-resume not added next to ney-handoff: %v", s.State)
+	}
+	for _, name := range []string{"ney-handoff", "ney-resume"} {
+		if _, err := os.Stat(filepath.Join(home, ".agents", "skills", name)); !os.IsNotExist(err) {
+			t.Errorf("%s installed in a folder the user never opted into", name)
 		}
 	}
 }
